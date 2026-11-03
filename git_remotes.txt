@@ -1,2 +1,2 @@
-origin	git@github.com:EDOHWARES/VacciChain.git (fetch)
-origin	git@github.com:EDOHWARES/VacciChain.git (push)
+origin	git@github.com:ZainabJanee/VacciChain.git (fetch)
+origin	git@github.com:ZainabJanee/VacciChain.git (push)
