@@ -1,7 +1,6 @@
 #  Vacci-Chain
 
 [![CI](https://github.com/ZainabJanee/VacciChain/actions/workflows/ci.yml/badge.svg)](https://github.com/ZainabJanee/VacciChain/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/ZainabJanee/VacciChain/graph/badge.svg?token=YOUR_TOKEN)](https://codecov.io/gh/ZainabJanee/VacciChain)
 
 > Blockchain-based vaccination records on Stellar — soulbound, verifiable, tamper-proof.
 
@@ -104,7 +103,9 @@ vacci-chain/
 
 See the [Folder Structure Guide](docs/folder-structure.md) for detailed descriptions of every directory and key file.
  
-See the visual architecture diagram in [docs/architecture.mmd](docs/architecture.mmd) and the rendered SVG [docs/architecture.svg](docs/architecture.svg) for a quick overview of service interactions.
+See the visual architecture diagram in [docs/architecture.mmd](docs/architecture.mmd) and the rendered SVG below:
+
+![VacciChain Architecture](docs/architecture.svg)
 
 For an expanded developer setup walkthrough see [docs/setup-guide.md](docs/setup-guide.md).
 
