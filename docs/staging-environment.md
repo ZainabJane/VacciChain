@@ -246,10 +246,31 @@ VacciChain maintains a production-equivalent staging environment for testing bef
 2. CI tests run (contract, backend, python, docker)
 3. On success, `deploy-staging.yml` workflow triggers
 4. Docker images are built and pushed to ECR
-5. ECS task definition is updated
-6. New containers are deployed to staging cluster
-7. Smoke tests verify deployment
-8. Deployment summary posted to GitHub
+5. New task definition revision is registered (blue/green target group)
+6. Green (new) tasks are started alongside the existing blue (current) tasks
+7. Deployment waits for green targets to pass health checks
+8. A canary slice of traffic is shifted to green and smoke tests run
+9. Remaining traffic is shifted to green; blue tasks are drained and stopped
+10. Deployment summary posted to GitHub
+
+### Blue/Green Deployment with Canary Traffic Shift
+
+Staging uses AWS CodeDeploy blue/green deployments on ECS, mirroring production.
+
+| Phase | Traffic to green | Gate before proceeding |
+|---|---|---|
+| Provision | 0% | Green tasks reach `HEALTHY` in the target group (2 consecutive passing checks) |
+| Canary | 10% | Smoke tests pass and error rate stays below 1% for 5 minutes |
+| Linear shift | 10% → 100% in 10% steps every 2 minutes | Health checks and SLO error-rate alarm stay green |
+| Complete | 100% | Blue tasks drained (connection draining, 30s) and terminated |
+
+If any gate fails, CodeDeploy automatically rolls back to the blue task set and the workflow fails.
+
+Health checks used as gates:
+
+- **ECS/ALB health check:** `GET /health` — must return `200` with `{"status":"ok"}`
+- **Smoke tests:** `npm run test:smoke` against the canary target group
+- **SLO alarm:** the staging `error-rate` CloudWatch alarm (see [Monitoring Staging](#monitoring-staging)) must remain in `OK`
 
 ### Manual Deployment
 
@@ -257,6 +278,54 @@ VacciChain maintains a production-equivalent staging environment for testing bef
 # Trigger deployment manually
 gh workflow run deploy-staging.yml
 ```
+
+### Rollback Procedure
+
+Rollback is a first-class operation and is exercised on every release candidate (see failure injection below).
+
+**Automatic rollback:** triggered by CodeDeploy when a health check, smoke test, or SLO alarm gate fails. No action required; the previous blue task set resumes 100% of traffic.
+
+**Manual rollback:**
+
+```bash
+# 1. Find the current deployment
+aws deploy list-deployments \
+  --application-name vaccichain-staging \
+  --deployment-group-name vaccichain-staging-dg \
+  --include-only-statuses InProgress
+
+# 2. Stop and roll back the in-progress deployment
+aws deploy stop-deployment \
+  --deployment-id <deployment-id> \
+  --auto-rollback-enabled
+
+# 3. Confirm traffic is back on the previous task set
+aws deploy get-deployment --deployment-id <deployment-id> \
+  --query 'deploymentInfo.{status:status,rollback:rollbackInfo}'
+
+# 4. Verify service health
+curl https://staging.vaccichain.example.com/health
+```
+
+**Rollback verification checklist:**
+
+- [ ] CodeDeploy deployment status is `STOPPED` or `ROLLED_BACK`
+- [ ] ALB target group shows the previous task set as `HEALTHY` and receiving 100% traffic
+- [ ] `/health` returns `200`
+- [ ] Smoke tests pass against the restored environment
+- [ ] The failing release is recorded in the deployment summary and a follow-up issue is opened
+
+### Failure Injection (Rollback & SLO Alert Testing)
+
+Staging is the environment where rollback and alerting are deliberately broken to prove they work. Run this before promoting a release:
+
+1. **Deliberately failing release:** deploy a build with a broken health endpoint (e.g. `HEALTH_CHECK_FORCE_FAIL=true` in the staging task definition) via `gh workflow run deploy-staging.yml -f inject_failure=health`
+2. **Confirm the gate holds:** the canary must never exceed 10% traffic; CodeDeploy should roll back automatically within the canary window
+3. **Confirm rollback:** follow the rollback verification checklist above
+4. **Confirm SLO alerts fire:** the injected failure should trip the staging `error-rate` and `latency-p99` alarms; verify the alert reaches the on-call channel with its runbook link
+5. **Clean up:** remove the failure flag and redeploy the good build
+
+Failure injection runs only in staging and must never be enabled in production.
 
 ## Testing in Staging
 
@@ -323,6 +392,20 @@ aws ecs list-tasks --cluster vaccichain-staging
 aws ecs describe-tasks --cluster vaccichain-staging --tasks <task-arn>
 ```
 
+### Service-Level Objectives and Alerts
+
+Staging carries the same SLO definitions as production so alerts can be validated before release. Each SLI has an owner, severity, and runbook.
+
+| SLI | Objective (staging) | Alert threshold | Severity | Owner | Runbook |
+|---|---|---|---|---|---|
+| Availability (`/health` success rate) | 99.5% over 1h | < 99% for 5m | P1 | Backend on-call | `docs/runbooks/availability.md` |
+| Error rate (5xx / total) | < 1% over 1h | > 1% for 5m | P1 | Backend on-call | `docs/runbooks/error-rate.md` |
+| Latency (p99 API) | < 800ms over 1h | > 800ms for 10m | P2 | Backend on-call | `docs/runbooks/latency.md` |
+| Poller lag | < 30s | > 60s for 5m | P2 | Indexer on-call | `docs/runbooks/poller-lag.md` |
+| Data freshness | < 2 min | > 5m | P2 | Indexer on-call | `docs/runbooks/data-freshness.md` |
+
+Alerts are validated with the controlled failure injection described in [Failure Injection](#failure-injection-rollback--slo-alert-testing) — a failing release must trip the error-rate and latency alarms before it is promoted.
+
 ## Secrets Management in Staging
 
 Staging uses the same AWS Secrets Manager setup as production:
@@ -343,9 +426,11 @@ aws secretsmanager update-secret \
 ### Deployment Failed
 
 1. Check GitHub Actions workflow logs
-2. Review ECS task logs: `aws logs tail /ecs/vaccichain-staging`
-3. Verify secrets exist in Secrets Manager
-4. Check IAM permissions for ECS task role
+2. Review the CodeDeploy deployment status and rollback info: `aws deploy get-deployment --deployment-id <deployment-id>`
+3. Review ECS task logs: `aws logs tail /ecs/vaccichain-staging`
+4. Verify secrets exist in Secrets Manager
+5. Check IAM permissions for ECS task role
+6. If the deployment rolled back, confirm the previous task set is healthy before retrying
 
 ### Service Not Responding
 

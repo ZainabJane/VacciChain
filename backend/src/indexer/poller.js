@@ -7,6 +7,7 @@
 const StellarSdk = require('@stellar/stellar-sdk');
 const { upsertEvents, getLatestLedger } = require('./db');
 const { invalidateCache } = require('../stellar/issuerCache');
+const { setGauge } = require('../metrics');
 
 
 const SOROBAN_RPC_URL = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
@@ -83,8 +84,14 @@ async function poll() {
       .map(parseEvent)
       .filter(Boolean);
 
+    // Record successful poll timestamp and latest indexed ledger for SLO alerting
+    // (poller lag / data freshness).
+    setGauge('indexer_last_successful_poll_timestamp_seconds', Math.floor(Date.now() / 1000));
+    setGauge('indexer_latest_indexed_ledger', getLatestLedger());
+
     if (events.length) {
       upsertEvents(events);
+      setGauge('indexer_latest_indexed_ledger', getLatestLedger());
       if (process.env.NODE_ENV !== 'test') {
         console.log(`[indexer] Stored ${events.length} new event(s) from ledger ${startLedger}`);
       }

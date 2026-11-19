@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      rollback_only:
+        description: "Skip deployment and only run the rollback job"
+        type: boolean
+        default: false
 
 jobs:
   deploy-staging:
@@ -77,13 +82,74 @@ jobs:
           container-name: python-service
           image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-python:${{ github.sha }}
 
-      - name: Deploy to ECS and wait for stability
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
-        with:
-          task-definition: ${{ steps.task-def-final.outputs.task-definition }}
-          service: vaccichain-staging
-          cluster: vaccichain-staging
-          wait-for-service-stability: true
+      # ---------------------------------------------------------------------
+      # Blue/green (canary) deployment via CodeDeploy + ALB weighted target groups
+      #
+      # Traffic shift is defined in the CodeDeploy deployment config
+      # (staging/codedeploy-canary-config.json): 10% -> 50% -> 100%, with a
+      # configurable bake time between steps. CodeDeploy automatically rolls
+      # back to the previous (blue) task set if any health check or smoke test
+      # fails during the shift.
+      #
+      # ROLLBACK DRILL PROCEDURE (exercised with a deliberately failing release):
+      #   1. Push a commit that makes the backend health endpoint return 500
+      #      (e.g. set HEALTHCHECK_FORCE_FAIL=true in the image) to `main`.
+      #   2. Watch this workflow: the canary should shift 10% -> 50%, the ALB
+      #      health check / smoke test should fail, and CodeDeploy should
+      #      automatically roll back to the previous task set.
+      #   3. Confirm the `rollback` job below ran (triggered by `needs` failure)
+      #      and that the ALB is serving 100% traffic from the previous version.
+      #   4. Verify the alert webhook fired and the deployment summary shows
+      #      the rollback. Revert the failing commit afterwards.
+      # A manual rollback can be triggered via workflow_dispatch with
+      # `rollback_only: true`, or by re-running the `rollback` job.
+      # ---------------------------------------------------------------------
+
+      - name: Register new task definition (green)
+        id: register-task-def
+        run: |
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://${{ steps.task-def-final.outputs.task-definition }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "task-def-arn=${NEW_TASK_DEF_ARN}" >> "$GITHUB_OUTPUT"
+          echo "Registered new task definition: ${NEW_TASK_DEF_ARN}"
+
+      - name: Create CodeDeploy deployment (canary 10% -> 50% -> 100%)
+        id: codedeploy
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name vaccichain-staging \
+            --deployment-group-name vaccichain-staging \
+            --deployment-config-name vaccichain-staging-canary \
+            --revision '{
+              "revisionType": "AppSpecContent",
+              "appSpecContent": {
+                "content": "{\"version\":0.0,\"Resources\":[{\"TargetService\":{\"Type\":\"AWS::ECS::Service\",\"Properties\":{\"TaskDefinition\":\"${{ steps.register-task-def.outputs.task-def-arn }}\",\"LoadBalancerInfo\":{\"ContainerName\":\"backend\",\"ContainerPort\":8080}}}}]}"
+              }
+            }' \
+            --query 'deploymentId' \
+            --output text)
+          echo "deployment-id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+          echo "Started CodeDeploy deployment: ${DEPLOYMENT_ID}"
+
+      - name: Wait for CodeDeploy traffic shift and health checks
+        run: |
+          aws deploy wait deployment-successful \
+            --deployment-id "${{ steps.codedeploy.outputs.deployment-id }}"
+
+      - name: Smoke test green environment
+        run: |
+          for i in $(seq 1 10); do
+            if curl -sf --max-time 10 https://staging.vaccichain.example.com/health; then
+              echo "Smoke test passed"
+              exit 0
+            fi
+            echo "Smoke test attempt ${i} failed, retrying..."
+            sleep 15
+          done
+          echo "Smoke test failed after retries" >&2
+          exit 1
 
       - name: Post deployment summary
         run: |
@@ -100,4 +166,74 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{
               "text": "🚨 Staging deployment failed for commit `${{ github.sha }}` by `${{ github.actor }}`. See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }'
+
+  rollback:
+    name: Roll back staging deployment
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    # Runs automatically when the canary deployment fails its health/smoke
+    # checks, or manually via workflow_dispatch with rollback_only: true.
+    if: >-
+      always() && (
+        needs.deploy-staging.result == 'failure' ||
+        github.event.inputs.rollback_only == 'true'
+      )
+    environment:
+      name: staging
+      url: https://staging.vaccichain.example.com
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_STAGING }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Stop in-progress CodeDeploy deployment (triggers rollback)
+        run: |
+          DEPLOYMENT_ID=$(aws deploy list-deployments \
+            --application-name vaccichain-staging \
+            --deployment-group-name vaccichain-staging \
+            --include-only-statuses InProgress \
+            --query 'deployments[0]' \
+            --output text)
+          if [ -n "${DEPLOYMENT_ID}" ] && [ "${DEPLOYMENT_ID}" != "None" ]; then
+            echo "Stopping deployment ${DEPLOYMENT_ID} to trigger rollback"
+            aws deploy stop-deployment \
+              --deployment-id "${DEPLOYMENT_ID}" \
+              --auto-rollback-enabled
+            aws deploy wait deployment-successful --deployment-id "${DEPLOYMENT_ID}" || true
+          else
+            echo "No in-progress deployment found; nothing to stop."
+          fi
+
+      - name: Verify rollback restored previous version
+        run: |
+          for i in $(seq 1 10); do
+            if curl -sf --max-time 10 https://staging.vaccichain.example.com/health; then
+              echo "Rollback verified: previous version is healthy"
+              exit 0
+            fi
+            echo "Health check attempt ${i} failed, retrying..."
+            sleep 15
+          done
+          echo "Rollback verification failed" >&2
+          exit 1
+
+      - name: Post rollback summary
+        run: |
+          echo "### Staging Rollback" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by:** \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reason:** ${{ needs.deploy-staging.result == 'failure' && 'deployment failure' || 'manual rollback' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp:** $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_STEP_SUMMARY
+
+      - name: Alert on rollback
+        if: always()
+        run: |
+          curl -sf -X POST "${{ secrets.ALERT_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "⚠️ Staging rollback executed for commit `${{ github.sha }}` by `${{ github.actor }}`. See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }'

@@ -19,3 +19,8 @@ updates:
     directory: "/contracts"
     schedule:
       interval: "daily"
+
+  - package-ecosystem: "terraform"
+    directory: "/infra"
+    schedule:
+      interval: "weekly"

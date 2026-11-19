@@ -27,6 +27,10 @@ This guide covers deploying VacciChain to a production environment on AWS ECS Fa
 10. [Monitoring and Alerting](#10-monitoring-and-alerting)
 11. [CloudWatch Logs](#11-cloudwatch-logs)
 12. [Rollback Procedure](#12-rollback-procedure)
+13. [Base Image Pinning and Update Cadence](#13-base-image-pinning-and-update-cadence)
+14. [Terraform Dependency Scanning](#14-terraform-dependency-scanning)
+15. [Canary / Blue-Green Deployment and Rollback Drills](#15-canary--blue-green-deployment-and-rollback-drills)
+16. [Image and Artifact Retention Policy](#16-image-and-artifact-retention-policy)
 
 ---
 
@@ -37,6 +41,8 @@ Complete these steps before touching any infrastructure.
 - [ ] External security audit completed and all critical findings resolved
 - [ ] All tests passing: `npm test` (backend), `cargo test` (contracts), `pytest` (python-service)
 - [ ] Dependency scans clean: `npm audit`, `cargo audit`, `pip audit`
+- [ ] Terraform provider/module scan clean (see [section 14](#14-terraform-dependency-scanning))
+- [ ] Base images pinned to controlled tags or digests (see [section 13](#13-base-image-pinning-and-update-cadence))
 - [ ] Domain DNS configured and propagated
 - [ ] AWS account limits reviewed (ECS tasks, ECR storage, Secrets Manager)
 - [ ] Mainnet launch checklist reviewed: [`docs/mainnet-launch.md`](./mainnet-launch.md)
@@ -362,6 +368,16 @@ aws ecr get-login-password --region us-east-1 | \
 ### 6.2 Build and Tag Images
 
 Use a versioned tag (e.g., the Git SHA or a semantic version) — never deploy `latest` to production.
+
+Base images in the Dockerfiles must follow the pinning policy in [section 13](#13-base-image-pinning-and-update-cadence). Record the resulting image digest after pushing — the digest is the immutable reference used for deployment and for cleanup protection:
+
+```bash
+aws ecr describe-images \
+  --repository-name vaccichain-backend \
+  --image-ids imageTag=$TAG \
+  --query 'imageDetails[0].imageDigest' \
+  --output text
+```
 
 ```bash
 export TAG=$(git rev-parse --short HEAD)
@@ -703,7 +719,7 @@ The ECS task execution role (`ecsTaskExecutionRole`) is granted `logs:CreateLogS
 
 ## 12. Rollback Procedure
 
-### 11.1 Rolling Back a Service
+### 12.1 Rolling Back a Service
 
 To revert to the previous image tag:
 
@@ -722,7 +738,7 @@ aws ecs update-service \
   --region us-east-1
 ```
 
-### 11.2 Rolling Back a Contract Deployment
+### 12.2 Rolling Back a Contract Deployment
 
 The Soroban contract supports upgrades via the `upgrade` function (admin-only). To revert:
 
@@ -746,7 +762,7 @@ The Soroban contract supports upgrades via the `upgrade` function (admin-only). 
 
 See [`docs/contract-upgrade.md`](./contract-upgrade.md) for the full upgrade and rollback process.
 
-### 11.3 Rollback Criteria
+### 12.3 Rollback Criteria
 
 Initiate a rollback if any of the following occur within 30 minutes of deployment:
 
@@ -755,6 +771,178 @@ Initiate a rollback if any of the following occur within 30 minutes of deploymen
 - ECS tasks are crash-looping (more than 3 restarts)
 - Contract calls are failing with unexpected errors
 - Audit log shows unauthorized access attempts
+
+For canary/blue-green rollback and the rollback drill procedure, see [section 15](#15-canary--blue-green-deployment-and-rollback-drills).
+
+---
+
+## 13. Base Image Pinning and Update Cadence
+
+Production images must be built from controlled base images so that every build is reproducible and auditable.
+
+### 13.1 Pinning Rules
+
+- **Production Dockerfiles** (`backend/Dockerfile`, `frontend/Dockerfile`, `python-service/Dockerfile`) must reference base images by **digest** (`FROM node:20.11.1-bookworm-slim@sha256:<digest>`) or, at minimum, by a fully qualified version tag — never `latest`, `stable`, or an unversioned major tag.
+- Digest pinning is preferred for production; the human-readable tag is kept alongside the digest for readability.
+- Base image changes are made only through automated dependency PRs (Renovate) or an explicitly reviewed manual PR.
+- The pinned digest is recorded in the PR description when it changes, so the change is traceable in the audit trail.
+
+### 13.2 Update Cadence
+
+| Update type | Cadence | Merge policy |
+|---|---|---|
+| Digest-only refresh (same tag) | Weekly (Renovate schedule) | Auto-merge once CI is green |
+| Patch version bump (e.g. `20.11.1` → `20.11.2`) | Weekly | Auto-merge once CI is green |
+| Minor version bump (e.g. `20.x` → `22.x`) | As released | Manual review required |
+| Major version bump (e.g. `20` → `22`) | As released | Manual review + staging soak required |
+
+Renovate opens base-image PRs on a weekly schedule. Digest and patch updates auto-merge after CI passes; minor and major updates require a reviewer and a successful staging deployment before merging.
+
+### 13.3 Verifying Pins
+
+```bash
+# Fail if any Dockerfile uses an unpinned or floating base image
+grep -nE '^\s*FROM\s+\S+:(latest|stable)\b' backend/Dockerfile frontend/Dockerfile python-service/Dockerfile && exit 1 || true
+
+# Show current pins
+grep -nE '^\s*FROM\s+' backend/Dockerfile frontend/Dockerfile python-service/Dockerfile
+```
+
+---
+
+## 14. Terraform Dependency Scanning
+
+CI scans Terraform providers and modules for known vulnerabilities and policy violations. The scan runs on every pull request that touches `infra/` and on a nightly schedule.
+
+### 14.1 What Is Scanned
+
+- Terraform **providers** locked in `.terraform.lock.hcl` (via `terraform providers lock` and a vulnerability scanner such as `trivy config` / `tfsec`)
+- Terraform **modules** referenced in `infra/` (registry and git sources)
+- Terraform **configuration** for insecure defaults (public buckets, open security groups, unencrypted volumes)
+
+### 14.2 Security Policy
+
+| Severity | Action |
+|---|---|
+| `CRITICAL` | CI **fails**; merge blocked; fix or documented exception required |
+| `HIGH` | CI **fails**; merge blocked; fix or documented exception required |
+| `MEDIUM` | CI warns; tracked as a follow-up issue |
+| `LOW` | Reported only |
+
+Exceptions must be recorded in `infra/security-exceptions.md` with an owner and expiry date. Expired exceptions fail CI.
+
+### 14.3 Running the Scan Locally
+
+```bash
+cd infra/envs/production
+terraform init -backend=false
+terraform providers lock -platform=linux_amd64
+
+# Vulnerability and misconfiguration scan
+trivy config --severity HIGH,CRITICAL --exit-code 1 .
+```
+
+A non-zero exit code means the change violates the security policy and must not be merged.
+
+---
+
+## 15. Canary / Blue-Green Deployment and Rollback Drills
+
+Backend releases use a blue/green traffic switch with a canary stage so that a failing release can be rolled back without downtime.
+
+### 15.1 Deployment Flow
+
+1. **Deploy green** — register a new task definition revision and create/update the green target group with the new image digest. No production traffic is sent yet.
+2. **Wait for healthy targets** — the deployment blocks until the green target group reports all targets healthy and `/health` returns `200`.
+3. **Canary switch (10%)** — shift 10% of ALB traffic to green and observe for 10 minutes. Abort on any 5xx increase or failed health check.
+4. **Full switch (100%)** — shift remaining traffic to green, keep blue running for 30 minutes as the rollback target.
+5. **Retire blue** — after the soak window and passing smoke tests, scale blue down to zero.
+
+```bash
+# Example: shift 10% of traffic to the green target group
+aws elbv2 modify-listener \
+  --listener-arn $LISTENER_ARN \
+  --default-actions '[{
+    "Type": "forward",
+    "ForwardConfig": {
+      "TargetGroups": [
+        {"TargetGroupArn": "'"$BLUE_TG_ARN"'", "Weight": 90},
+        {"TargetGroupArn": "'"$GREEN_TG_ARN"'", "Weight": 10}
+      ]
+    }
+  }]'
+```
+
+The deployment fails (and does not switch traffic) if green targets do not become healthy within the configured grace period.
+
+### 15.2 Rollback
+
+If the canary or smoke checks fail, shift 100% of traffic back to blue and stop the green deployment:
+
+```bash
+aws elbv2 modify-listener \
+  --listener-arn $LISTENER_ARN \
+  --default-actions Type=forward,TargetGroupArn=$BLUE_TG_ARN
+
+aws ecs update-service \
+  --cluster vaccichain-prod \
+  --service vaccichain-backend \
+  --task-definition vaccichain-prod:<PREVIOUS_REVISION>
+```
+
+### 15.3 Rollback Drill
+
+The rollback path must be exercised at least once per quarter using a deliberately failing test release:
+
+1. Build a test image that fails its health check (e.g. returns `500` from `/health`).
+2. Deploy it through the normal pipeline to a staging (or production canary) target group.
+3. Confirm the deployment **does not** complete the traffic switch and that the canary is aborted.
+4. Confirm traffic returns to the previous (blue) target group and the service remains healthy.
+5. Record the drill date, outcome, and any issues in the release log.
+
+A drill that does not abort cleanly is treated as a release blocker until fixed.
+
+---
+
+## 16. Image and Artifact Retention Policy
+
+Retention keeps registries and workflow artifacts within cost limits while preserving release evidence.
+
+### 16.1 Retention Classes
+
+| Class | Examples | Retention |
+|---|---|---|
+| Disposable build outputs | PR/preview images, untagged layers, CI artifacts from non-release runs | 14 days |
+| Release candidates | Tagged images from `main` that were not promoted | 30 days |
+| Signed production releases | Images referenced by a production deployment, signed release artifacts, SBOMs, provenance attestations | Indefinite (never auto-deleted) |
+
+### 16.2 Cleanup Rules
+
+- ECR lifecycle policies delete untagged images after 14 days and non-release tagged images after 30 days.
+- GitHub Actions artifacts from non-release workflows expire after 14 days.
+- Signed production release artifacts (image digests, SBOMs, signatures, deployment records) are retained indefinitely as audit evidence.
+
+### 16.3 Protection of Deployed Images
+
+Automated cleanup **must not** delete:
+
+- The image digest currently deployed to any production ECS service
+- The previous revision kept as the rollback target
+- Any image referenced by a signed release record
+
+Before deleting, the cleanup job resolves the digests in use by production services and excludes them:
+
+```bash
+# Digests currently deployed in production — must be excluded from cleanup
+aws ecs describe-services \
+  --cluster vaccichain-prod \
+  --services vaccichain-backend \
+  --query 'services[0].taskDefinition' --output text | \
+  xargs -I{} aws ecs describe-task-definition --task-definition {} \
+  --query 'taskDefinition.containerDefinitions[].image' --output text
+```
+
+Cleanup jobs run in dry-run mode first and log every candidate for deletion; any candidate matching a protected digest is skipped and reported.
 
 ---
 
@@ -767,6 +955,7 @@ Initiate a rollback if any of the following occur within 30 minutes of deploymen
 - [Mainnet Launch Checklist](./mainnet-launch.md) — Pre-launch sign-off checklist
 - [Contract Upgrade Guide](./contract-upgrade.md) — Upgrading the Soroban contract
 - [Staging Setup](./staging-setup.md) — Staging environment reference
+- [Infra Security Exceptions](../infra/security-exceptions.md) — Documented scan exceptions
 - [Stellar Documentation](https://developers.stellar.org/)
 - [AWS ECS Fargate](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html)
 - [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/)

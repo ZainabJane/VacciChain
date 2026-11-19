@@ -1,5 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Update cadence: Renovate runs weekly (before 3am on Monday). Docker digest-only updates are auto-merged; minor/major base image updates require approval. Terraform providers and modules are kept updated weekly and grouped for review.",
   "extends": [
     "config:base",
     ":docker"
@@ -9,6 +10,9 @@
     "enabled": true,
     "major": {
       "enabled": false
+    },
+    "digest": {
+      "enabled": true
     }
   },
   "vulnerabilityAlerts": {
@@ -18,15 +22,19 @@
   "docker-compose": {
     "enabled": false
   },
+  "terraform": {
+    "enabled": true
+  },
   "packageRules": [
     {
-      "description": "Auto-merge Docker digest-only updates",
+      "description": "Auto-merge Docker digest-only updates weekly",
       "matchDatasources": ["docker"],
       "matchUpdateTypes": ["digest"],
       "automerge": true,
       "automergeType": "pr",
       "automergeStrategy": "squash",
-      "minimumReleaseAge": "0 days"
+      "minimumReleaseAge": "0 days",
+      "schedule": ["before 3am on Monday"]
     },
     {
       "description": "Require approval for minor/major Node.js updates",
@@ -44,6 +52,13 @@
       "description": "Require approval for minor/major nginx updates",
       "matchImages": ["nginx"],
       "matchUpdateTypes": ["minor", "major"],
+      "automerge": false
+    },
+    {
+      "description": "Keep Terraform providers and modules updated weekly, grouped for review",
+      "matchManagers": ["terraform"],
+      "groupName": "terraform providers and modules",
+      "schedule": ["before 3am on Monday"],
       "automerge": false
     }
   ],

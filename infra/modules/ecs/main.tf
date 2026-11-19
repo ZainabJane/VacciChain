@@ -9,6 +9,16 @@ variable "secret_arns"     { type = map(string) }
 variable "backend_cpu"     { type = number; default = 512 }
 variable "backend_memory"  { type = number; default = 1024 }
 variable "desired_count"   { type = number; default = 1 }
+# Percentage of backend traffic routed to the canary target group (0-100).
+# 0 = all traffic on the stable target group; 100 = fully promoted canary.
+variable "backend_canary_weight" {
+  type    = number
+  default = 0
+  validation {
+    condition     = var.backend_canary_weight >= 0 && var.backend_canary_weight <= 100
+    error_message = "backend_canary_weight must be between 0 and 100."
+  }
+}
 
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
@@ -156,12 +166,43 @@ resource "aws_lb_listener" "http" {
   }
 }
 
+# ── Canary target group for backend (weighted traffic switching) ──────────────
+# Deploy the new backend revision to this target group, verify health/smoke
+# checks, then shift weights on the listener rule below. Rollback = set the
+# canary weight back to 0 and drain the canary target group.
+resource "aws_lb_target_group" "backend_canary" {
+  name        = "${var.name}-backend-canary-tg"
+  port        = 4000
+  protocol    = "HTTP"
+  vpc_id      = var.vpc_id
+  target_type = "ip"
+  health_check {
+    path                = "/health"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    interval            = 30
+  }
+}
+
 resource "aws_lb_listener_rule" "api" {
   listener_arn = aws_lb_listener.http.arn
   priority     = 10
   action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.backend.arn
+    type = "forward"
+    forward {
+      target_group {
+        arn    = aws_lb_target_group.backend.arn
+        weight = var.backend_canary_weight
+      }
+      target_group {
+        arn    = aws_lb_target_group.backend_canary.arn
+        weight = 100 - var.backend_canary_weight
+      }
+      stickiness {
+        enabled  = true
+        duration = 3600
+      }
+    }
   }
   condition {
     path_pattern { values = ["/v1/*", "/health"] }
@@ -238,6 +279,14 @@ resource "aws_ecs_service" "backend" {
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
   network_configuration {
     subnets         = var.private_subnets
     security_groups = [aws_security_group.tasks.id]
@@ -283,6 +332,14 @@ resource "aws_ecs_service" "frontend" {
   task_definition = aws_ecs_task_definition.frontend.arn
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
+
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
 
   network_configuration {
     subnets         = var.private_subnets
@@ -333,6 +390,14 @@ resource "aws_ecs_service" "analytics" {
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
   network_configuration {
     subnets         = var.private_subnets
     security_groups = [aws_security_group.tasks.id]
@@ -341,3 +406,5 @@ resource "aws_ecs_service" "analytics" {
 
 output "alb_dns_name" { value = aws_lb.this.dns_name }
 output "cluster_name" { value = aws_ecs_cluster.this.name }
+output "backend_target_group_arn"        { value = aws_lb_target_group.backend.arn }
+output "backend_canary_target_group_arn" { value = aws_lb_target_group.backend_canary.arn }
