@@ -29,6 +29,85 @@ const errorHandler = require('./middleware/errorHandler');
 const app = express();
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
 
+// --- Graceful shutdown / in-flight request tracking -------------------------
+const DEFAULT_DRAIN_TIMEOUT_MS = 10000;
+
+let shuttingDown = false;
+let inFlightRequests = 0;
+let drainResolve = null;
+let drainPromise = null;
+
+/**
+ * Begin draining: reject new requests with 503 and resolve once all in-flight
+ * requests have completed or the timeout expires.
+ *
+ * @param {number} [timeoutMs] - Maximum time to wait for in-flight requests.
+ * @returns {Promise<{drained: boolean, remaining: number}>}
+ */
+function beginDrain(timeoutMs = DEFAULT_DRAIN_TIMEOUT_MS) {
+  if (drainPromise) return drainPromise;
+
+  shuttingDown = true;
+  logger.info('Draining in-flight requests...', { inFlight: inFlightRequests, timeoutMs });
+
+  drainPromise = new Promise((resolve) => {
+    let settled = false;
+    const finish = (drained) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      drainResolve = null;
+      resolve({ drained, remaining: inFlightRequests });
+    };
+
+    const timer = setTimeout(() => {
+      logger.warn('Drain timeout reached; remaining requests will be terminated', {
+        remaining: inFlightRequests,
+      });
+      finish(false);
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    drainResolve = () => {
+      if (inFlightRequests === 0) finish(true);
+    };
+
+    // Nothing in flight — resolve immediately.
+    if (inFlightRequests === 0) finish(true);
+  });
+
+  return drainPromise;
+}
+
+/** Whether the app is currently draining / shutting down. */
+function isShuttingDown() {
+  return shuttingDown;
+}
+
+// Registered early so every request (including rejected ones) is accounted for.
+app.use((req, res, next) => {
+  if (shuttingDown) {
+    res.setHeader('Connection', 'close');
+    res.setHeader('Retry-After', '5');
+    return res.status(503).json({ error: 'Service Unavailable', message: 'Server is shutting down' });
+  }
+
+  inFlightRequests += 1;
+  let finished = false;
+  const onDone = () => {
+    if (finished) return;
+    finished = true;
+    inFlightRequests -= 1;
+    if (drainResolve) drainResolve();
+  };
+
+  res.on('finish', onDone);
+  res.on('close', onDone);
+
+  next();
+});
+// ---------------------------------------------------------------------------
+
 app.use(cors({
   origin: (origin, callback) => {
     // Allow requests with no origin (like mobile apps or curl requests)
@@ -140,3 +219,6 @@ if (require.main === module) {
 }
 
 module.exports = app;
+module.exports.beginDrain = beginDrain;
+module.exports.isShuttingDown = isShuttingDown;
+module.exports.getInFlightCount = () => inFlightRequests;

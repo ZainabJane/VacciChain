@@ -282,3 +282,86 @@ describe('Integration Tests - Error Handling', () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe('Integration Tests - Graceful Shutdown', () => {
+  const shutdown = require('../src/shutdown');
+  const db = require('../src/db');
+  const poller = require('../src/poller');
+
+  const SHUTDOWN_TIMEOUT_MS = 2000;
+
+  beforeEach(() => {
+    shutdown.reset();
+    jest.restoreAllMocks();
+  });
+
+  afterEach(async () => {
+    await shutdown.reset();
+  });
+
+  it('drains an in-flight request before the timeout', async () => {
+    let releaseSlowRequest;
+    const slowRequestGate = new Promise((resolve) => {
+      releaseSlowRequest = resolve;
+    });
+
+    // Register a slow in-flight operation with the shutdown coordinator.
+    const inFlight = shutdown.track(async () => {
+      await slowRequestGate;
+      return 'completed';
+    });
+
+    const shutdownPromise = shutdown.gracefulShutdown({ timeoutMs: SHUTDOWN_TIMEOUT_MS });
+
+    // Release the in-flight work shortly after shutdown begins.
+    setTimeout(() => releaseSlowRequest(), 50);
+
+    const result = await shutdownPromise;
+
+    await expect(inFlight).resolves.toBe('completed');
+    expect(result.drained).toBe(true);
+    expect(result.timedOut).toBe(false);
+    expect(result.inFlightCompleted).toBe(1);
+    expect(result.inFlightFailed).toBe(0);
+  });
+
+  it('explicitly fails in-flight work that exceeds the timeout', async () => {
+    const neverResolves = new Promise(() => {});
+    const inFlight = shutdown.track(async () => {
+      await neverResolves;
+    });
+
+    const result = await shutdown.gracefulShutdown({ timeoutMs: 100 });
+
+    await expect(inFlight).rejects.toThrow(/shutdown/i);
+    expect(result.timedOut).toBe(true);
+    expect(result.drained).toBe(false);
+    expect(result.inFlightFailed).toBe(1);
+  });
+
+  it('returns 503 for new requests while draining', async () => {
+    const shutdownPromise = shutdown.gracefulShutdown({ timeoutMs: SHUTDOWN_TIMEOUT_MS });
+
+    const res = await request(app).get(`/verify/${VALID_WALLET}`);
+
+    expect(res.status).toBe(503);
+    expect(res.body.error).toMatch(/shutting down/i);
+
+    await shutdownPromise;
+  });
+
+  it('closes poller and database in order during shutdown', async () => {
+    const order = [];
+    jest.spyOn(poller, 'stop').mockImplementation(async () => {
+      order.push('poller');
+    });
+    jest.spyOn(db, 'close').mockImplementation(async () => {
+      order.push('db');
+    });
+
+    const result = await shutdown.gracefulShutdown({ timeoutMs: SHUTDOWN_TIMEOUT_MS });
+
+    expect(order).toEqual(['poller', 'db']);
+    expect(result.closed).toEqual(['poller', 'db']);
+  });
+});
