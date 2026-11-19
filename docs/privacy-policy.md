@@ -104,7 +104,44 @@ JWTs are stateless and short-lived (1 hour). No session store is maintained serv
 
 ---
 
-## 3. Off-Chain Data Purge Mechanism
+## 3. Off-Chain Data Classes, Retention & Deletion Constraints
+
+The following table summarises every off-chain data class, its retention period, and the constraints that govern deletion. It is the authoritative reference for the automated retention jobs described in section 3.1.
+
+| Data class | Store / location | Retention period | Deletion constraints |
+|---|---|---|---|
+| Audit logs | `AUDIT_LOG_PATH` (NDJSON, append-only) | 2 years from entry date | Purged only by `purge_audit_log.mjs`. Entries flagged as **compliance/recovery records** (see 3.2) are exempt and never purged. |
+| Indexed records | SQLite indexer DB (`DATABASE_PATH`) | Cache — retained indefinitely, rebuildable | May be wiped/rebuilt at any time; per-subject rows deleted via `purge_indexer.mjs`. Wiping never affects on-chain data. |
+| Operational data | Backend runtime (nonces, JWT state, temp files) | Ephemeral (≤ 1 hour; nonces 5 min) | Expires automatically; no manual purge required. |
+| Compliance audit trail | Separate compliance log (outside main audit log) | 6 years (HIPAA-aligned) | **Never** deleted by automated jobs; manual, approved deletion only. |
+| Recovery records | Backups / restore snapshots | 90 days rolling | **Never** deleted by automated retention jobs; expired only via the approved backup-rotation process. |
+
+**Approval:** This retention schedule must be reviewed and approved by the legal/compliance advisor (see section 7) before mainnet. Any change to a retention period requires re-approval.
+
+### 3.1 Automated Retention Jobs
+
+| Job | Target | Schedule (recommended) | Protects |
+|---|---|---|---|
+| `purge_audit_log.mjs --older-than 730` | Audit logs older than 2 years | Daily (cron) | Skips compliance/recovery-flagged entries |
+| `purge_indexer.mjs --wallet <KEY>` | Per-subject indexer rows | On data-subject request | On-chain data untouched |
+| Backup rotation | Recovery snapshots older than 90 days | Daily (cron) | Retains the most recent 90 days |
+
+All jobs are idempotent and dry-run capable (`--dry-run`). Jobs must be covered by tests that assert required audit and recovery records are **not** deleted (see `backend/test/retention.test.mjs`).
+
+### 3.2 Protected Records (Never Auto-Deleted)
+
+The following records are explicitly excluded from all automated retention/purge jobs:
+
+- Audit entries marked `retain: true` or belonging to the compliance audit trail.
+- Any record referenced by an open incident, legal hold, or data-subject request in progress.
+- Recovery/backup snapshots within the 90-day window.
+
+A legal hold flag overrides all retention periods until cleared by the compliance advisor.
+
+---
+
+## 4. Off-Chain Data Purge Mechanism
+=======
 
 For data subject deletion requests (GDPR Article 17 "right to erasure"):
 
@@ -123,7 +160,7 @@ All purge operations must be logged in a separate compliance audit trail (outsid
 
 ---
 
-## 4. Data Controller & Processor Responsibilities
+## 5. Data Controller & Processor Responsibilities
 
 | Role | Party | Obligations |
 |---|---|---|
@@ -133,7 +170,7 @@ All purge operations must be logged in a separate compliance audit trail (outsid
 
 ---
 
-## 5. Security Measures
+## 6. Security Measures
 
 - Audit logs stored with filesystem permissions restricted to the backend process user.
 - Database volume (`vaccichain_db`) not exposed outside the Docker network.
@@ -143,7 +180,7 @@ All purge operations must be logged in a separate compliance audit trail (outsid
 
 ---
 
-## 6. Legal Basis for Processing (GDPR)
+## 7. Legal Basis for Processing (GDPR)
 
 | Processing activity | Legal basis |
 |---|---|
@@ -153,12 +190,12 @@ All purge operations must be logged in a separate compliance audit trail (outsid
 
 ---
 
-## 7. Compliance Review Requirement
+## 8. Compliance Review Requirement
 
 > ⚠️ **This policy must be reviewed and approved by a qualified legal/compliance advisor before mainnet deployment.** The review should cover GDPR (EU), HIPAA (US), and any jurisdiction-specific health data regulations applicable to the deployment region.
 
 ---
 
-## 8. Contact
+## 9. Contact
 
 For data subject requests or compliance enquiries, contact the platform operator at the address provided during onboarding.

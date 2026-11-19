@@ -9,6 +9,45 @@ const path = require('path');
 let db = null;
 let dbPath = null;
 
+/**
+ * Retention policy for off-chain data classes.
+ *
+ * - indexed_events: raw indexed event rows. Retained for EVENT_RETENTION_DAYS.
+ *   Never purged below the last recovery checkpoint ledger (see
+ *   `setRecoveryCheckpoint`) so the indexer can always resume/replay.
+ * - operational_data: transient operational rows (e.g. revoked API keys).
+ *   Retained for OPERATIONAL_RETENTION_DAYS.
+ * - audit_logs / patient_consent / issuer_applications: audit, consent and
+ *   recovery-critical records. NEVER purged by automated jobs.
+ */
+const RETENTION_POLICY = Object.freeze({
+  indexed_events: { retentionDays: 90, purgeable: true, protectedByCheckpoint: true },
+  operational_data: { retentionDays: 30, purgeable: true, protectedByCheckpoint: false },
+  audit_logs: { retentionDays: null, purgeable: false },
+  patient_consent: { retentionDays: null, purgeable: false },
+  issuer_applications: { retentionDays: null, purgeable: false },
+});
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Ledger sequence below which indexed events must never be purged. */
+let recoveryCheckpointLedger = 0;
+
+/** Record the last recovery checkpoint; events at/below it are protected. */
+function setRecoveryCheckpoint(ledger) {
+  if (typeof ledger === 'number' && ledger > recoveryCheckpointLedger) {
+    recoveryCheckpointLedger = ledger;
+  }
+}
+
+function getRecoveryCheckpoint() {
+  return recoveryCheckpointLedger;
+}
+
+function getRetentionPolicy() {
+  return RETENTION_POLICY;
+}
+
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS events (
     id          TEXT PRIMARY KEY,
@@ -156,7 +195,66 @@ function revokeApiKey(id) {
   flush();
 }
 
-module.exports = { initDb, upsertEvents, queryEvents, getLatestLedger, insertApiKey, getApiKeyByHash, listApiKeys, revokeApiKey, getConsent, recordConsent, hasConsented, insertIssuerApplication, getIssuerApplication, listIssuerApplications, updateIssuerApplicationStatus };
+// ── Retention / purge jobs ───────────────────────────────────────────────────
+
+/**
+ * Delete indexed event rows older than the configured retention period.
+ * Rows at or below the recovery checkpoint ledger are always preserved.
+ * @param {{ now?: number, retentionDays?: number }} opts
+ * @returns {{ deleted: number, cutoff: number, protectedLedger: number }}
+ */
+function purgeIndexedEvents({ now = Date.now(), retentionDays } = {}) {
+  const days = retentionDays != null
+    ? retentionDays
+    : RETENTION_POLICY.indexed_events.retentionDays;
+  const cutoff = now - days * DAY_MS;
+
+  const before = db.exec('SELECT COUNT(*) FROM events')[0].values[0][0];
+  db.run(
+    'DELETE FROM events WHERE timestamp < ? AND ledger > ?',
+    [cutoff, recoveryCheckpointLedger]
+  );
+  const after = db.exec('SELECT COUNT(*) FROM events')[0].values[0][0];
+  flush();
+  return { deleted: before - after, cutoff, protectedLedger: recoveryCheckpointLedger };
+}
+
+/**
+ * Purge transient operational data (revoked API keys older than retention).
+ * Audit, consent and issuer records are never touched.
+ * @param {{ now?: number, retentionDays?: number }} opts
+ * @returns {{ deleted: number, cutoff: number }}
+ */
+function purgeOperationalData({ now = Date.now(), retentionDays } = {}) {
+  const days = retentionDays != null
+    ? retentionDays
+    : RETENTION_POLICY.operational_data.retentionDays;
+  const cutoffIso = new Date(now - days * DAY_MS).toISOString();
+
+  const before = db.exec('SELECT COUNT(*) FROM api_keys')[0].values[0][0];
+  db.run(
+    'DELETE FROM api_keys WHERE revoked = 1 AND created_at < ?',
+    [cutoffIso]
+  );
+  const after = db.exec('SELECT COUNT(*) FROM api_keys')[0].values[0][0];
+  flush();
+  return { deleted: before - after, cutoff: now - days * DAY_MS };
+}
+
+/**
+ * Entry point for the scheduled retention job. Runs all purgeable data-class
+ * jobs and returns a per-class summary.
+ * @param {{ now?: number }} opts
+ */
+function runRetentionJobs({ now = Date.now() } = {}) {
+  return {
+    ranAt: new Date(now).toISOString(),
+    indexed_events: purgeIndexedEvents({ now }),
+    operational_data: purgeOperationalData({ now }),
+  };
+}
+
+module.exports = { initDb, upsertEvents, queryEvents, getLatestLedger, insertApiKey, getApiKeyByHash, listApiKeys, revokeApiKey, getConsent, recordConsent, hasConsented, insertIssuerApplication, getIssuerApplication, listIssuerApplications, updateIssuerApplicationStatus, getRetentionPolicy, setRecoveryCheckpoint, getRecoveryCheckpoint, purgeIndexedEvents, purgeOperationalData, runRetentionJobs };
 
 // ── Patient consent ───────────────────────────────────────────────────────────
 

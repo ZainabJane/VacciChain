@@ -40,6 +40,41 @@ The backend validates its variables at startup via [Zod](https://zod.dev/). A mi
 - Example (testnet): `STELLAR_NETWORK_PASSPHRASE=Test SDF Network ; September 2015`
 - Example (mainnet): `STELLAR_NETWORK_PASSPHRASE=Public Global Stellar Network ; September 2015`
 
+### `HORIZON_TIMEOUT_MS`
+- Required: no
+- Default: `10000`
+- Format: positive integer (milliseconds)
+- Description: Per-request timeout applied to every Horizon HTTP call. Prevents workers from blocking indefinitely on a slow or unresponsive Horizon endpoint. Exceeding the timeout aborts the request and surfaces a classified `timeout` error.
+- Example: `HORIZON_TIMEOUT_MS=10000`
+
+### `SOROBAN_RPC_TIMEOUT_MS`
+- Required: no
+- Default: `15000`
+- Format: positive integer (milliseconds)
+- Description: Per-request timeout applied to every Soroban RPC call (simulation, submission, and status polling). Exceeding the timeout aborts the request and surfaces a classified `timeout` error.
+- Example: `SOROBAN_RPC_TIMEOUT_MS=15000`
+
+### `SOROBAN_RPC_MAX_RETRIES`
+- Required: no
+- Default: `3`
+- Format: non-negative integer
+- Description: Maximum number of retries for Soroban RPC calls. Only idempotent, read-only operations (e.g. `simulateTransaction`, `getTransaction`) are retried. Transaction submission is never retried automatically — a submission that times out is reported as `indeterminate` so callers can reconcile via transaction hash instead of risking a duplicate submission. When retries are exhausted the call fails with a classified error and a structured correlation identifier.
+- Example: `SOROBAN_RPC_MAX_RETRIES=3`
+
+### `SOROBAN_RPC_RETRY_BASE_DELAY_MS`
+- Required: no
+- Default: `250`
+- Format: positive integer (milliseconds)
+- Description: Base delay for exponential backoff between Soroban RPC retries. The delay for attempt *n* is `SOROBAN_RPC_RETRY_BASE_DELAY_MS * 2^(n-1)`, capped by `SOROBAN_RPC_RETRY_MAX_DELAY_MS`.
+- Example: `SOROBAN_RPC_RETRY_BASE_DELAY_MS=250`
+
+### `SOROBAN_RPC_RETRY_MAX_DELAY_MS`
+- Required: no
+- Default: `4000`
+- Format: positive integer (milliseconds)
+- Description: Upper bound on the backoff delay between Soroban RPC retries.
+- Example: `SOROBAN_RPC_RETRY_MAX_DELAY_MS=4000`
+
 ---
 
 ## Contract
@@ -123,6 +158,54 @@ The backend validates its variables at startup via [Zod](https://zod.dev/). A mi
 - Format: valid file path; the parent directory must be writable
 - Description: Path to the append-only NDJSON audit log file. Each line is a JSON object with `timestamp`, `actor`, `action`, `target`, `result`, and `meta`. Never deleted or updated — only appended.
 - Example: `AUDIT_LOG_PATH=/var/log/vaccichain/audit.log`
+
+---
+
+## Data retention and purge
+
+Retention is enforced by scheduled purge jobs. Each data class has its own retention window; audit and recovery records are protected from deletion.
+
+### `RETENTION_AUDIT_LOG_DAYS`
+- Required: no
+- Default: `365`
+- Format: positive integer (days)
+- Description: Retention window for audit log records. Audit records within this window are never purged. Records older than this window may be archived, but the append-only audit log file itself is never truncated in place — see `AUDIT_LOG_PATH`.
+- Example: `RETENTION_AUDIT_LOG_DAYS=365`
+
+### `RETENTION_INDEXED_RECORDS_DAYS`
+- Required: no
+- Default: `180`
+- Format: positive integer (days)
+- Description: Retention window for off-chain indexed records (e.g. cached vaccination events). Records older than this window are eligible for purge. On-chain data is unaffected.
+- Example: `RETENTION_INDEXED_RECORDS_DAYS=180`
+
+### `RETENTION_OPERATIONAL_DATA_DAYS`
+- Required: no
+- Default: `30`
+- Format: positive integer (days)
+- Description: Retention window for operational data such as request logs, metrics snapshots, and transient job state. Purely diagnostic — safe to purge aggressively.
+- Example: `RETENTION_OPERATIONAL_DATA_DAYS=30`
+
+### `RETENTION_PURGE_SCHEDULE_MINUTES`
+- Required: no
+- Default: `1440` (once per day)
+- Format: positive integer (minutes)
+- Description: How often the retention purge job runs. The job deletes only records past their class-specific retention window and skips any record flagged as required for audit or recovery.
+- Example: `RETENTION_PURGE_SCHEDULE_MINUTES=1440`
+
+### `RETENTION_PURGE_BATCH_SIZE`
+- Required: no
+- Default: `500`
+- Format: positive integer
+- Description: Maximum number of records deleted per batch within a single purge run. Bounds lock time and memory use on large purges.
+- Example: `RETENTION_PURGE_BATCH_SIZE=500`
+
+### `RETENTION_DRY_RUN`
+- Required: no
+- Default: `false`
+- Format: boolean (`true` | `false`)
+- Description: When `true`, the purge job logs what it would delete without deleting anything. Use to validate retention settings before enabling automated deletion.
+- Example: `RETENTION_DRY_RUN=false`
 
 ---
 
@@ -267,7 +350,11 @@ When an anomaly is detected the service POSTs a JSON payload to `ALERT_WEBHOOK_U
 | `STELLAR_NETWORK` | no | Zod (backend) | enum: `testnet` \| `mainnet` |
 | `HORIZON_URL` | yes | Zod (backend) | valid URL |
 | `SOROBAN_RPC_URL` | yes | Zod (backend) | valid URL |
+| `HORIZON_TIMEOUT_MS` | no | Zod (backend) | positive integer (ms), default 10000 |
+| `SOROBAN_RPC_TIMEOUT_MS` | no | Zod (backend) | positive integer (ms), default 15000 |
 | `SOROBAN_RPC_MAX_RETRIES` | no | Zod (backend) | non-negative integer, default 3 |
+| `SOROBAN_RPC_RETRY_BASE_DELAY_MS` | no | Zod (backend) | positive integer (ms), default 250 |
+| `SOROBAN_RPC_RETRY_MAX_DELAY_MS` | no | Zod (backend) | positive integer (ms), default 4000 |
 | `STELLAR_NETWORK_PASSPHRASE` | yes | Zod (backend) | non-empty string |
 | `VACCINATIONS_CONTRACT_ID` | yes | Zod (backend) | non-empty string |
 | `ADMIN_SECRET_KEY` | yes | Zod (backend) | non-empty string |
@@ -285,6 +372,12 @@ When an anomaly is detected the service POSTs a JSON payload to `ALERT_WEBHOOK_U
 | `RATE_LIMIT_SEP10` | no | runtime | parsed as integer, default 10 |
 | `RATE_LIMIT_VERIFY` | no | runtime | parsed as integer, default 60 |
 | `AUDIT_LOG_PATH` | no | runtime | writable path, default `./audit.log` |
+| `RETENTION_AUDIT_LOG_DAYS` | no | Zod (backend) | positive integer (days), default 365 |
+| `RETENTION_INDEXED_RECORDS_DAYS` | no | Zod (backend) | positive integer (days), default 180 |
+| `RETENTION_OPERATIONAL_DATA_DAYS` | no | Zod (backend) | positive integer (days), default 30 |
+| `RETENTION_PURGE_SCHEDULE_MINUTES` | no | Zod (backend) | positive integer (minutes), default 1440 |
+| `RETENTION_PURGE_BATCH_SIZE` | no | Zod (backend) | positive integer, default 500 |
+| `RETENTION_DRY_RUN` | no | Zod (backend) | boolean, default `false` |
 | `ANALYTICS_PORT` | no | runtime | positive integer, default 8001 |
 | `BACKEND_URL` | no | runtime | valid URL, default set by Compose |
 | `LOG_LEVEL` | no | runtime | Python logging level, default `INFO` |

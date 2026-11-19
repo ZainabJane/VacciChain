@@ -4,13 +4,16 @@ const crypto = require('crypto');
 const StellarSdk = require('@stellar/stellar-sdk');
 const config = require('../config');
 const nonceStore = require('./nonceStore');
+const stellarClient = require('./client');
 
 const NETWORK_PASSPHRASE =
   config.STELLAR_NETWORK === 'mainnet'
     ? StellarSdk.Networks.PUBLIC
     : StellarSdk.Networks.TESTNET;
 
-const server = new StellarSdk.Horizon.Server(config.HORIZON_URL);
+// All Horizon access goes through the shared client wrapper so calls get
+// bounded timeouts, safe retries, and classified errors with correlation IDs.
+const server = stellarClient.getHorizonServer();
 
 /**
  * Build a SEP-10 challenge transaction.

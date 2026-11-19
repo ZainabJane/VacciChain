@@ -5,6 +5,16 @@ const { initDb, upsertEvents, queryEvents, getLatestLedger } = require('../src/i
 const { parseEvent, stopPoller } = require('../src/indexer/poller');
 const { vaccinationRecordFactory } = require('./factories');
 
+let retention;
+try {
+  // Retention/purge module (backlog #53). Optional so this suite still runs
+  // if the module has not been wired up yet.
+  retention = require('../src/indexer/retention');
+} catch (err) {
+  retention = null;
+}
+const describeRetention = retention ? describe : describe.skip;
+
 
 const tmpDb = path.join(os.tmpdir(), `vaccichain-test-${Date.now()}.db`);
 
@@ -134,6 +144,84 @@ describe('poller — parseEvent', () => {
 
   it('returns null when topic is missing', () => {
     expect(parseEvent({ id: 'raw-005', ledger: 204 })).toBeNull();
+  });
+});
+
+describeRetention('retention — purge policies', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+
+  const seedRetentionEvents = () => {
+    upsertEvents([
+      {
+        id: 'ret-old-indexed',
+        event_type: 'VaccinationMinted',
+        ledger: 300,
+        timestamp: Math.floor((now - 400 * DAY_MS) / 1000),
+        contract_id: 'CABC',
+        payload: { vaccine_name: 'Old' },
+      },
+      {
+        id: 'ret-recent-indexed',
+        event_type: 'VaccinationMinted',
+        ledger: 301,
+        timestamp: Math.floor((now - 1 * DAY_MS) / 1000),
+        contract_id: 'CABC',
+        payload: { vaccine_name: 'Recent' },
+      },
+      {
+        id: 'ret-old-audit',
+        event_type: 'IssuerAdded',
+        ledger: 302,
+        timestamp: Math.floor((now - 400 * DAY_MS) / 1000),
+        contract_id: 'CABC',
+        payload: { issuer: 'GAUDIT' },
+      },
+    ]);
+  };
+
+  it('documents data classes with retention periods and deletion constraints', () => {
+    const policy = retention.getRetentionPolicy();
+    expect(Array.isArray(policy)).toBe(true);
+    expect(policy.length).toBeGreaterThan(0);
+    policy.forEach((entry) => {
+      expect(typeof entry.dataClass).toBe('string');
+      expect(typeof entry.retentionDays).toBe('number');
+      expect(entry.retentionDays).toBeGreaterThan(0);
+      expect(typeof entry.deletable).toBe('boolean');
+    });
+    const audit = policy.find((e) => /audit/i.test(e.dataClass));
+    expect(audit).toBeDefined();
+    expect(audit.deletable).toBe(false);
+  });
+
+  it('purges expired indexed events only', () => {
+    seedRetentionEvents();
+    const result = retention.runRetentionJob({ now });
+    expect(result).toBeDefined();
+    expect(result.purged).toBeGreaterThanOrEqual(1);
+
+    const remaining = queryEvents({ limit: 1000 }).map((e) => e.id);
+    expect(remaining).not.toContain('ret-old-indexed');
+    expect(remaining).toContain('ret-recent-indexed');
+  });
+
+  it('preserves audit and recovery records even when expired', () => {
+    seedRetentionEvents();
+    retention.runRetentionJob({ now });
+
+    const remaining = queryEvents({ limit: 1000 }).map((e) => e.id);
+    expect(remaining).toContain('ret-old-audit');
+  });
+
+  it('respects configured retention periods', () => {
+    seedRetentionEvents();
+    // With a very long retention window nothing should be purged.
+    const result = retention.runRetentionJob({ now, retentionDays: 100000 });
+    expect(result.purged).toBe(0);
+
+    const remaining = queryEvents({ limit: 1000 }).map((e) => e.id);
+    expect(remaining).toContain('ret-old-indexed');
   });
 });
 

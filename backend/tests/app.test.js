@@ -3,6 +3,11 @@ const app = require('../src/app');
 const health = require('../src/health');
 
 describe('Health check', () => {
+  afterEach(() => {
+    health.setSorobanHealthy(true);
+    health.setDatabaseHealthy(true);
+  });
+
   it('GET /health returns ok', async () => {
     const res = await request(app).get('/health');
     expect(res.status).toBe(200);
@@ -19,6 +24,61 @@ describe('Health check', () => {
     expect(typeof res.body.uptime).toBe('number');
     expect(res.body.uptime).toBeGreaterThanOrEqual(0);
     health.setSorobanHealthy(true);
+  });
+
+  it('GET /health/live returns 200 while the process is running', async () => {
+    health.setSorobanHealthy(false);
+    health.setDatabaseHealthy(false);
+    const res = await request(app).get('/health/live');
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(typeof res.body.uptime).toBe('number');
+    expect(res.body.uptime).toBeGreaterThanOrEqual(0);
+  });
+
+  it('GET /health/ready returns 200 when dependencies are healthy', async () => {
+    const res = await request(app).get('/health/ready');
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(res.body.checks).toEqual(
+      expect.objectContaining({ database: 'ok', soroban: 'ok' })
+    );
+  });
+
+  it('GET /health/ready returns 503 when Soroban is unavailable', async () => {
+    health.setSorobanHealthy(false);
+    const res = await request(app).get('/health/ready');
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.checks).toEqual(
+      expect.objectContaining({ database: 'ok', soroban: 'unavailable' })
+    );
+  });
+
+  it('GET /health/ready returns 503 when the database is unavailable', async () => {
+    health.setDatabaseHealthy(false);
+    const res = await request(app).get('/health/ready');
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.checks).toEqual(
+      expect.objectContaining({ database: 'unavailable', soroban: 'ok' })
+    );
+  });
+
+  it('health responses do not disclose secrets or raw errors', async () => {
+    health.setSorobanHealthy(false);
+    health.setDatabaseHealthy(false);
+    const endpoints = ['/health', '/health/live', '/health/ready'];
+    for (const endpoint of endpoints) {
+      const res = await request(app).get(endpoint);
+      const body = JSON.stringify(res.body);
+      expect(body).not.toMatch(/secret/i);
+      expect(body).not.toMatch(/password/i);
+      expect(body).not.toMatch(/stack/i);
+      expect(body).not.toMatch(/error/i);
+      expect(res.body).not.toHaveProperty('error');
+      expect(res.body).not.toHaveProperty('details');
+    }
   });
 });
 

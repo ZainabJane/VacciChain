@@ -20,7 +20,12 @@ const onboardingRoutes = require('./routes/onboarding');
 const apiVersion = require('./middleware/apiVersion');
 const securityHeaders = require('./middleware/securityHeaders');
 const { getRpcServer } = require('./stellar/soroban');
-const { getHealthStatus, startHealthProbe } = require('./health');
+const {
+  getHealthStatus,
+  getLivenessStatus,
+  getReadinessStatus,
+  startHealthProbe,
+} = require('./health');
 
 const requestId = require('./middleware/requestId');
 const { sanitizeInputs } = require('./middleware/sanitize');
@@ -93,14 +98,41 @@ app.use(errorHandler);
 
 
 /**
- * Health check endpoint.
+ * Liveness probe — reports only whether the process is running.
+ * Never depends on the database or RPC, so orchestrators restart
+ * crashed processes without cycling on temporary dependency outages.
+ *
+ * @route GET /health/live
+ * @returns {Object} 200 - { status: "ok", uptime }
+ */
+app.get('/health/live', (_req, res) => {
+  res.status(200).json(getLivenessStatus());
+});
+
+/**
+ * Readiness probe — reports whether required dependencies (database and
+ * required RPC) are available. Returns 503 when any dependency is down.
+ * Responses contain only status booleans and uptime; no secrets or raw
+ * error messages are disclosed.
+ *
+ * @route GET /health/ready
+ * @returns {Object} 200 - { status: "ok", uptime, checks: { database, rpc } }
+ * @returns {Object} 503 - { status: "degraded", uptime, checks: { database, rpc } }
+ */
+app.get('/health/ready', async (_req, res) => {
+  const body = await getReadinessStatus();
+  res.status(body.status === 'ok' ? 200 : 503).json(body);
+});
+
+/**
+ * Backwards-compatible alias for the readiness probe.
  *
  * @route GET /health
- * @returns {Object} 200 - { status: "ok", uptime }
- * @returns {Object} 503 - { status: "degraded", uptime }
+ * @returns {Object} 200 - { status: "ok", uptime, checks: { database, rpc } }
+ * @returns {Object} 503 - { status: "degraded", uptime, checks: { database, rpc } }
  */
 app.get('/health', async (_req, res) => {
-  const body = getHealthStatus();
+  const body = await getReadinessStatus();
   res.status(body.status === 'ok' ? 200 : 503).json(body);
 });
 

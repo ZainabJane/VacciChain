@@ -9,6 +9,14 @@ const schema = z.object({
   SOROBAN_RPC_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   STELLAR_NETWORK_PASSPHRASE: z.string().min(1),
 
+  // Stellar call timeouts and retry policy (Horizon + Soroban RPC)
+  // Only idempotent/read operations are retried; transaction submissions are not.
+  STELLAR_RPC_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  STELLAR_RPC_MAX_RETRIES: z.coerce.number().int().nonnegative().default(3),
+  STELLAR_RETRY_BASE_DELAY_MS: z.coerce.number().int().nonnegative().default(250),
+  STELLAR_RETRY_MAX_DELAY_MS: z.coerce.number().int().nonnegative().default(5000),
+=======
+
   // Contract
   VACCINATIONS_CONTRACT_ID: z.string().min(1),
 
@@ -40,6 +48,16 @@ const schema = z.object({
   // Indexer
   EVENT_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(15000),
   DATABASE_PATH: z.string().default('/data/vaccichain.db'),
+
+  // Retention / purge policies (off-chain data)
+  // Indexed event records
+  RETENTION_EVENTS_DAYS: z.coerce.number().int().positive().default(365),
+  // Operational data (caches, job state, transient records)
+  RETENTION_OPERATIONAL_DAYS: z.coerce.number().int().positive().default(30),
+  // Audit logs (must be retained; purge only beyond this window)
+  RETENTION_AUDIT_DAYS: z.coerce.number().int().positive().default(1825),
+  // How often automated retention jobs run
+  RETENTION_JOB_INTERVAL_MS: z.coerce.number().int().positive().default(3600000),
 });
 
 function validateEnv(env) {

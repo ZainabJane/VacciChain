@@ -1,73 +1,25 @@
 const StellarSdk = require('@stellar/stellar-sdk');
 const config = require('../config');
 const logger = require('../logger');
+const {
+  withTimeout,
+  withRetry,
+  classifyError,
+  getCorrelationId,
+  SorobanError,
+  SorobanRpcError,
+  SorobanTransactionError,
+  SorobanSimulationError,
+  SorobanTimeoutError,
+  SorobanTransientError,
+  SorobanPermanentError,
+} = require('./client');
 
 const {
   SOROBAN_RPC_URL,
   STELLAR_NETWORK_PASSPHRASE: NETWORK_PASSPHRASE,
   VACCINATIONS_CONTRACT_ID: CONTRACT_ID,
-  SOROBAN_RPC_MAX_RETRIES,
-  SOROBAN_RPC_TIMEOUT_MS,
 } = config;
-
-class SorobanError extends Error {
-  constructor(message, originalError) {
-    super(message);
-    this.name = 'SorobanError';
-    this.original = originalError;
-  }
-}
-
-class SorobanRpcError extends SorobanError {
-  constructor(message, originalError) {
-    super(message, originalError);
-    this.name = 'SorobanRpcError';
-  }
-}
-
-class SorobanTransactionError extends SorobanError {
-  constructor(message, originalError) {
-    super(message, originalError);
-    this.name = 'SorobanTransactionError';
-  }
-}
-
-class SorobanSimulationError extends SorobanError {
-  constructor(message, originalError) {
-    super(message, originalError);
-    this.name = 'SorobanSimulationError';
-  }
-}
-
-class SorobanTimeoutError extends SorobanError {
-  constructor(context, elapsedMs) {
-    super(`RPC timeout after ${elapsedMs}ms (context: ${context})`);
-    this.name = 'SorobanTimeoutError';
-    this.context = context;
-    this.elapsedMs = elapsedMs;
-  }
-}
-
-/**
- * Race an async fn against a timeout. Cleans up the timer on resolution.
- * Throws SorobanTimeoutError if the timeout fires first.
- */
-async function withTimeout(fn, context) {
-  const start = Date.now();
-  let timer;
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      const elapsed = Date.now() - start;
-      logger.warn('Soroban RPC timeout', { context, rpcUrl: SOROBAN_RPC_URL, elapsedMs: elapsed });
-      reject(new SorobanTimeoutError(context, elapsed));
-    }, SOROBAN_RPC_TIMEOUT_MS);
-  });
-  try {
-    return await Promise.race([fn(), timeoutPromise]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 // Fee in stroops (1 XLM = 10_000_000 stroops). Minimum is 100.
 const TX_FEE = String(process.env.SOROBAN_FEE || 100);
@@ -79,55 +31,20 @@ function getRpcServer() {
 }
 
 /**
- * Helper to retry RPC calls with exponential backoff.
- * @param {Function} fn - The RPC call to execute
- * @param {string} context - Context for logging
+ * Execute a single-attempt RPC call (used for non-idempotent operations such as
+ * transaction submission). Applies a bounded timeout but never retries, so a
+ * transaction is never submitted twice.
  */
-async function withRetry(fn, context = '') {
-  let lastError;
-  for (let attempt = 0; attempt <= SOROBAN_RPC_MAX_RETRIES; attempt++) {
-    try {
-      if (attempt > 0) {
-        const backoff = Math.pow(2, attempt - 1) * 100; // 100ms, 200ms, 400ms
-        logger.info(`Retrying Soroban RPC call`, {
-          context,
-          attempt,
-          maxRetries: SOROBAN_RPC_MAX_RETRIES,
-          backoffMs: backoff,
-        });
-        await new Promise((resolve) => setTimeout(resolve, backoff));
-      }
-      return await withTimeout(fn, context);
-    } catch (error) {
-      lastError = error;
+async function callOnce(fn, context) {
+  return withTimeout(fn, context);
+}
 
-      // Don't retry 4xx errors as they are likely client-side/contract logic errors
-      const status = error.response?.status;
-      if (status && status >= 400 && status < 500) {
-        logger.warn(`Non-retryable Soroban RPC error`, {
-          context,
-          status,
-          message: error.message,
-        });
-        throw error;
-      }
-
-      if (attempt === SOROBAN_RPC_MAX_RETRIES) {
-        logger.error(`Soroban RPC call failed after maximum retries`, {
-          context,
-          attempt,
-          message: error.message,
-        });
-      } else {
-        logger.debug(`Soroban RPC call transient failure`, {
-          context,
-          attempt,
-          message: error.message,
-        });
-      }
-    }
-  }
-  throw lastError;
+/**
+ * Execute an idempotent read-only RPC call with bounded timeout and retries.
+ * Only safe-to-retry operations should use this.
+ */
+async function callRead(fn, context) {
+  return withRetry(fn, context, { idempotent: true });
 }
 
 /**
@@ -139,7 +56,7 @@ async function withRetry(fn, context = '') {
 async function invokeContract(secretKey, method, args) {
   const rpc = getRpcServer();
   const keypair = StellarSdk.Keypair.fromSecret(secretKey);
-  const account = await withRetry(() => rpc.getAccount(keypair.publicKey()), 'getAccount');
+  const account = await callRead(() => rpc.getAccount(keypair.publicKey()), 'getAccount');
 
   const contract = new StellarSdk.Contract(CONTRACT_ID);
 
@@ -154,33 +71,34 @@ async function invokeContract(secretKey, method, args) {
     .setTimeout(30)
     .build();
 
-  const prepared = await withRetry(() => rpc.prepareTransaction(tx), 'prepareTransaction');
+  const prepared = await callRead(() => rpc.prepareTransaction(tx), 'prepareTransaction');
   prepared.sign(keypair);
 
-  const response = await withRetry(() => rpc.sendTransaction(prepared), 'sendTransaction');
+  // Submission is NOT idempotent: single attempt only, bounded by timeout.
+  const response = await callOnce(() => rpc.sendTransaction(prepared), 'sendTransaction');
   if (response.status === 'ERROR') {
     const errDetail = JSON.stringify(response.errorResult);
     if (errDetail.includes('txINSUFFICIENT_FEE') || errDetail.includes('fee')) {
-      throw new Error(
+      throw new SorobanPermanentError(
         `Transaction rejected: fee too low (current: ${TX_FEE} stroops). ` +
         `Increase SOROBAN_FEE in your environment. Details: ${errDetail}`
       );
     }
-    const error = new Error(`Contract invocation failed: ${errDetail}`);
+    const error = new SorobanTransactionError(`Contract invocation failed: ${errDetail}`);
     error.sorobanErrorResult = response.errorResult;
     throw error;
   }
 
-  // Poll for result
+  // Poll for result (read-only, safe to retry)
   let result;
   for (let i = 0; i < 10; i++) {
     await new Promise((r) => setTimeout(r, 2000));
-    result = await withRetry(() => rpc.getTransaction(response.hash), 'getTransaction');
+    result = await callRead(() => rpc.getTransaction(response.hash), 'getTransaction');
     if (result.status !== 'NOT_FOUND') break;
   }
 
   if (result.status !== 'SUCCESS') {
-    const error = new Error(`Transaction failed: ${result.status}`);
+    const error = new SorobanTransactionError(`Transaction failed: ${result.status}`);
     error.sorobanResultXdr = result.resultXdr;
     error.sorobanStatus = result.status;
     throw error;
@@ -269,9 +187,9 @@ async function simulateContract(method, args) {
     .setTimeout(30)
     .build();
 
-  const sim = await withRetry(() => rpc.simulateTransaction(tx), 'simulateTransaction');
+  const sim = await callRead(() => rpc.simulateTransaction(tx), 'simulateTransaction');
   if (StellarSdk.SorobanRpc.Api.isSimulationError(sim)) {
-    const error = new Error(`Simulation failed: ${sim.error}`);
+    const error = new SorobanSimulationError(`Simulation failed: ${sim.error}`);
     error.simulationError = sim.error;
     throw error;
   }
@@ -283,7 +201,11 @@ async function simulateContract(method, args) {
  * Send a 503 RPC timeout response. Use in route catch blocks when err is SorobanTimeoutError.
  */
 function sendRpcTimeout(res) {
-  return res.status(503).json({ error: 'RPC timeout', retryAfter: 5 });
+  return res.status(503).json({
+    error: 'RPC timeout',
+    retryAfter: 5,
+    correlationId: getCorrelationId(),
+  });
 }
 
 module.exports = {
@@ -295,11 +217,14 @@ module.exports = {
   addIssuer,
   revokeIssuer,
   sendRpcTimeout,
+  classifyError,
   SorobanError,
   SorobanRpcError,
   SorobanTransactionError,
   SorobanSimulationError,
   SorobanTimeoutError,
+  SorobanTransientError,
+  SorobanPermanentError,
 };
 
 /**

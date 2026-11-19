@@ -11,7 +11,8 @@ const { isValidStellarPublicKey } = require('../middleware/wallet');
 const { addIssuer, revokeIssuer, simulateContract } = require('../stellar/soroban');
 const { isAuthorizedIssuer, invalidateCache } = require('../stellar/issuerCache');
 const validate = require('../middleware/validate');
-const { addIssuerSchema, createApiKeySchema, rotateJwtSchema, approveProposalSchema } = require('./schemas/admin.schemas');
+const { addIssuerSchema, createApiKeySchema, rotateJwtSchema, approveProposalSchema, purgeRetentionSchema } = require('./schemas/admin.schemas');
+const { runRetentionPurge, RETENTION_POLICIES } = require('../retention');
 
 const router = express.Router();
 
@@ -215,6 +216,57 @@ router.get('/multisig/proposals/:id', adminAuthMiddleware, adminOnly, (req, res)
     status: proposal.status,
     expires_at: new Date(proposal.expiresAt).toISOString(),
   });
+});
+
+// ── Retention & purge policies ────────────────────────────────────────────────
+
+/**
+ * GET /admin/retention/policies
+ * Returns the documented data classes, retention periods and deletion
+ * constraints. Audit and recovery records are flagged as protected.
+ */
+router.get('/retention/policies', adminAuthMiddleware, adminOnly, (_req, res) => {
+  res.json({ policies: RETENTION_POLICIES });
+});
+
+/**
+ * POST /admin/retention/purge
+ * Body: { data_classes?: string[], dry_run?: boolean }
+ *
+ * Triggers the automated retention purge jobs. Only data classes that are
+ * eligible for deletion are purged; audit logs and recovery records are
+ * always protected and never deleted by this job. The purge action itself
+ * is recorded in the audit log.
+ */
+router.post('/retention/purge', adminAuthMiddleware, adminOnly, validate(purgeRetentionSchema), (req, res) => {
+  const { data_classes: dataClasses, dry_run: dryRun = false } = req.body || {};
+
+  try {
+    const result = runRetentionPurge({ dataClasses, dryRun });
+
+    if (!dryRun) {
+      audit({
+        actor: req.user.wallet,
+        action: 'admin.retention_purge',
+        result: 'success',
+        meta: {
+          data_classes: result.purged.map((p) => p.data_class),
+          deleted: result.purged.reduce((sum, p) => sum + p.deleted, 0),
+          skipped_protected: result.skipped,
+        },
+      });
+    }
+
+    res.json(result);
+  } catch (err) {
+    audit({
+      actor: req.user.wallet,
+      action: 'admin.retention_purge',
+      result: 'failure',
+      meta: { error: err.message },
+    });
+    res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = router;

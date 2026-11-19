@@ -519,14 +519,47 @@ aws ecs describe-services \
   --services vaccichain-backend \
   --query 'services[0].{running:runningCount,desired:desiredCount,status:status}'
 
-# Backend health endpoint
-curl -sf https://app.yourdomain.com/health
+# Liveness probe — process-only, no dependency checks
+curl -sf https://app.yourdomain.com/health/live
 # Expected: {"status":"ok"}
+
+# Readiness probe — verifies database and required RPC state
+curl -sf https://app.yourdomain.com/health/ready
+# Expected: {"status":"ready","checks":{"database":"ok","rpc":"ok"}}
 
 # Swagger UI accessible
 curl -sf -o /dev/null -w "%{http_code}" https://app.yourdomain.com/docs
 # Expected: 200
 ```
+
+#### Liveness vs. Readiness Semantics
+
+The backend exposes two distinct health endpoints. They exist to keep orchestration from restarting healthy processes during transient dependency outages.
+
+| Endpoint | Purpose | Dependencies checked | Failure meaning |
+|---|---|---|---|
+| `GET /health/live` | Liveness — is the process alive and able to serve HTTP? | **None.** No database, no RPC, no external calls. | The process is wedged or crashed and should be restarted. |
+| `GET /health/ready` | Readiness — can this instance serve real traffic right now? | **Database** (SQLite at `DATABASE_PATH`) and **required RPC** (`SOROBAN_RPC_URL` reachability). | The instance is temporarily unable to serve traffic; it should be removed from rotation but **not** restarted. |
+
+**Dependency expectations:**
+
+- **Liveness (`/health/live`)** must never depend on the database or Stellar RPC. A temporary RPC or database outage must not cause liveness failures, otherwise orchestrators will crash-loop otherwise-healthy tasks.
+- **Readiness (`/health/ready`)** returns non-200 when the database is unreachable or the required Soroban RPC endpoint is down. It returns 200 only when both are healthy. Readiness failures are expected during dependency outages and should resolve automatically once the dependency recovers.
+
+**Response hygiene:** health responses never include secrets, connection strings, credentials, or raw upstream error payloads. They report only a coarse status per dependency (`ok` / `unavailable`) so the endpoints are safe to expose to load balancers and monitoring.
+
+#### Orchestration Guidance
+
+Map each probe to exactly one endpoint:
+
+| Orchestrator mechanism | Endpoint | Action on failure |
+|---|---|---|
+| ALB target group health check | `/health/ready` | Deregister the target from rotation (no task restart) |
+| ECS container health check | `/health/live` | ECS replaces the unhealthy task |
+| ECS deployment circuit breaker | `/health/ready` (via ALB) | Roll back the deployment if new tasks never become ready |
+| External uptime monitoring | `/health/ready` | Page on sustained failure |
+
+Do **not** point the ALB target group at `/health/live` — that would keep routing traffic to instances whose database or RPC dependency is down. Do **not** point the ECS container health check at `/health/ready` — that would restart tasks during temporary RPC outages. When creating the backend service (step 7.2), set the target group health check path to `/health/ready` and the container health check command to probe `/health/live`.
 
 ### 9.2 Stellar Connectivity
 
@@ -750,7 +783,8 @@ See [`docs/contract-upgrade.md`](./contract-upgrade.md) for the full upgrade and
 
 Initiate a rollback if any of the following occur within 30 minutes of deployment:
 
-- `GET /health` returns non-200 for more than 2 minutes
+- `GET /health/ready` returns non-200 for more than 2 minutes (after dependency recovery has been ruled out)
+- `GET /health/live` returns non-200 (indicates a wedged or crashed process)
 - 5xx error rate exceeds 1% of requests
 - ECS tasks are crash-looping (more than 3 restarts)
 - Contract calls are failing with unexpected errors

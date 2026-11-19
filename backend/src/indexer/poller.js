@@ -7,6 +7,7 @@
 const StellarSdk = require('@stellar/stellar-sdk');
 const { upsertEvents, getLatestLedger } = require('./db');
 const { invalidateCache } = require('../stellar/issuerCache');
+const { getEvents } = require('../stellar/client');
 
 
 const SOROBAN_RPC_URL = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
@@ -71,10 +72,11 @@ async function poll() {
   }
 
   try {
-    const rpc = getRpc();
     const startLedger = getLatestLedger() + 1;
 
-    const response = await rpc.getEvents({
+    // Read-only call: safe to retry. The shared client applies bounded
+    // timeouts and a retry policy, and classifies exhausted failures.
+    const response = await getEvents({
       startLedger,
       filters: [{ contractIds: [CONTRACT_ID] }],
     });
@@ -101,7 +103,12 @@ async function poll() {
     }
   } catch (err) {
     if (process.env.NODE_ENV !== 'test') {
-      console.error('[indexer] Poll error:', err.message);
+      const correlationId = err.correlationId || 'n/a';
+      const classification = err.classification || 'unknown';
+      console.error(
+        `[indexer] Poll error (classification=${classification}, correlationId=${correlationId}):`,
+        err.message,
+      );
     }
   }
 }

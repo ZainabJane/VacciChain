@@ -39,6 +39,7 @@ Please describe the tests you ran and how to reproduce them:
 - [ ] New and existing unit tests passed locally with my changes
 - [ ] Any dependent changes have been merged and published
 - [ ] If this PR adds a new directory or key file, I have updated `docs/folder-structure.md`.
+- [ ] The locale-parity CI check passes (it reports missing or unused translation keys across all supported locales), and any new or changed user-visible strings have been reviewed by a qualified translator before release.
 
 ## Screenshots (if applicable)
 

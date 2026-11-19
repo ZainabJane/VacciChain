@@ -7,6 +7,11 @@ const {
   SorobanSimulationError,
   SorobanRpcError,
 } = require('../src/stellar/soroban');
+const {
+  StellarClient,
+  StellarTimeoutError,
+  StellarRetryExhaustedError,
+} = require('../src/stellar/client');
 
 describe('Soroban Error Classes', () => {
   describe('SorobanError', () => {
@@ -118,6 +123,132 @@ describe('Soroban Error Classes', () => {
       expect(txErrors).toHaveLength(1);
       expect(simErrors).toHaveLength(1);
       expect(sorobanErrors).toHaveLength(2);
+    });
+  });
+});
+
+describe('StellarClient timeouts and retries', () => {
+  const makeClient = (overrides = {}) =>
+    new StellarClient({
+      timeoutMs: 50,
+      maxRetries: 2,
+      retryDelayMs: 1,
+      ...overrides,
+    });
+
+  const hanging = () => new Promise(() => {});
+
+  describe('timeout enforcement', () => {
+    it('rejects with a StellarTimeoutError when a call exceeds the timeout', async () => {
+      const client = makeClient();
+      const call = jest.fn(hanging);
+
+      await expect(client.read('getLedger', call)).rejects.toBeInstanceOf(
+        StellarTimeoutError
+      );
+      expect(call).toHaveBeenCalledTimes(1);
+    });
+
+    it('classifies the timeout error and attaches a correlation id', async () => {
+      const client = makeClient();
+      const call = jest.fn(hanging);
+
+      const error = await client.read('getLedger', call).catch((e) => e);
+
+      expect(error).toBeInstanceOf(SorobanError);
+      expect(error.code).toBe('STELLAR_TIMEOUT');
+      expect(typeof error.correlationId).toBe('string');
+      expect(error.correlationId.length).toBeGreaterThan(0);
+    });
+
+    it('resolves normally when the call completes within the timeout', async () => {
+      const client = makeClient();
+
+      await expect(
+        client.read('getLedger', async () => 'ok')
+      ).resolves.toBe('ok');
+    });
+  });
+
+  describe('retry policy for idempotent reads', () => {
+    it('retries transient failures on reads and eventually succeeds', async () => {
+      const client = makeClient();
+      const call = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('ECONNRESET'))
+        .mockResolvedValueOnce('ok');
+
+      await expect(client.read('getLedger', call)).resolves.toBe('ok');
+      expect(call).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries timeouts on reads', async () => {
+      const client = makeClient({ timeoutMs: 10 });
+      const call = jest
+        .fn()
+        .mockImplementationOnce(hanging)
+        .mockResolvedValueOnce('ok');
+
+      await expect(client.read('getLedger', call)).resolves.toBe('ok');
+      expect(call).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not retry non-retryable errors on reads', async () => {
+      const client = makeClient();
+      const call = jest.fn().mockRejectedValue(new Error('invalid argument'));
+
+      await expect(client.read('getLedger', call)).rejects.toBeInstanceOf(
+        SorobanError
+      );
+      expect(call).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws a classified StellarRetryExhaustedError with correlation id when retries run out', async () => {
+      const client = makeClient({ maxRetries: 2 });
+      const call = jest.fn().mockRejectedValue(new Error('ECONNRESET'));
+
+      const error = await client.read('getLedger', call).catch((e) => e);
+
+      expect(error).toBeInstanceOf(StellarRetryExhaustedError);
+      expect(error).toBeInstanceOf(SorobanError);
+      expect(error.code).toBe('STELLAR_RETRY_EXHAUSTED');
+      expect(typeof error.correlationId).toBe('string');
+      expect(error.correlationId.length).toBeGreaterThan(0);
+      expect(call).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe('transaction submissions', () => {
+    it('does not retry transaction submissions', async () => {
+      const client = makeClient({ maxRetries: 3 });
+      const call = jest.fn().mockRejectedValue(new Error('ECONNRESET'));
+
+      await expect(
+        client.submit('sendTransaction', call)
+      ).rejects.toBeInstanceOf(SorobanError);
+      expect(call).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not retry submissions on timeout', async () => {
+      const client = makeClient({ timeoutMs: 10, maxRetries: 3 });
+      const call = jest.fn(hanging);
+
+      await expect(
+        client.submit('sendTransaction', call)
+      ).rejects.toBeInstanceOf(StellarTimeoutError);
+      expect(call).toHaveBeenCalledTimes(1);
+    });
+
+    it('attaches a correlation id to submission errors', async () => {
+      const client = makeClient();
+      const call = jest.fn().mockRejectedValue(new Error('tx failed'));
+
+      const error = await client
+        .submit('sendTransaction', call)
+        .catch((e) => e);
+
+      expect(typeof error.correlationId).toBe('string');
+      expect(error.correlationId.length).toBeGreaterThan(0);
     });
   });
 });
