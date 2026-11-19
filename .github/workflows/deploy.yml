@@ -107,6 +107,68 @@ jobs:
         run: |
           gh secret set TESTNET_CONTRACT_ID --body "$CONTRACT_ID"
 
+      - name: Verify public TLS certificate
+        env:
+          PUBLIC_HOST: ${{ vars.TESTNET_PUBLIC_HOST }}
+        run: |
+          if [ -z "$PUBLIC_HOST" ]; then
+            echo "::error::TESTNET_PUBLIC_HOST is not configured; cannot verify TLS."
+            exit 1
+          fi
+
+          echo "### TLS verification for $PUBLIC_HOST" >> "$GITHUB_STEP_SUMMARY"
+
+          # 1. Certificate chain, hostname match and expiry (fails on any error).
+          if ! openssl s_client -connect "$PUBLIC_HOST:443" -servername "$PUBLIC_HOST" \
+              -verify_return_error -verify_hostname "$PUBLIC_HOST" </dev/null 2>/dev/null \
+              | openssl x509 -noout -subject -issuer -dates -checkend 604800; then
+            echo "::error::Certificate chain/hostname/expiry check failed for $PUBLIC_HOST."
+            exit 1
+          fi
+          echo "- Certificate chain, hostname and 7-day expiry window: OK" >> "$GITHUB_STEP_SUMMARY"
+
+          # 2. Modern TLS policy: TLS 1.2+ must succeed.
+          if ! openssl s_client -connect "$PUBLIC_HOST:443" -servername "$PUBLIC_HOST" \
+              -tls1_2 </dev/null 2>/dev/null | grep -q "Verify return code: 0 (ok)"; then
+            echo "::error::TLS 1.2+ handshake failed for $PUBLIC_HOST."
+            exit 1
+          fi
+          echo "- TLS 1.2+ handshake: OK" >> "$GITHUB_STEP_SUMMARY"
+
+          # 3. Legacy TLS 1.0/1.1 must be rejected.
+          for legacy in -tls1 -tls1_1; do
+            if openssl s_client -connect "$PUBLIC_HOST:443" -servername "$PUBLIC_HOST" \
+                $legacy </dev/null 2>/dev/null | grep -q "Verify return code: 0 (ok)"; then
+              echo "::error::Legacy TLS ($legacy) is still accepted by $PUBLIC_HOST."
+              exit 1
+            fi
+          done
+          echo "- Legacy TLS 1.0/1.1 rejected: OK" >> "$GITHUB_STEP_SUMMARY"
+
+          # 4. Plaintext HTTP must redirect to HTTPS (or be refused).
+          HTTP_CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "http://$PUBLIC_HOST/" || echo "000")
+          if [ "$HTTP_CODE" = "000" ]; then
+            echo "- Plaintext HTTP refused: OK" >> "$GITHUB_STEP_SUMMARY"
+          else
+            REDIRECT_URL=$(curl -sS -o /dev/null -w '%{redirect_url}' --max-time 15 "http://$PUBLIC_HOST/")
+            case "$REDIRECT_URL" in
+              https://*)
+                echo "- Plaintext HTTP redirects to $REDIRECT_URL: OK" >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              *)
+                echo "::error::Plaintext HTTP is not redirected to HTTPS (status $HTTP_CODE)."
+                exit 1
+                ;;
+            esac
+          fi
+
+          # 5. HTTPS endpoint must be reachable with a valid certificate.
+          if ! curl -sS -o /dev/null --fail --max-time 15 "https://$PUBLIC_HOST/"; then
+            echo "::error::HTTPS endpoint https://$PUBLIC_HOST/ is not reachable with a valid certificate."
+            exit 1
+          fi
+          echo "- HTTPS endpoint reachable with valid certificate: OK" >> "$GITHUB_STEP_SUMMARY"
+
   deploy-mainnet:
     name: Deploy → Mainnet
     needs: [build, deploy-testnet]
@@ -165,3 +227,65 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh secret set MAINNET_CONTRACT_ID --body "$CONTRACT_ID"
+
+      - name: Verify public TLS certificate
+        env:
+          PUBLIC_HOST: ${{ vars.MAINNET_PUBLIC_HOST }}
+        run: |
+          if [ -z "$PUBLIC_HOST" ]; then
+            echo "::error::MAINNET_PUBLIC_HOST is not configured; cannot verify TLS."
+            exit 1
+          fi
+
+          echo "### TLS verification for $PUBLIC_HOST" >> "$GITHUB_STEP_SUMMARY"
+
+          # 1. Certificate chain, hostname match and expiry (fails on any error).
+          if ! openssl s_client -connect "$PUBLIC_HOST:443" -servername "$PUBLIC_HOST" \
+              -verify_return_error -verify_hostname "$PUBLIC_HOST" </dev/null 2>/dev/null \
+              | openssl x509 -noout -subject -issuer -dates -checkend 604800; then
+            echo "::error::Certificate chain/hostname/expiry check failed for $PUBLIC_HOST."
+            exit 1
+          fi
+          echo "- Certificate chain, hostname and 7-day expiry window: OK" >> "$GITHUB_STEP_SUMMARY"
+
+          # 2. Modern TLS policy: TLS 1.2+ must succeed.
+          if ! openssl s_client -connect "$PUBLIC_HOST:443" -servername "$PUBLIC_HOST" \
+              -tls1_2 </dev/null 2>/dev/null | grep -q "Verify return code: 0 (ok)"; then
+            echo "::error::TLS 1.2+ handshake failed for $PUBLIC_HOST."
+            exit 1
+          fi
+          echo "- TLS 1.2+ handshake: OK" >> "$GITHUB_STEP_SUMMARY"
+
+          # 3. Legacy TLS 1.0/1.1 must be rejected.
+          for legacy in -tls1 -tls1_1; do
+            if openssl s_client -connect "$PUBLIC_HOST:443" -servername "$PUBLIC_HOST" \
+                $legacy </dev/null 2>/dev/null | grep -q "Verify return code: 0 (ok)"; then
+              echo "::error::Legacy TLS ($legacy) is still accepted by $PUBLIC_HOST."
+              exit 1
+            fi
+          done
+          echo "- Legacy TLS 1.0/1.1 rejected: OK" >> "$GITHUB_STEP_SUMMARY"
+
+          # 4. Plaintext HTTP must redirect to HTTPS (or be refused).
+          HTTP_CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "http://$PUBLIC_HOST/" || echo "000")
+          if [ "$HTTP_CODE" = "000" ]; then
+            echo "- Plaintext HTTP refused: OK" >> "$GITHUB_STEP_SUMMARY"
+          else
+            REDIRECT_URL=$(curl -sS -o /dev/null -w '%{redirect_url}' --max-time 15 "http://$PUBLIC_HOST/")
+            case "$REDIRECT_URL" in
+              https://*)
+                echo "- Plaintext HTTP redirects to $REDIRECT_URL: OK" >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              *)
+                echo "::error::Plaintext HTTP is not redirected to HTTPS (status $HTTP_CODE)."
+                exit 1
+                ;;
+            esac
+          fi
+
+          # 5. HTTPS endpoint must be reachable with a valid certificate.
+          if ! curl -sS -o /dev/null --fail --max-time 15 "https://$PUBLIC_HOST/"; then
+            echo "::error::HTTPS endpoint https://$PUBLIC_HOST/ is not reachable with a valid certificate."
+            exit 1
+          fi
+          echo "- HTTPS endpoint reachable with valid certificate: OK" >> "$GITHUB_STEP_SUMMARY"
