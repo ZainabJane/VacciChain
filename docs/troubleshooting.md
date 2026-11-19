@@ -54,6 +54,23 @@ This guide documents common VacciChain setup and runtime errors, with exact symp
 - Cause: A local service is not running or is bound to a different port.
 - Solution: Start the missing dependency and verify the host:port values in the backend configuration.
 
+### 8a. `Startup failed: <component> initialization error` (structured startup diagnostic)
+
+- Symptom: The backend exits with a non-zero status during boot and prints a structured diagnostic such as `{"level":"fatal","event":"startup_failed","component":"database","code":"DB_CONNECT_FAILED","message":"..."}`. The API never begins listening.
+- Cause: A required initialization step (configuration, secrets, database, or poller) failed. Startup is fail-fast: the process reports the first failing component and aborts rather than running in a partially initialized state.
+- Solution: Read the `component` and `code` fields of the diagnostic to identify the failing step, then fix the underlying cause before restarting:
+  - `component: "config"` — a required environment variable is missing or malformed. Compare your `.env` against `env.example` and correct the offending key.
+  - `component: "secrets"` — a secret is missing, empty, or fails validation (for example an invalid Stellar secret seed). Re-provision the secret and confirm it has no stray whitespace or newlines.
+  - `component: "database"` — the database is unreachable or credentials are rejected. Verify the connection URL, that the database is running, and that migrations have been applied.
+  - `component: "poller"` — the poller could not start (for example a missing RPC endpoint or an unreachable upstream). Confirm the poller's endpoint configuration and that the upstream service is reachable.
+- Note: Diagnostics never include secret values; only the component, error code, and a safe message are emitted.
+
+### 8b. Readiness endpoint reports `not ready` after startup
+
+- Symptom: The process is running but `GET /health/ready` (or the configured readiness probe) returns a non-ready status.
+- Cause: Readiness stays `false` until every required initialization step (config, secrets, database, poller) has succeeded. A service that is still initializing, or that failed a step and was restarted, will report not ready.
+- Solution: Check the startup logs for a `startup_failed` diagnostic and resolve the reported component. Once all required steps succeed, readiness flips to `true` automatically; no manual toggle is needed. If readiness never becomes true, confirm the readiness probe is pointed at the correct port and path.
+
 ## Frontend Build
 
 ### 9. `vite v... failed to load js file: /src/main.jsx`

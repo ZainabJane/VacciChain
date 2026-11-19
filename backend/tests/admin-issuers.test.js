@@ -147,6 +147,88 @@ describe('Admin Issuer Endpoints', () => {
     });
   });
 
+  // ── Onboarding status transitions ─────────────────────────────────────────
+
+  describe('POST /v1/admin/issuers/:wallet/onboarding/transition', () => {
+    const transitionUrl = (wallet) =>
+      `/v1/admin/issuers/${wallet}/onboarding/transition`;
+
+    it('approves a pending application and records audit metadata', async () => {
+      const res = await request(app)
+        .post(transitionUrl(VALID_ISSUER_ADDRESS))
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'approved' });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({
+        wallet: VALID_ISSUER_ADDRESS,
+        status: 'approved',
+      });
+      expect(res.body.audit).toMatchObject({
+        actor: 'GADMIN',
+        from: 'pending',
+        to: 'approved',
+      });
+      expect(typeof res.body.audit.timestamp).toBe('string');
+      expect(Number.isNaN(Date.parse(res.body.audit.timestamp))).toBe(false);
+    });
+
+    it('rejects an invalid transition (approved -> pending)', async () => {
+      const res = await request(app)
+        .post(transitionUrl(VALID_ISSUER_ADDRESS))
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'pending' });
+
+      expect(res.status).toBe(409);
+      expect(res.body).toHaveProperty('error');
+    });
+
+    it('rejects a duplicate review of an already-approved application', async () => {
+      const res = await request(app)
+        .post(transitionUrl(VALID_ISSUER_ADDRESS))
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'approved' });
+
+      expect(res.status).toBe(409);
+      expect(res.body).toHaveProperty('error');
+    });
+
+    it('rejects an unknown target status', async () => {
+      const res = await request(app)
+        .post(transitionUrl(VALID_ISSUER_ADDRESS))
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'bogus' });
+
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects non-admin role', async () => {
+      const res = await request(app)
+        .post(transitionUrl(VALID_ISSUER_ADDRESS))
+        .set('Authorization', `Bearer ${issuerToken}`)
+        .send({ status: 'approved' });
+
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects patient role', async () => {
+      const res = await request(app)
+        .post(transitionUrl(VALID_ISSUER_ADDRESS))
+        .set('Authorization', `Bearer ${patientToken}`)
+        .send({ status: 'rejected' });
+
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects unauthenticated request', async () => {
+      const res = await request(app)
+        .post(transitionUrl(VALID_ISSUER_ADDRESS))
+        .send({ status: 'approved' });
+
+      expect(res.status).toBe(401);
+    });
+  });
+
   // ── GET /admin/issuers ────────────────────────────────────────────────────
 
   describe('GET /v1/admin/issuers', () => {

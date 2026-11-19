@@ -24,7 +24,9 @@ const applySchema = z.object({
 });
 
 const reviewSchema = z.object({
-  decision: z.enum(['approved', 'rejected'])
+  decision: z.enum(['approved', 'rejected'], {
+    errorMap: () => ({ message: "decision must be either 'approved' or 'rejected'" }),
+  })
     .describe('Approval decision'),
   reviewer_note: z.string()
     .max(500, 'reviewer_note must not exceed 500 characters')

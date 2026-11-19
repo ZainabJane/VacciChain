@@ -4,13 +4,23 @@ const logger = require('./logger');
 
 let sorobanHealthy = true;
 let lastProbeAt = null;
+let ready = false;
 
 function getHealthStatus() {
   const status = sorobanHealthy ? 'ok' : 'degraded';
   return {
     status,
+    ready,
     uptime: Number(process.uptime().toFixed(3)),
   };
+}
+
+function setReady(value) {
+  ready = Boolean(value);
+}
+
+function isReady() {
+  return ready;
 }
 
 async function probeSorobanHealth() {
@@ -52,5 +62,7 @@ module.exports = {
   getHealthStatus,
   startHealthProbe,
   setSorobanHealthy,
+  setReady,
+  isReady,
   _getLastProbeAt: () => lastProbeAt,
 };

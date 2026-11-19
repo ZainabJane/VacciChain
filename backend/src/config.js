@@ -40,6 +40,12 @@ const schema = z.object({
   // Indexer
   EVENT_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(15000),
   DATABASE_PATH: z.string().default('/data/vaccichain.db'),
+
+  // Batch verification limits (documented bounds)
+  // BATCH_MAX_SIZE: maximum number of items accepted in a single batch (1..100)
+  BATCH_MAX_SIZE: z.coerce.number().int().min(1).max(100).default(100),
+  // BATCH_CONCURRENCY: maximum number of items processed in parallel (1..20)
+  BATCH_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(5),
 });
 
 function validateEnv(env) {
@@ -51,14 +57,43 @@ function validateEnv(env) {
   return result.data;
 }
 
+/**
+ * Validate configuration and return a structured diagnostic instead of throwing
+ * or exiting. Used by startup initialization so failures are observable and
+ * recoverable.
+ *
+ * @param {object} [env=process.env]
+ * @returns {{ ok: true, config: object } | { ok: false, error: { code: string, message: string, issues: Array<{ path: string, message: string }> } }}
+ */
+function validateConfig(env = process.env) {
+  const result = schema.safeParse(env);
+  if (result.success) {
+    return { ok: true, config: result.data };
+  }
+  const issues = result.error.issues.map(i => ({
+    path: String(i.path[0] ?? ''),
+    message: i.message,
+  }));
+  const detail = issues.map(i => `  ${i.path}: ${i.message}`).join('\n');
+  return {
+    ok: false,
+    error: {
+      code: 'CONFIG_INVALID',
+      message: `[config] Missing or invalid environment variables:\n${detail}`,
+      issues,
+    },
+  };
+}
+
 const config = (() => {
-  try {
-    return validateEnv(process.env);
-  } catch (err) {
-    console.error(err.message);
+  const result = validateConfig(process.env);
+  if (!result.ok) {
+    console.error(result.error.message);
     process.exit(1);
   }
+  return result.config;
 })();
 
 module.exports = config;
 module.exports.validateEnv = validateEnv;
+module.exports.validateConfig = validateConfig;

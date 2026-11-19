@@ -43,7 +43,11 @@ class AnomalyResponse(BaseModel):
 class BatchVerifyRequest(BaseModel):
     wallets: List[str] = Field(
         ...,
-        description="List of Stellar public-key addresses to verify (max 100)",
+        description=(
+            "List of Stellar public-key addresses to verify. Hard limit is 100; "
+            "the effective maximum may be lowered via the BATCH_MAX_SIZE "
+            "environment variable (documented limits: 1-100)."
+        ),
         min_length=1,
         max_length=100,
         examples=[["GABC...XYZ", "GDEF...UVW"]],
@@ -60,3 +64,7 @@ class WalletResult(BaseModel):
 class BatchVerifyResponse(BaseModel):
     results: List[WalletResult] = Field(..., description="Per-wallet verification results")
     total: int = Field(..., description="Number of wallets processed", ge=0)
+    request_id: Optional[str] = Field(
+        None,
+        description="Optional correlation ID echoed back for tracing this batch request",
+    )

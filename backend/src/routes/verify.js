@@ -7,11 +7,54 @@ const { verifyLimiter, verifierKeyLimiter } = require('../middleware/rateLimiter
 const verifierApiKey = require('../middleware/verifierApiKey');
 const authMiddleware = require('../middleware/auth');
 const { audit } = require('../middleware/auditLog');
+const { requestIdMiddleware } = require('../middleware/requestId');
+const config = require('../config');
 
 const router = express.Router();
 
 const verifyCache = new Map();
 const CACHE_TTL = 60 * 1000; // 60 seconds
+
+// Bounded batch verification limits (see config for documented limits).
+const BATCH_MAX_SIZE = config.batchMaxSize;
+const BATCH_CONCURRENCY = config.batchConcurrency;
+
+/**
+ * Run `worker` over `items` with at most `limit` in flight at any time.
+ * Results preserve input order; each entry is { ok, value } or { ok: false, error }.
+ */
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function run() {
+    while (true) {
+      const current = nextIndex++;
+      if (current >= items.length) return;
+      try {
+        results[current] = { ok: true, value: await worker(items[current], current) };
+      } catch (err) {
+        results[current] = { ok: false, error: err };
+      }
+    }
+  }
+
+  const runners = [];
+  const workerCount = Math.min(limit, items.length);
+  for (let i = 0; i < workerCount; i += 1) {
+    runners.push(run());
+  }
+  await Promise.all(runners);
+  return results;
+}
+
+function isTimeoutError(err) {
+  return Boolean(err && err.message && (
+    err.message.toLowerCase().includes('timeout') ||
+    err.message.toLowerCase().includes('deadline') ||
+    err.message.toLowerCase().includes('abort')
+  ));
+}
 
 /**
  * Try JWT first; if no Authorization header, fall through to API key auth.
@@ -101,7 +144,7 @@ router.get(
     }
 
     try {
-      const { vaccinated, records } = await verifyVaccination(wallet);
+      const { vaccinated, records } = await verifyVaccination(wallet, { requestId: req.id });
 
       verifyCache.set(wallet, {
         vaccinated,
@@ -121,13 +164,8 @@ router.get(
     } catch (err) {
       const errorMessage = resolveContractErrorMessage(err);
       audit({ actor: ip, action: 'verify.public_lookup', target: wallet, result: 'failure', meta: { error: errorMessage, ip } });
-      
-      const isTimeout = err.message && (
-        err.message.toLowerCase().includes('timeout') ||
-        err.message.toLowerCase().includes('deadline') ||
-        err.message.toLowerCase().includes('abort')
-      );
-      res.status(isTimeout ? 503 : 500).json({ error: errorMessage });
+
+      res.status(isTimeoutError(err) ? 503 : 500).json({ error: errorMessage, requestId: req.id });
     }
   }
 );
@@ -187,6 +225,114 @@ router.get(
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
+/**
+ * @swagger
+ * /verify/batch:
+ *   post:
+ *     summary: Batch vaccination status verification
+ *     description: >
+ *       Verifies up to BATCH_MAX_SIZE wallets per request. Items are processed
+ *       with bounded concurrency (BATCH_CONCURRENCY) to protect the RPC provider
+ *       and worker pool. Partial failures are reported per item.
+ *     tags:
+ *       - Verification
+ *     security:
+ *       - bearerAuth: []
+ *       - apiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               wallets:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *     responses:
+ *       200:
+ *         description: Per-item verification results
+ *       400:
+ *         description: Invalid request (bad wallets or batch too large)
+ *       401:
+ *         description: Unauthorized - JWT or API key required
+ *       429:
+ *         description: Rate limit exceeded
+ */
+// POST /verify/batch — JWT or verifier API key, bounded concurrency
+router.post(
+  '/batch',
+  jwtOrApiKey,
+  adaptiveLimiter,
+  async (req, res) => {
+    const requestId = req.id;
+    const actor = req.verifier ? `apikey:${req.verifier.id}` : (req.user?.wallet ?? 'unknown');
+    const wallets = req.body && req.body.wallets;
+
+    if (!Array.isArray(wallets) || wallets.length === 0) {
+      return res.status(400).json({ error: 'wallets must be a non-empty array', requestId });
+    }
+    if (wallets.length > BATCH_MAX_SIZE) {
+      return res.status(400).json({
+        error: `batch size exceeds maximum of ${BATCH_MAX_SIZE}`,
+        requestId,
+      });
+    }
+
+    const invalid = [];
+    wallets.forEach((wallet, index) => {
+      if (typeof wallet !== 'string' || !StellarSdk.StrKey.isValidEd25519PublicKey(wallet)) {
+        invalid.push({ index, wallet, error: 'invalid wallet address' });
+      }
+    });
+    if (invalid.length > 0) {
+      return res.status(400).json({ error: 'invalid wallet address in batch', invalid, requestId });
+    }
+
+    const now = Date.now();
+    const results = await mapWithConcurrency(wallets, BATCH_CONCURRENCY, async (wallet) => {
+      const cached = verifyCache.get(wallet);
+      if (cached && (now - cached.timestamp < CACHE_TTL)) {
+        return { wallet, vaccinated: cached.vaccinated, verified: cached.vaccinated, records: cached.records };
+      }
+      const { vaccinated, records } = await verifyVaccination(wallet, { requestId });
+      verifyCache.set(wallet, { vaccinated, records, timestamp: now });
+      return { wallet, vaccinated, verified: vaccinated, records };
+    });
+
+    const items = results.map((result, index) => {
+      if (result.ok) {
+        return { index, wallet: wallets[index], ok: true, ...result.value };
+      }
+      const errorMessage = resolveContractErrorMessage(result.error);
+      return {
+        index,
+        wallet: wallets[index],
+        ok: false,
+        error: { message: errorMessage, timeout: isTimeoutError(result.error) },
+      };
+    });
+
+    const failed = items.filter((item) => !item.ok).length;
+    audit({
+      actor,
+      action: 'verify.batch',
+      target: `${wallets.length} wallets`,
+      result: failed === 0 ? 'success' : 'partial_failure',
+      meta: { requestId, total: wallets.length, failed },
+    });
+
+    res.json({
+      requestId,
+      total: wallets.length,
+      succeeded: wallets.length - failed,
+      failed,
+      results: items,
+    });
+  }
+);
+
 // GET /verify/:wallet — JWT or verifier API key
 router.get(
   '/:wallet',
@@ -210,7 +356,7 @@ router.get(
     }
 
     try {
-      const { vaccinated, records } = await verifyVaccination(wallet);
+      const { vaccinated, records } = await verifyVaccination(wallet, { requestId: req.id });
 
       verifyCache.set(wallet, {
         vaccinated,
@@ -230,13 +376,8 @@ router.get(
     } catch (err) {
       const errorMessage = resolveContractErrorMessage(err);
       audit({ actor, action: 'verify.lookup', target: wallet, result: 'failure', meta: { error: errorMessage } });
-      
-      const isTimeout = err.message && (
-        err.message.toLowerCase().includes('timeout') ||
-        err.message.toLowerCase().includes('deadline') ||
-        err.message.toLowerCase().includes('abort')
-      );
-      res.status(isTimeout ? 503 : 500).json({ error: errorMessage });
+
+      res.status(isTimeoutError(err) ? 503 : 500).json({ error: errorMessage, requestId: req.id });
     }
   }
 );

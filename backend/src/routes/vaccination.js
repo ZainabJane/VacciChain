@@ -91,7 +91,7 @@ router.post(
       vaccine_name,
       date_administered,
       process.env.ISSUER_SECRET_KEY,
-      { doseNumber: dose_number, doseSeries: dose_series }
+      { doseNumber: dose_number, doseSeries: dose_series, requestId: req.requestId }
     );
     const timestamp = new Date().toISOString();
 
@@ -100,7 +100,7 @@ router.post(
       action: 'vaccination.issue',
       target: patient_address,
       result: 'success',
-      meta: { token_id: result.tokenId, vaccine_name, date_administered, dose_number, dose_series },
+      meta: { token_id: result.tokenId, vaccine_name, date_administered, dose_number, dose_series, requestId: req.requestId },
     });
 
     res.json({
@@ -118,7 +118,7 @@ router.post(
       action: 'vaccination.issue',
       target: patient_address,
       result: 'failure',
-      meta: { error: errorMessage },
+      meta: { error: errorMessage, requestId: req.requestId },
     });
     const mapped = mapContractError(err);
     if (mapped?.name === 'DuplicateRecord') {
@@ -187,14 +187,14 @@ router.post(
         StellarSdk.Address.fromString(req.user.publicKey).toScVal(),
       ];
 
-      await invokeContract(process.env.ISSUER_SECRET_KEY, 'revoke_vaccination', args);
+      await invokeContract(process.env.ISSUER_SECRET_KEY, 'revoke_vaccination', args, { requestId: req.requestId });
 
       audit({
         actor: req.user.publicKey,
         action: 'vaccination.revoke',
         target: String(token_id),
         result: 'success',
-        meta: { token_id },
+        meta: { token_id, requestId: req.requestId },
       });
 
       res.json({ success: true, token_id });
@@ -206,7 +206,7 @@ router.post(
         action: 'vaccination.revoke',
         target: String(token_id),
         result: 'failure',
-        meta: { token_id, error: errorMessage },
+        meta: { token_id, error: errorMessage, requestId: req.requestId },
       });
       res.status(500).json({ error: errorMessage });
     }
@@ -270,7 +270,7 @@ router.get('/:wallet', authMiddleware, validateStellarPublicKey('params', 'walle
 
   try {
     const args = [StellarSdk.Address.fromString(wallet).toScVal()];
-    const result = await simulateContract('verify_vaccination', args);
+    const result = await simulateContract('verify_vaccination', args, { requestId: req.requestId });
     const [vaccinated, allRecords] = StellarSdk.scValToNative(result);
 
     const total = allRecords.length;

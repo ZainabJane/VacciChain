@@ -37,3 +37,166 @@ describe('validateEnv', () => {
     exitSpy.mockRestore();
   });
 });
+
+describe('startup initialization', () => {
+  let initializeStartup;
+  let isReady;
+
+  beforeEach(() => {
+    jest.resetModules();
+    ({ initializeStartup, isReady } = require('../src/startup'));
+  });
+
+  const okStep = () => Promise.resolve();
+
+  it('reports a structured diagnostic and non-zero exit when config is missing', async () => {
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+    const logSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = await initializeStartup({
+      steps: {
+        config: () => {
+          throw new Error('HORIZON_URL is required');
+        },
+        secrets: okStep,
+        database: okStep,
+        poller: okStep,
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.diagnostic).toMatchObject({
+      event: 'startup_failure',
+      step: 'config',
+    });
+    expect(typeof result.diagnostic.message).toBe('string');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(isReady()).toBe(false);
+
+    exitSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+
+  it('reports a structured diagnostic when secrets initialization fails', async () => {
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+    const logSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = await initializeStartup({
+      steps: {
+        config: okStep,
+        secrets: () => Promise.reject(new Error('vault unreachable')),
+        database: okStep,
+        poller: okStep,
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.diagnostic).toMatchObject({
+      event: 'startup_failure',
+      step: 'secrets',
+    });
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(isReady()).toBe(false);
+
+    exitSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+
+  it('reports a structured diagnostic when database initialization fails', async () => {
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+    const logSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = await initializeStartup({
+      steps: {
+        config: okStep,
+        secrets: okStep,
+        database: () => Promise.reject(new Error('connection refused')),
+        poller: okStep,
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.diagnostic).toMatchObject({
+      event: 'startup_failure',
+      step: 'database',
+    });
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(isReady()).toBe(false);
+
+    exitSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+
+  it('reports a structured diagnostic when poller initialization fails', async () => {
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+    const logSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = await initializeStartup({
+      steps: {
+        config: okStep,
+        secrets: okStep,
+        database: okStep,
+        poller: () => Promise.reject(new Error('poller start failed')),
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.diagnostic).toMatchObject({
+      event: 'startup_failure',
+      step: 'poller',
+    });
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(isReady()).toBe(false);
+
+    exitSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+
+  it('does not leak secrets in the structured diagnostic', async () => {
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+    const logSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const secret = valid.ADMIN_SECRET_KEY;
+    const result = await initializeStartup({
+      steps: {
+        config: okStep,
+        secrets: () => Promise.reject(new Error(`failed to load ${secret}`)),
+        database: okStep,
+        poller: okStep,
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(JSON.stringify(result.diagnostic)).not.toContain(secret);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+
+    exitSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+
+  it('keeps readiness false until all initialization steps succeed', async () => {
+    let releaseDatabase;
+    const databaseGate = new Promise((resolve) => {
+      releaseDatabase = resolve;
+    });
+
+    const initPromise = initializeStartup({
+      steps: {
+        config: okStep,
+        secrets: okStep,
+        database: () => databaseGate,
+        poller: okStep,
+      },
+    });
+
+    // Give the earlier steps a chance to run; readiness must still be false.
+    await Promise.resolve();
+    expect(isReady()).toBe(false);
+
+    releaseDatabase();
+    const result = await initPromise;
+
+    expect(result.ok).toBe(true);
+    expect(isReady()).toBe(true);
+  });
+});
