@@ -36,6 +36,7 @@ router.post('/issuers', adminAuthMiddleware, adminOnly, validate(addIssuerSchema
 
   try {
     const result = await addIssuer(address);
+    invalidateCache(address);
     audit({ actor: req.user.wallet, action: 'admin.add_issuer', result: 'success', meta: { address } });
     res.status(201).json({ address, authorized: true, hash: result.hash });
   } catch (err) {

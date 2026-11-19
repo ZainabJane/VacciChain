@@ -53,6 +53,32 @@ describe('Admin Issuer Endpoints', () => {
       expect(res.body).toHaveProperty('hash');
     });
 
+    it('invalidates the issuer cache on successful add', async () => {
+      const { invalidateCache } = require('../src/stellar/issuerCache');
+      invalidateCache.mockClear();
+
+      const res = await request(app)
+        .post('/v1/admin/issuers')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ address: VALID_ISSUER_ADDRESS });
+
+      expect(res.status).toBe(201);
+      expect(invalidateCache).toHaveBeenCalledWith(VALID_ISSUER_ADDRESS);
+    });
+
+    it('does not invalidate the issuer cache when add is rejected', async () => {
+      const { invalidateCache } = require('../src/stellar/issuerCache');
+      invalidateCache.mockClear();
+
+      const res = await request(app)
+        .post('/v1/admin/issuers')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ address: 'not-a-stellar-address' });
+
+      expect(res.status).toBe(400);
+      expect(invalidateCache).not.toHaveBeenCalled();
+    });
+
     it('rejects missing address', async () => {
       const res = await request(app)
         .post('/v1/admin/issuers')
@@ -111,6 +137,30 @@ describe('Admin Issuer Endpoints', () => {
       expect(res.body).toHaveProperty('hash');
     });
 
+    it('invalidates the issuer cache on successful revoke', async () => {
+      const { invalidateCache } = require('../src/stellar/issuerCache');
+      invalidateCache.mockClear();
+
+      const res = await request(app)
+        .delete(`/v1/admin/issuers/${VALID_ISSUER_ADDRESS}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      expect(res.status).toBe(200);
+      expect(invalidateCache).toHaveBeenCalledWith(VALID_ISSUER_ADDRESS);
+    });
+
+    it('does not invalidate the issuer cache when revoke is rejected', async () => {
+      const { invalidateCache } = require('../src/stellar/issuerCache');
+      invalidateCache.mockClear();
+
+      const res = await request(app)
+        .delete('/v1/admin/issuers/bad-address')
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      expect(res.status).toBe(400);
+      expect(invalidateCache).not.toHaveBeenCalled();
+    });
+
     it('returns 404 for non-existent issuer', async () => {
       const { isAuthorizedIssuer } = require('../src/stellar/issuerCache');
       isAuthorizedIssuer.mockResolvedValueOnce(false);
@@ -144,6 +194,49 @@ describe('Admin Issuer Endpoints', () => {
         .delete(`/v1/admin/issuers/${VALID_ISSUER_ADDRESS}`);
 
       expect(res.status).toBe(401);
+    });
+  });
+
+  // ── Revocation consistency window ─────────────────────────────────────────
+
+  describe('Revocation consistency window', () => {
+    const CONSISTENCY_WINDOW_MS = 30 * 1000;
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('revoked issuer cannot mint after the consistency window', async () => {
+      const { isAuthorizedIssuer } = require('../src/stellar/issuerCache');
+      isAuthorizedIssuer.mockReset();
+
+      // Before revocation the issuer is authorized and can mint.
+      isAuthorizedIssuer.mockResolvedValueOnce(true);
+      const before = await request(app)
+        .post('/v1/issuer/mint')
+        .set('Authorization', `Bearer ${issuerToken}`)
+        .send({ patient: 'GPATIENT', amount: '10' });
+      expect(before.status).not.toBe(403);
+
+      // Admin revokes the issuer; cache is invalidated immediately.
+      const revoke = await request(app)
+        .delete(`/v1/admin/issuers/${VALID_ISSUER_ADDRESS}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(revoke.status).toBe(200);
+
+      // Simulate the cache TTL expiring (end of the consistency window).
+      jest.useFakeTimers();
+      jest.advanceTimersByTime(CONSISTENCY_WINDOW_MS);
+
+      // After the window the cache reflects the revocation.
+      isAuthorizedIssuer.mockResolvedValue(false);
+      const after = await request(app)
+        .post('/v1/issuer/mint')
+        .set('Authorization', `Bearer ${issuerToken}`)
+        .send({ patient: 'GPATIENT', amount: '10' });
+
+      expect(after.status).toBe(403);
+      expect(isAuthorizedIssuer).toHaveBeenCalled();
     });
   });
 

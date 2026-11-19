@@ -8,7 +8,11 @@ const { resolveContractErrorMessage, mapContractError } = require('../stellar/co
 const { audit } = require('../middleware/auditLog');
 const validate = require('../middleware/validate');
 const { hasConsented } = require('../indexer/db');
-const { issueSchema, revokeSchema } = require('./schemas/vaccination.schemas');
+const { issueSchema, revokeSchema, vaccinationListQuerySchema } = require('./schemas/vaccination.schemas');
+const idempotency = require('../middleware/idempotency');
+
+const MAX_PAGE_SIZE = Number(process.env.VACCINATION_MAX_PAGE_SIZE) || 100;
+const DEFAULT_PAGE_SIZE = Math.min(Number(process.env.VACCINATION_DEFAULT_PAGE_SIZE) || 20, MAX_PAGE_SIZE);
 
 const router = express.Router();
 
@@ -75,6 +79,7 @@ router.post(
   '/issue',
   authMiddleware,
   issuerMiddleware,
+  idempotency,
   validateStellarPublicKey('body', 'patient_address'),
   validate(issueSchema),
   async (req, res) => {
@@ -255,34 +260,57 @@ router.post(
  *               $ref: '#/components/schemas/Error'
  */
 // GET /vaccination/:wallet — fetch paginated records for a wallet
-router.get('/:wallet', authMiddleware, validateStellarPublicKey('params', 'wallet'), async (req, res) => {
-  const { wallet } = req.params;
+router.get(
+  '/:wallet',
+  authMiddleware,
+  validateStellarPublicKey('params', 'wallet'),
+  validate(vaccinationListQuerySchema, 'query'),
+  async (req, res) => {
+    const { wallet } = req.params;
 
-  const rawPage = req.query.page !== undefined ? Number(req.query.page) : 1;
-  const rawLimit = req.query.limit !== undefined ? Number(req.query.limit) : 20;
+    const rawPage = req.query.page !== undefined ? Number(req.query.page) : 1;
+    const rawLimit = req.query.limit !== undefined ? Number(req.query.limit) : DEFAULT_PAGE_SIZE;
 
-  if (!Number.isInteger(rawPage) || rawPage < 1) {
-    return res.status(400).json({ error: 'page must be a positive integer' });
+    if (!Number.isInteger(rawPage) || rawPage < 1) {
+      return res.status(400).json({ error: 'page must be a positive integer' });
+    }
+    if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > MAX_PAGE_SIZE) {
+      return res.status(400).json({ error: `limit must be an integer between 1 and ${MAX_PAGE_SIZE}` });
+    }
+
+    try {
+      const args = [StellarSdk.Address.fromString(wallet).toScVal()];
+      const result = await simulateContract('verify_vaccination', args);
+      const [vaccinated, allRecords] = StellarSdk.scValToNative(result);
+
+      // Deterministic ordering: created_at DESC, then token_id DESC as tiebreaker.
+      const sorted = [...allRecords].sort((a, b) => {
+        const aTime = a.created_at ?? a.createdAt ?? 0;
+        const bTime = b.created_at ?? b.createdAt ?? 0;
+        const timeDiff = new Date(bTime).getTime() - new Date(aTime).getTime();
+        if (timeDiff !== 0 && !Number.isNaN(timeDiff)) return timeDiff;
+        return String(b.token_id ?? b.tokenId ?? '').localeCompare(String(a.token_id ?? a.tokenId ?? ''));
+      });
+
+      const total = sorted.length;
+      const start = (rawPage - 1) * rawLimit;
+      const data = sorted.slice(start, start + rawLimit);
+      const hasMore = start + data.length < total;
+
+      res.json({
+        data,
+        total,
+        page: rawPage,
+        limit: rawLimit,
+        has_more: hasMore,
+        next_page: hasMore ? rawPage + 1 : null,
+      });
+    } catch (err) {
+      if (err instanceof SorobanTimeoutError) return sendRpcTimeout(res);
+      const errorMessage = resolveContractErrorMessage(err);
+      res.status(500).json({ error: errorMessage });
+    }
   }
-  if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 100) {
-    return res.status(400).json({ error: 'limit must be an integer between 1 and 100' });
-  }
-
-  try {
-    const args = [StellarSdk.Address.fromString(wallet).toScVal()];
-    const result = await simulateContract('verify_vaccination', args);
-    const [vaccinated, allRecords] = StellarSdk.scValToNative(result);
-
-    const total = allRecords.length;
-    const start = (rawPage - 1) * rawLimit;
-    const data = allRecords.slice(start, start + rawLimit);
-
-    res.json({ data, total, page: rawPage, limit: rawLimit });
-  } catch (err) {
-    if (err instanceof SorobanTimeoutError) return sendRpcTimeout(res);
-    const errorMessage = resolveContractErrorMessage(err);
-    res.status(500).json({ error: errorMessage });
-  }
-});
+);
 
 module.exports = router;

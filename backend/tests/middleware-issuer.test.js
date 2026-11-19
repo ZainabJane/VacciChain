@@ -12,6 +12,7 @@
 // Mock the on-chain allowlist check and logger before requiring the middleware
 jest.mock('../src/stellar/issuerCache', () => ({
   isAuthorizedIssuer: jest.fn(),
+  invalidateCache: jest.fn(),
 }));
 
 jest.mock('../src/logger', () => ({
@@ -19,8 +20,13 @@ jest.mock('../src/logger', () => ({
   error: jest.fn(),
 }));
 
-const { isAuthorizedIssuer } = require('../src/stellar/issuerCache');
+jest.mock('../src/config', () => ({
+  ISSUER_CACHE_TTL_MS: 60000,
+}));
+
+const { isAuthorizedIssuer, invalidateCache } = require('../src/stellar/issuerCache');
 const logger = require('../src/logger');
+const config = require('../src/config');
 const issuerMiddleware = require('../src/middleware/issuer');
 const StellarSdk = require('@stellar/stellar-sdk');
 
@@ -161,5 +167,65 @@ describe('issuerMiddleware — contract allowlist check error', () => {
     expect(res.json).toHaveBeenCalledWith({ error: 'Failed to verify issuer authorization' });
     expect(next).not.toHaveBeenCalled();
     expect(logger.error).toHaveBeenCalled();
+  });
+});
+
+describe('issuerMiddleware — revocation window', () => {
+  it('rejects mint attempts after invalidateCache(wallet) following a revoke', async () => {
+    // Initially authorized
+    isAuthorizedIssuer.mockResolvedValue(true);
+    const req = makeReq();
+    const res = makeRes();
+    const next = jest.fn();
+
+    await issuerMiddleware(req, res, next);
+    expect(next).toHaveBeenCalledTimes(1);
+
+    // Issuer is revoked on-chain and the cache entry is invalidated
+    invalidateCache(WALLET);
+    expect(invalidateCache).toHaveBeenCalledWith(WALLET);
+
+    // Next call must re-query and observe the revocation
+    isAuthorizedIssuer.mockResolvedValue(false);
+    const res2 = makeRes();
+    const next2 = jest.fn();
+
+    await issuerMiddleware(req, res2, next2);
+
+    expect(isAuthorizedIssuer).toHaveBeenCalledTimes(2);
+    expect(res2.status).toHaveBeenCalledWith(403);
+    expect(res2.json).toHaveBeenCalledWith({
+      error: 'Issuer authorization revoked or not found on-chain',
+    });
+    expect(next2).not.toHaveBeenCalled();
+  });
+
+  it('cached true values expire after config.ISSUER_CACHE_TTL_MS', async () => {
+    jest.useFakeTimers();
+    try {
+      isAuthorizedIssuer.mockResolvedValue(true);
+      const req = makeReq();
+      const res = makeRes();
+      const next = jest.fn();
+
+      await issuerMiddleware(req, res, next);
+      expect(next).toHaveBeenCalledTimes(1);
+
+      // Advance past the documented revocation window
+      jest.advanceTimersByTime(config.ISSUER_CACHE_TTL_MS + 1);
+
+      // After TTL expiry the cache must re-query and see the revocation
+      isAuthorizedIssuer.mockResolvedValue(false);
+      const res2 = makeRes();
+      const next2 = jest.fn();
+
+      await issuerMiddleware(req, res2, next2);
+
+      expect(isAuthorizedIssuer).toHaveBeenCalledTimes(2);
+      expect(res2.status).toHaveBeenCalledWith(403);
+      expect(next2).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

@@ -1,6 +1,7 @@
 const { isAuthorizedIssuer, invalidateCache } = require('../src/stellar/issuerCache');
 const issuerMiddleware = require('../src/middleware/issuer');
 const { simulateContract } = require('../src/stellar/soroban');
+const config = require('../src/config');
 const StellarSdk = require('@stellar/stellar-sdk');
 
 jest.mock('../src/stellar/soroban');
@@ -41,6 +42,70 @@ describe('Issuer Verification & Caching', () => {
 
     await isAuthorizedIssuer(gAddress);
     expect(simulateContract).toHaveBeenCalledTimes(2);
+  });
+
+  it('cached authorization expires after the documented TTL', async () => {
+    const nowSpy = jest.spyOn(Date, 'now');
+    const start = 1_000_000;
+    nowSpy.mockReturnValue(start);
+
+    simulateContract.mockResolvedValue(StellarSdk.xdr.ScVal.scvBool(true));
+
+    const res1 = await isAuthorizedIssuer(gAddress);
+    expect(res1).toBe(true);
+    expect(simulateContract).toHaveBeenCalledTimes(1);
+
+    // Within the TTL window the cached value is served.
+    nowSpy.mockReturnValue(start + config.ISSUER_CACHE_TTL_MS - 1);
+    const res2 = await isAuthorizedIssuer(gAddress);
+    expect(res2).toBe(true);
+    expect(simulateContract).toHaveBeenCalledTimes(1);
+
+    // After the TTL the cache entry is stale and must be re-queried.
+    nowSpy.mockReturnValue(start + config.ISSUER_CACHE_TTL_MS + 1);
+    const res3 = await isAuthorizedIssuer(gAddress);
+    expect(res3).toBe(true);
+    expect(simulateContract).toHaveBeenCalledTimes(2);
+
+    nowSpy.mockRestore();
+  });
+
+  it('revoked issuer cannot mint after the consistency window', async () => {
+    const nowSpy = jest.spyOn(Date, 'now');
+    const start = 2_000_000;
+    nowSpy.mockReturnValue(start);
+
+    // Issuer is authorized and gets cached.
+    simulateContract.mockResolvedValue(StellarSdk.xdr.ScVal.scvBool(true));
+    expect(await isAuthorizedIssuer(gAddress)).toBe(true);
+    expect(simulateContract).toHaveBeenCalledTimes(1);
+
+    // Issuer is revoked on-chain; cache still serves the stale value within TTL.
+    simulateContract.mockResolvedValue(StellarSdk.xdr.ScVal.scvBool(false));
+    nowSpy.mockReturnValue(start + config.ISSUER_CACHE_TTL_MS - 1);
+    expect(await isAuthorizedIssuer(gAddress)).toBe(true);
+    expect(simulateContract).toHaveBeenCalledTimes(1);
+
+    // After the consistency window the revocation is observed.
+    nowSpy.mockReturnValue(start + config.ISSUER_CACHE_TTL_MS + 1);
+    expect(await isAuthorizedIssuer(gAddress)).toBe(false);
+    expect(simulateContract).toHaveBeenCalledTimes(2);
+
+    // Middleware must now reject the revoked issuer.
+    const req = { user: { role: 'issuer', wallet: gAddress } };
+    const res = {
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis()
+    };
+    const next = jest.fn();
+
+    await issuerMiddleware(req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledWith({ error: 'Issuer authorization revoked or not found on-chain' });
+    expect(next).not.toHaveBeenCalled();
+
+    nowSpy.mockRestore();
   });
 
   it('issuerMiddleware blocks unauthorized issuers', async () => {

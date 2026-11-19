@@ -40,6 +40,42 @@ const schema = z.object({
   // Indexer
   EVENT_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(15000),
   DATABASE_PATH: z.string().default('/data/vaccichain.db'),
+
+  // Vaccination list pagination (#44)
+  // Hard upper bound on page size; requests above this are rejected/clamped.
+  VACCINATION_MAX_PAGE_SIZE: z.coerce.number().int().positive().default(100),
+  // Page size used when the client does not specify a limit.
+  VACCINATION_DEFAULT_PAGE_SIZE: z.coerce.number().int().positive().default(20),
+
+  // Issuer authorization cache (#48)
+  // TTL of cached issuer permissions. This is also the documented revocation
+  // consistency window: a revoked issuer may be accepted for at most this long.
+  ISSUER_CACHE_TTL_MS: z.coerce.number().int().nonnegative().default(30000),
+
+  // Mint idempotency (#49)
+  // How long idempotency records are retained (and persisted) so retries after
+  // timeouts or restarts return the original outcome.
+  IDEMPOTENCY_TTL_MS: z.coerce.number().int().positive().default(86400000),
+
+  // SEP-10 challenge nonce store (#46)
+  // 'memory' is single-instance only; 'redis' is required for multi-instance.
+  NONCE_STORE_BACKEND: z.enum(['memory', 'redis']).default('memory'),
+  NONCE_STORE_REDIS_URL: z.string().url().optional(),
+}).superRefine((val, ctx) => {
+  if (val.VACCINATION_DEFAULT_PAGE_SIZE > val.VACCINATION_MAX_PAGE_SIZE) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['VACCINATION_DEFAULT_PAGE_SIZE'],
+      message: 'must be less than or equal to VACCINATION_MAX_PAGE_SIZE',
+    });
+  }
+  if (val.NONCE_STORE_BACKEND === 'redis' && !val.NONCE_STORE_REDIS_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['NONCE_STORE_REDIS_URL'],
+      message: 'is required when NONCE_STORE_BACKEND is "redis"',
+    });
+  }
 });
 
 function validateEnv(env) {

@@ -51,6 +51,8 @@ module.exports = {
     total: 0,
     page: 1,
     limit: 20,
+    has_more: false,
+    next_page: null,
   },
 
   // Happy path: paginated records response
@@ -66,5 +68,47 @@ module.exports = {
     total: 1,
     page: 1,
     limit: 20,
+    has_more: false,
+    next_page: null,
+  },
+
+  // Boundary case: first page of a multi-page result set
+  PAGINATED_RECORDS_FIRST_PAGE: {
+    data: [
+      {
+        token_id: 'token-001',
+        vaccine_name: 'COVID-19',
+        date_administered: '2024-01-15',
+        issuer_address: ISSUER_WALLET,
+      },
+      {
+        token_id: 'token-002',
+        vaccine_name: 'Influenza',
+        date_administered: '2023-10-01',
+        issuer_address: ISSUER_WALLET,
+      },
+    ],
+    total: 3,
+    page: 1,
+    limit: 2,
+    has_more: true,
+    next_page: 2,
+  },
+
+  // Boundary case: last page of a multi-page result set
+  PAGINATED_RECORDS_LAST_PAGE: {
+    data: [
+      {
+        token_id: 'token-003',
+        vaccine_name: 'Tetanus',
+        date_administered: '2023-05-20',
+        issuer_address: ISSUER_WALLET,
+      },
+    ],
+    total: 3,
+    page: 2,
+    limit: 2,
+    has_more: false,
+    next_page: null,
   },
 };
