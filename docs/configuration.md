@@ -10,6 +10,17 @@ The backend validates its variables at startup via [Zod](https://zod.dev/). A mi
 
 ---
 
+## Startup behavior
+
+The backend initializes its dependencies in a fixed order: configuration, secrets, database, and the event poller. Each step is fail-fast:
+
+- If any required step fails, startup aborts with a **structured diagnostic** (a JSON object with `event`, `step`, `code`, and a redacted `message` — secrets are never included) written to the log and stderr, and the process exits with a **non-zero exit code**.
+- Partially initialized resources (open database handles, poller timers, etc.) are torn down before exit, so no partial service state is left behind.
+- The readiness endpoint (`GET /health/ready`) reports **not ready** (`503`) until every required initialization step has succeeded. Liveness (`GET /health/live`) only reports that the process is running.
+- Once all steps succeed, readiness flips to ready and the service begins accepting traffic.
+
+---
+
 ## Stellar / Soroban
 
 ### `STELLAR_NETWORK`
@@ -94,6 +105,32 @@ The backend validates its variables at startup via [Zod](https://zod.dev/). A mi
 - Format: positive integer
 - Description: TCP port the Express backend listens on.
 - Example: `PORT=4000`
+
+---
+
+## Batch verification
+
+Controls the size and parallelism of batch verification requests (`POST /verify/batch`). Both values are bounded so a single request cannot overwhelm the backend, the Soroban RPC provider, or the Python worker pool.
+
+### `BATCH_MAX_SIZE`
+- Required: no
+- Default: `100`
+- Format: integer
+- Allowed range: `1`–`1000` (values outside the range are rejected at startup)
+- Description: Maximum number of items accepted in a single batch verification request. Requests exceeding this limit are rejected with `400` and a structured error; they are not silently truncated.
+- Example: `BATCH_MAX_SIZE=100`
+
+### `BATCH_CONCURRENCY`
+- Required: no
+- Default: `5`
+- Format: integer
+- Allowed range: `1`–`32` (values outside the range are rejected at startup)
+- Description: Maximum number of batch items verified in parallel. Items beyond this are queued. Partial failures are reported per item in the response (`{ index, status, error }`) rather than failing the whole batch.
+- Tuning guidance:
+  - Keep `BATCH_CONCURRENCY` well below the RPC provider's per-second rate limit.
+  - For rate-limited or shared RPC endpoints use `2`–`4`.
+  - Do not raise above `16` without load testing — latency degrades and RPC throttling errors increase.
+- Example: `BATCH_CONCURRENCY=5`
 
 ---
 
@@ -276,6 +313,8 @@ When an anomaly is detected the service POSTs a JSON payload to `ALERT_WEBHOOK_U
 | `ISSUER_SECRET_KEY` | yes | runtime | valid Stellar secret key format |
 | `JWT_SECRET` | yes | Zod (backend) | non-empty string |
 | `PORT` | no | Zod (backend) | positive integer, default 4000 |
+| `BATCH_MAX_SIZE` | no | Zod (backend) | integer 1–1000, default 100 |
+| `BATCH_CONCURRENCY` | no | Zod (backend) | integer 1–32, default 5 |
 | `ALLOWED_ORIGINS` | no | Zod (backend) | comma-separated URLs, default `http://localhost:3000` |
 | `SOROBAN_FEE` | no | Zod (backend) | positive integer (stroops), default 100 |
 | `SOROBAN_TIP` | no | Zod (backend) | non-negative integer (stroops), default 0 |

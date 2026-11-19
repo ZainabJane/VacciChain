@@ -9,11 +9,12 @@ The VacciChain Analytics Service provides endpoints for querying vaccination sta
 ## Table of Contents
 
 1. [Authentication](#authentication)
-2. [Analytics Endpoints](#analytics-endpoints)
-3. [Batch Verification](#batch-verification)
-4. [Rate Limiting](#rate-limiting)
-5. [Error Handling](#error-handling)
-6. [Examples](#examples)
+2. [Correlation IDs](#correlation-ids)
+3. [Analytics Endpoints](#analytics-endpoints)
+4. [Batch Verification](#batch-verification)
+5. [Rate Limiting](#rate-limiting)
+6. [Error Handling](#error-handling)
+7. [Examples](#examples)
 
 ---
 
@@ -56,6 +57,94 @@ curl -H "Authorization: Bearer <jwt-token>" \
 ### Batch Verification (POST /batch/verify)
 
 **No authentication required** — mirrors the public backend verification endpoint.
+
+---
+
+## Correlation IDs
+
+Every request to the Analytics Service carries a **correlation ID** so operators can trace a single workflow across the Node backend, the analytics service, and downstream Stellar calls.
+
+### Header
+
+| Header | Direction | Description |
+|--------|-----------|-------------|
+| `X-Request-ID` | Request & Response | Correlation identifier for the request |
+
+### Validation and Generation
+
+- If the incoming request includes an `X-Request-ID` header, it is **validated** before use.
+- A valid ID must be 1-128 characters and contain only alphanumeric characters, hyphens (`-`), and underscores (`_`). Anything else (spaces, slashes, control characters, etc.) is rejected and a new ID is generated instead.
+- If the header is missing or invalid, the service **generates** a new ID (UUID v4) automatically.
+- The resolved ID is propagated to all downstream calls (backend API requests and Stellar RPC calls) via the `X-Request-ID` header, and included in every structured log line for the request.
+
+### Response
+
+The resolved correlation ID is always returned in the `X-Request-ID` response header, whether the request succeeded or failed. This lets clients correlate their request with server-side logs.
+
+- The response header contains only the validated/generated ID.
+- Error response bodies never include internal stack traces or credentials — only the safe `detail` message.
+
+### Logging
+
+Structured logs include the correlation ID as a top-level field:
+
+```json
+{
+  "level": "INFO",
+  "request_id": "3f2b8c1e-9a4d-4e7b-8c2f-1d5e6a7b8c9d",
+  "method": "GET",
+  "path": "/analytics/rates",
+  "status": 200,
+  "duration_ms": 842
+}
+```
+
+### Examples
+
+**Client-supplied correlation ID (analytics endpoint):**
+
+```bash
+curl -i -X GET "http://analytics:8000/analytics/rates" \
+  -H "X-API-Key: your-api-key" \
+  -H "X-Request-ID: order-12345-abc"
+```
+
+**Response headers:**
+```
+HTTP/1.1 200 OK
+X-Request-ID: order-12345-abc
+Content-Type: application/json
+```
+
+**Generated correlation ID (batch endpoint, no header supplied):**
+
+```bash
+curl -i -X POST "http://analytics:8000/batch/verify" \
+  -H "Content-Type: application/json" \
+  -d '{"wallets": ["GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF"]}'
+```
+
+**Response headers:**
+```
+HTTP/1.1 200 OK
+X-Request-ID: 3f2b8c1e-9a4d-4e7b-8c2f-1d5e6a7b8c9d
+Content-Type: application/json
+```
+
+**Invalid correlation ID (replaced with a generated one):**
+
+```bash
+curl -i -X GET "http://analytics:8000/analytics/rates" \
+  -H "X-API-Key: your-api-key" \
+  -H "X-Request-ID: bad id/with spaces"
+```
+
+**Response headers:**
+```
+HTTP/1.1 200 OK
+X-Request-ID: 7c9e2a4f-1b3d-4f5a-9e8c-2d6b0a1c3e5f
+Content-Type: application/json
+```
 
 ---
 
@@ -102,6 +191,10 @@ curl -X GET "http://analytics:8000/analytics/rates" \
 | 401 | Missing or invalid authentication |
 | 403 | JWT token missing required `issuer` role |
 | 500 | Backend API unreachable or timeout |
+
+**Correlation:**
+- Accepts and returns `X-Request-ID` (see [Correlation IDs](#correlation-ids))
+- The ID is forwarded to the backend event query and included in logs
 
 **Performance:**
 - Fetches up to 500 events from backend
@@ -321,6 +414,11 @@ curl -X POST "http://analytics:8000/batch/verify" \
 | 429 | Rate limit exceeded (30 req/min) | `{"detail": "rate limit exceeded"}` |
 | 500 | Backend API unreachable | `{"detail": "Internal server error"}` |
 
+**Correlation:**
+- Accepts and returns `X-Request-ID` (see [Correlation IDs](#correlation-ids))
+- The same ID is propagated to every per-wallet backend verification call, so all downstream calls for one batch can be traced together
+- The ID is included in structured logs for each wallet result
+
 **Performance:**
 - Processes up to 100 wallets per request
 - Response time: 5-15 seconds (depends on backend and network)
@@ -409,6 +507,8 @@ curl -X POST "http://analytics:8000/batch/verify" \
 - Backend API timeout
 - Database connection failure
 
+**Note:** Error responses never include internal stack traces or credentials. Use the `X-Request-ID` response header to correlate the error with server-side logs.
+
 ---
 
 ## Examples
@@ -423,6 +523,7 @@ ANALYTICS_URL="http://analytics:8000"
 
 curl -X GET "${ANALYTICS_URL}/analytics/rates" \
   -H "X-API-Key: ${API_KEY}" \
+  -H "X-Request-ID: ${REQUEST_ID:-$(uuidgen)}" \
   -H "Content-Type: application/json"
 ```
 
@@ -436,6 +537,8 @@ curl -X GET "${ANALYTICS_URL}/analytics/rates" \
   "total_mints": 2130
 }
 ```
+
+**Response header:** `X-Request-ID: <the ID you sent, or a generated one>`
 
 ### Example 2: Get Issuer Activity (JWT Auth)
 
@@ -498,6 +601,7 @@ ANALYTICS_URL="http://analytics:8000"
 
 curl -X POST "${ANALYTICS_URL}/batch/verify" \
   -H "Content-Type: application/json" \
+  -H "X-Request-ID: batch-verify-2024-01-15" \
   -d '{
     "wallets": [
       "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF",
@@ -505,6 +609,8 @@ curl -X POST "${ANALYTICS_URL}/batch/verify" \
     ]
   }'
 ```
+
+**Response header:** `X-Request-ID: batch-verify-2024-01-15`
 
 **Response:**
 ```json
@@ -533,27 +639,35 @@ curl -X POST "${ANALYTICS_URL}/batch/verify" \
 import httpx
 import json
 
-# Analytics endpoint with API key
-async def get_vaccination_rates(api_key: str):
+import uuid
+
+# Analytics endpoint with API key and correlation ID
+async def get_vaccination_rates(api_key: str, request_id: str | None = None):
+    request_id = request_id or str(uuid.uuid4())
     async with httpx.AsyncClient() as client:
         response = await client.get(
             "http://analytics:8000/analytics/rates",
-            headers={"X-API-Key": api_key}
+            headers={"X-API-Key": api_key, "X-Request-ID": request_id}
         )
+        # Echo back the resolved correlation ID for log correlation
+        print("request_id:", response.headers.get("X-Request-ID"))
         return response.json()
 
-# Batch verify with error handling
-async def batch_verify_wallets(wallets: list[str]):
+# Batch verify with error handling and correlation ID
+async def batch_verify_wallets(wallets: list[str], request_id: str | None = None):
+    request_id = request_id or str(uuid.uuid4())
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
                 "http://analytics:8000/batch/verify",
                 json={"wallets": wallets},
+                headers={"X-Request-ID": request_id},
                 timeout=30
             )
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
+            print("request_id:", e.response.headers.get("X-Request-ID"))
             if e.response.status_code == 429:
                 print("Rate limited, retry after:", e.response.headers.get("Retry-After"))
             raise
@@ -625,3 +739,9 @@ asyncio.run(main())
 - Comprehensive markdown documentation
 - Located at `docs/analytics-api.md`
 - Includes table of contents, examples, and configuration
+
+✅ **Correlation IDs are documented**
+- `X-Request-ID` header validation and generation rules
+- Propagation to downstream backend and Stellar calls
+- Presence in structured logs and response headers
+- Examples for analytics and batch endpoints

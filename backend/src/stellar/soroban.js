@@ -1,6 +1,7 @@
 const StellarSdk = require('@stellar/stellar-sdk');
 const config = require('../config');
 const logger = require('../logger');
+const { getRequestId } = require('../requestContext');
 
 const {
   SOROBAN_RPC_URL,
@@ -52,13 +53,18 @@ class SorobanTimeoutError extends SorobanError {
  * Race an async fn against a timeout. Cleans up the timer on resolution.
  * Throws SorobanTimeoutError if the timeout fires first.
  */
-async function withTimeout(fn, context) {
+async function withTimeout(fn, context, requestId) {
   const start = Date.now();
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(() => {
       const elapsed = Date.now() - start;
-      logger.warn('Soroban RPC timeout', { context, rpcUrl: SOROBAN_RPC_URL, elapsedMs: elapsed });
+      logger.warn('Soroban RPC timeout', {
+        context,
+        requestId,
+        rpcUrl: SOROBAN_RPC_URL,
+        elapsedMs: elapsed,
+      });
       reject(new SorobanTimeoutError(context, elapsed));
     }, SOROBAN_RPC_TIMEOUT_MS);
   });
@@ -74,16 +80,29 @@ const TX_FEE = String(process.env.SOROBAN_FEE || 100);
 // Inclusion tip in stroops for priority during congestion (0 = no tip).
 const TX_TIP = process.env.SOROBAN_TIP ? String(process.env.SOROBAN_TIP) : undefined;
 
-function getRpcServer() {
-  return new StellarSdk.SorobanRpc.Server(SOROBAN_RPC_URL);
+/**
+ * Build a Soroban RPC server whose underlying HTTP client forwards the
+ * correlation ID as an X-Request-ID header on every downstream call.
+ * @param {string} [requestId] - Correlation ID for this workflow
+ */
+function getRpcServer(requestId) {
+  const server = new StellarSdk.SorobanRpc.Server(SOROBAN_RPC_URL);
+  const correlationId = requestId || getRequestId();
+  if (correlationId && server && server.httpClient && server.httpClient.defaults) {
+    server.httpClient.defaults.headers = server.httpClient.defaults.headers || {};
+    server.httpClient.defaults.headers['X-Request-ID'] = correlationId;
+  }
+  return server;
 }
 
 /**
  * Helper to retry RPC calls with exponential backoff.
  * @param {Function} fn - The RPC call to execute
  * @param {string} context - Context for logging
+ * @param {string} [requestId] - Correlation ID for this workflow
  */
-async function withRetry(fn, context = '') {
+async function withRetry(fn, context = '', requestId) {
+  const correlationId = requestId || getRequestId();
   let lastError;
   for (let attempt = 0; attempt <= SOROBAN_RPC_MAX_RETRIES; attempt++) {
     try {
@@ -91,13 +110,14 @@ async function withRetry(fn, context = '') {
         const backoff = Math.pow(2, attempt - 1) * 100; // 100ms, 200ms, 400ms
         logger.info(`Retrying Soroban RPC call`, {
           context,
+          requestId: correlationId,
           attempt,
           maxRetries: SOROBAN_RPC_MAX_RETRIES,
           backoffMs: backoff,
         });
         await new Promise((resolve) => setTimeout(resolve, backoff));
       }
-      return await withTimeout(fn, context);
+      return await withTimeout(fn, context, correlationId);
     } catch (error) {
       lastError = error;
 
@@ -106,6 +126,7 @@ async function withRetry(fn, context = '') {
       if (status && status >= 400 && status < 500) {
         logger.warn(`Non-retryable Soroban RPC error`, {
           context,
+          requestId: correlationId,
           status,
           message: error.message,
         });
@@ -115,12 +136,14 @@ async function withRetry(fn, context = '') {
       if (attempt === SOROBAN_RPC_MAX_RETRIES) {
         logger.error(`Soroban RPC call failed after maximum retries`, {
           context,
+          requestId: correlationId,
           attempt,
           message: error.message,
         });
       } else {
         logger.debug(`Soroban RPC call transient failure`, {
           context,
+          requestId: correlationId,
           attempt,
           message: error.message,
         });
@@ -135,11 +158,18 @@ async function withRetry(fn, context = '') {
  * @param {string} secretKey - Caller's secret key
  * @param {string} method - Contract method name
  * @param {StellarSdk.xdr.ScVal[]} args - Method arguments
+ * @param {Object} [options]
+ * @param {string} [options.requestId] - Correlation ID for this workflow
  */
-async function invokeContract(secretKey, method, args) {
-  const rpc = getRpcServer();
+async function invokeContract(secretKey, method, args, options = {}) {
+  const requestId = options.requestId || getRequestId();
+  const rpc = getRpcServer(requestId);
   const keypair = StellarSdk.Keypair.fromSecret(secretKey);
-  const account = await withRetry(() => rpc.getAccount(keypair.publicKey()), 'getAccount');
+  const account = await withRetry(
+    () => rpc.getAccount(keypair.publicKey()),
+    'getAccount',
+    requestId
+  );
 
   const contract = new StellarSdk.Contract(CONTRACT_ID);
 
@@ -154,10 +184,18 @@ async function invokeContract(secretKey, method, args) {
     .setTimeout(30)
     .build();
 
-  const prepared = await withRetry(() => rpc.prepareTransaction(tx), 'prepareTransaction');
+  const prepared = await withRetry(
+    () => rpc.prepareTransaction(tx),
+    'prepareTransaction',
+    requestId
+  );
   prepared.sign(keypair);
 
-  const response = await withRetry(() => rpc.sendTransaction(prepared), 'sendTransaction');
+  const response = await withRetry(
+    () => rpc.sendTransaction(prepared),
+    'sendTransaction',
+    requestId
+  );
   if (response.status === 'ERROR') {
     const errDetail = JSON.stringify(response.errorResult);
     if (errDetail.includes('txINSUFFICIENT_FEE') || errDetail.includes('fee')) {
@@ -175,7 +213,11 @@ async function invokeContract(secretKey, method, args) {
   let result;
   for (let i = 0; i < 10; i++) {
     await new Promise((r) => setTimeout(r, 2000));
-    result = await withRetry(() => rpc.getTransaction(response.hash), 'getTransaction');
+    result = await withRetry(
+      () => rpc.getTransaction(response.hash),
+      'getTransaction',
+      requestId
+    );
     if (result.status !== 'NOT_FOUND') break;
   }
 
@@ -204,8 +246,10 @@ function toOptionalU32(value) {
  * @param {Object} [options]
  * @param {number|null} [options.doseNumber]
  * @param {number|null} [options.doseSeries]
+ * @param {string} [options.requestId] - Correlation ID for this workflow
  */
 async function mintVaccination(patient, vaccineName, dateAdministered, issuerSecret, options = {}) {
+  const requestId = options.requestId || getRequestId();
   try {
     const issuerKeypair = StellarSdk.Keypair.fromSecret(issuerSecret);
     const args = [
@@ -217,7 +261,7 @@ async function mintVaccination(patient, vaccineName, dateAdministered, issuerSec
       toOptionalU32(options.doseSeries),
     ];
 
-    const result = await invokeContract(issuerSecret, 'mint_vaccination', args);
+    const result = await invokeContract(issuerSecret, 'mint_vaccination', args, { requestId });
     const tokenId = StellarSdk.scValToNative(result.returnValue);
     return {
       tokenId,
@@ -233,11 +277,14 @@ async function mintVaccination(patient, vaccineName, dateAdministered, issuerSec
 /**
  * Verify vaccination status via a read-only contract call.
  * @param {string} wallet - Stellar wallet address to verify
+ * @param {Object} [options]
+ * @param {string} [options.requestId] - Correlation ID for this workflow
  */
-async function verifyVaccination(wallet) {
+async function verifyVaccination(wallet, options = {}) {
+  const requestId = options.requestId || getRequestId();
   try {
     const args = [StellarSdk.Address.fromString(wallet).toScVal()];
-    const rawResult = await simulateContract('verify_vaccination', args);
+    const rawResult = await simulateContract('verify_vaccination', args, { requestId });
     const [vaccinated, records] = StellarSdk.scValToNative(rawResult);
     return {
       wallet,
@@ -252,9 +299,14 @@ async function verifyVaccination(wallet) {
 
 /**
  * Read-only contract call (no signing needed).
+ * @param {string} method - Contract method name
+ * @param {StellarSdk.xdr.ScVal[]} args - Method arguments
+ * @param {Object} [options]
+ * @param {string} [options.requestId] - Correlation ID for this workflow
  */
-async function simulateContract(method, args) {
-  const rpc = getRpcServer();
+async function simulateContract(method, args, options = {}) {
+  const requestId = options.requestId || getRequestId();
+  const rpc = getRpcServer(requestId);
   const contract = new StellarSdk.Contract(CONTRACT_ID);
 
   // Use a dummy account for simulation
@@ -269,7 +321,11 @@ async function simulateContract(method, args) {
     .setTimeout(30)
     .build();
 
-  const sim = await withRetry(() => rpc.simulateTransaction(tx), 'simulateTransaction');
+  const sim = await withRetry(
+    () => rpc.simulateTransaction(tx),
+    'simulateTransaction',
+    requestId
+  );
   if (StellarSdk.SorobanRpc.Api.isSimulationError(sim)) {
     const error = new Error(`Simulation failed: ${sim.error}`);
     error.simulationError = sim.error;
@@ -305,25 +361,31 @@ module.exports = {
 /**
  * Add a new issuer to the contract allowlist (admin-signed).
  * @param {string} issuerWallet - Stellar public key to authorize as issuer
+ * @param {Object} [options]
+ * @param {string} [options.requestId] - Correlation ID for this workflow
  */
-async function addIssuer(issuerWallet) {
+async function addIssuer(issuerWallet, options = {}) {
+  const requestId = options.requestId || getRequestId();
   const adminSecret = process.env.ADMIN_SECRET_KEY;
   if (!adminSecret) throw new Error('ADMIN_SECRET_KEY not configured');
   const args = [StellarSdk.xdr.ScVal.scvAddress(
     StellarSdk.Address.fromString(issuerWallet).toScAddress()
   )];
-  return invokeContract(adminSecret, 'add_issuer', args);
+  return invokeContract(adminSecret, 'add_issuer', args, { requestId });
 }
 
 /**
  * Revoke an issuer from the contract allowlist (admin-signed).
  * @param {string} issuerWallet - Stellar public key to deauthorize
+ * @param {Object} [options]
+ * @param {string} [options.requestId] - Correlation ID for this workflow
  */
-async function revokeIssuer(issuerWallet) {
+async function revokeIssuer(issuerWallet, options = {}) {
+  const requestId = options.requestId || getRequestId();
   const adminSecret = process.env.ADMIN_SECRET_KEY;
   if (!adminSecret) throw new Error('ADMIN_SECRET_KEY not configured');
   const args = [StellarSdk.xdr.ScVal.scvAddress(
     StellarSdk.Address.fromString(issuerWallet).toScAddress()
   )];
-  return invokeContract(adminSecret, 'revoke_issuer', args);
+  return invokeContract(adminSecret, 'revoke_issuer', args, { requestId });
 }

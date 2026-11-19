@@ -120,5 +120,60 @@ function adminAuthMiddleware(req, res, next) {
   next();
 }
 
+/**
+ * Strict admin-only middleware for sensitive transitions (e.g. onboarding review).
+ * Requires the token role to be exactly 'admin' — no other role is accepted.
+ * Propagates the request correlation ID onto req.user for audit logging.
+ */
+function requireAdmin(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing authorization header' });
+  }
+
+  const token = header.slice(7);
+  const keys = getVerificationKeys();
+  let decoded = null;
+
+  let preferredKid = null;
+  try {
+    const unverified = jwt.decode(token, { complete: true });
+    preferredKid = unverified?.header?.kid || null;
+  } catch (_) {}
+
+  const ordered = preferredKid
+    ? [...keys].sort((a) => (a.kid === preferredKid ? -1 : 1))
+    : keys;
+
+  for (const key of ordered) {
+    try {
+      decoded = jwt.verify(token, key.secret);
+      break;
+    } catch (_) {}
+  }
+
+  if (!decoded) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+
+  const requiredClaims = ['sub', 'role', 'wallet', 'exp'];
+  for (const claim of requiredClaims) {
+    if (!decoded[claim]) {
+      return res.status(401).json({ error: `Missing or empty claim: ${claim}` });
+    }
+  }
+
+  if (decoded.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin role required' });
+  }
+
+  req.user = decoded;
+  if (req.requestId) {
+    req.user.requestId = req.requestId;
+  }
+  next();
+}
+
 module.exports = authMiddleware;
 module.exports.adminAuthMiddleware = adminAuthMiddleware;
+module.exports.requireAdmin = requireAdmin;

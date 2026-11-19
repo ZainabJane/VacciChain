@@ -2,7 +2,7 @@
 
 const TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-// nonce → { clientPublicKey, expiresAt }
+// nonce → { clientPublicKey, expiresAt, requestId }
 const store = new Map();
 
 // Purge expired entries every minute
@@ -15,21 +15,28 @@ setInterval(() => {
 
 /**
  * Register a new nonce with a 5-minute TTL.
+ * Optionally associates a requestId for log correlation.
  */
-function set(nonce, clientPublicKey) {
-  store.set(nonce, { clientPublicKey, expiresAt: Date.now() + TTL_MS });
+function set(nonce, clientPublicKey, requestId) {
+  store.set(nonce, {
+    clientPublicKey,
+    expiresAt: Date.now() + TTL_MS,
+    requestId: requestId || null,
+  });
 }
 
 /**
  * Consume a nonce. Returns clientPublicKey on success.
  * Throws if nonce is unknown, expired, or already used.
+ * Errors include the associated requestId (if any) for correlation.
  */
 function consume(nonce) {
   const entry = store.get(nonce);
   if (!entry) throw new Error('Invalid or already used nonce');
   if (Date.now() > entry.expiresAt) {
     store.delete(nonce);
-    throw new Error('Challenge expired');
+    const suffix = entry.requestId ? ` (requestId: ${entry.requestId})` : '';
+    throw new Error(`Challenge expired${suffix}`);
   }
   store.delete(nonce); // single-use: remove immediately on consume
   return entry.clientPublicKey;

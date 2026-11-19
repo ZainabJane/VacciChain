@@ -38,6 +38,50 @@ docker events --filter event=oom --format '{{.Actor.Attributes.name}}' | \
   done
 ```
 
+## Batch verification concurrency
+
+Batch verification (analytics) fans out per-item work to the backend, the RPC
+provider, and the Python worker pool. To keep large batches from overwhelming any
+of these, both the batch size and the parallelism are bounded and configurable.
+
+### Configuration
+
+| Variable | Default | Allowed range | Purpose |
+|---|---|---|---|
+| `BATCH_SIZE` | 100 | 1–1000 | Maximum number of items accepted in a single batch request |
+| `BATCH_CONCURRENCY` | 4 | 1–16 | Maximum number of items processed in parallel within a batch |
+
+Requests exceeding `BATCH_SIZE` are rejected with a validation error rather than
+silently truncated. `BATCH_CONCURRENCY` is clamped to the documented range at
+startup; out-of-range values are logged and replaced with the nearest bound.
+
+### Recommended values
+
+| Scenario | `BATCH_SIZE` | `BATCH_CONCURRENCY` |
+|---|---|---|
+| Default / shared host | 100 | 4 |
+| Backend memory-constrained (near 256 MB limit) | 50 | 2 |
+| RPC provider rate-limited | 100 | 2–4 |
+| Dedicated host with headroom | 250 | 8 |
+
+Keep `BATCH_SIZE × BATCH_CONCURRENCY` in mind: the effective in-flight item count
+is bounded by `BATCH_CONCURRENCY`, but each in-flight item may hold an XDR buffer
+(see the `backend` memory basis above). Raising concurrency multiplies peak memory.
+
+### Tuning `BATCH_CONCURRENCY`
+
+1. Start at the default (4) and run a representative batch.
+2. Watch backend memory (`docker stats backend`) and RPC error rates. If memory
+   approaches the 256 MB limit or you see OOM kills, halve concurrency.
+3. If latency is dominated by waiting on the RPC provider and error rates are
+   clean, increase concurrency one step at a time up to 16, re-profiling each time.
+4. Partial failures are reported per item: a failed item yields an error result
+   for that item only, and the rest of the batch completes. A batch response is
+   therefore a mix of successes and per-item errors, never an all-or-nothing abort.
+
+Load tests should confirm stable latency as batch size grows and that partial
+failures surface a clear per-item error result.
+
 ## Adjusting limits
 
 If you observe legitimate OOM kills under normal load, increase the memory limit

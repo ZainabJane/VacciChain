@@ -23,12 +23,34 @@ const { applySchema, reviewSchema } = require('./schemas/onboarding.schemas');
 
 const router = express.Router();
 
+// Explicit onboarding state machine.
+// Only pending applications may transition to a terminal state.
+const ONBOARDING_STATES = Object.freeze({
+  PENDING: 'pending',
+  APPROVED: 'approved',
+  REJECTED: 'rejected',
+});
+
+const ALLOWED_TRANSITIONS = Object.freeze({
+  [ONBOARDING_STATES.PENDING]: [ONBOARDING_STATES.APPROVED, ONBOARDING_STATES.REJECTED],
+  [ONBOARDING_STATES.APPROVED]: [],
+  [ONBOARDING_STATES.REJECTED]: [],
+});
+
+function isValidTransition(from, to) {
+  const allowed = ALLOWED_TRANSITIONS[from];
+  return Array.isArray(allowed) && allowed.includes(to);
+}
+
 function adminOnly(req, res, next) {
   if (req.user?.role !== 'issuer') {
     return res.status(403).json({ error: 'Admin access required' });
   }
   next();
 }
+
+/**
+ * POST /onboarding/apply
  * Any authenticated user can submit an onboarding request.
  */
 router.post('/apply', authMiddleware, validate(applySchema), async (req, res) => {
@@ -78,7 +100,16 @@ router.post('/applications/:id/review', authMiddleware, adminOnly, validate(revi
 
   const { decision, reviewer_note } = req.body;
 
-  if (decision === 'approved') {
+  const previousStatus = application.status;
+
+  if (!isValidTransition(previousStatus, decision)) {
+    return res.status(400).json({
+      error: `Invalid transition from '${previousStatus}' to '${decision}'`,
+      allowed: ALLOWED_TRANSITIONS[previousStatus] || [],
+    });
+  }
+
+  if (decision === ONBOARDING_STATES.APPROVED) {
     try {
       await addIssuer(application.wallet);
     } catch (err) {
@@ -86,16 +117,37 @@ router.post('/applications/:id/review', authMiddleware, adminOnly, validate(revi
     }
   }
 
-  updateIssuerApplicationStatus(req.params.id, { status: decision, reviewer_note });
+  const reviewedAt = new Date().toISOString();
+  const reviewedBy = req.user.wallet;
 
-  audit({
-    actor: req.user.wallet,
-    action: `onboarding.${decision}`,
-    result: decision,
-    meta: { applicationId: req.params.id, applicantWallet: application.wallet },
+  updateIssuerApplicationStatus(req.params.id, {
+    status: decision,
+    reviewer_note,
+    reviewed_by: reviewedBy,
+    reviewed_at: reviewedAt,
   });
 
-  res.json({ id: req.params.id, status: decision, wallet: application.wallet });
+  audit({
+    actor: reviewedBy,
+    action: 'onboarding.review',
+    result: decision,
+    meta: {
+      applicationId: req.params.id,
+      applicantWallet: application.wallet,
+      previousStatus,
+      newStatus: decision,
+      reviewer_note: reviewer_note ?? null,
+      reviewedAt,
+    },
+  });
+
+  res.json({
+    id: req.params.id,
+    status: decision,
+    wallet: application.wallet,
+    reviewed_by: reviewedBy,
+    reviewed_at: reviewedAt,
+  });
 });
 
 module.exports = router;

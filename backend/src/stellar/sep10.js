@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const StellarSdk = require('@stellar/stellar-sdk');
 const config = require('../config');
 const nonceStore = require('./nonceStore');
+const { getRequestId } = require('../observability/correlation');
 
 const NETWORK_PASSPHRASE =
   config.STELLAR_NETWORK === 'mainnet'
@@ -25,8 +26,13 @@ const server = new StellarSdk.Horizon.Server(config.HORIZON_URL);
  *  - signed by server keypair
  *
  * Returns { transaction, nonce, network_passphrase }.
+ *
+ * @param {string} clientPublicKey - Client Stellar account (G...)
+ * @param {string} [requestId] - Correlation ID for tracing (defaults to the
+ *   current request context, if any)
  */
-async function buildChallenge(clientPublicKey) {
+async function buildChallenge(clientPublicKey, requestId) {
+  const correlationId = requestId || getRequestId();
   const serverKeypair = StellarSdk.Keypair.fromSecret(config.SEP10_SERVER_KEY);
 
   // SEP-10 requires sequence number 0. Use a synthetic account so the builder
@@ -61,7 +67,7 @@ async function buildChallenge(clientPublicKey) {
 
   tx.sign(serverKeypair);
 
-  nonceStore.set(nonce, clientPublicKey);
+  nonceStore.set(nonce, clientPublicKey, correlationId);
 
   return { transaction: tx.toXDR(), nonce, network_passphrase: NETWORK_PASSPHRASE };
 }
@@ -78,10 +84,17 @@ async function buildChallenge(clientPublicKey) {
  *  6. Client signature is present and valid
  *
  * Returns the verified client public key on success.
+ *
+ * @param {string} transactionXDR - Base64-encoded challenge transaction
+ * @param {string} nonce - Nonce issued by buildChallenge
+ * @param {string} [requestId] - Correlation ID for tracing (defaults to the
+ *   current request context, if any)
  */
-function verifyChallenge(transactionXDR, nonce) {
+function verifyChallenge(transactionXDR, nonce, requestId) {
+  const correlationId = requestId || getRequestId();
+
   // 1. Consume nonce — throws if unknown, expired, or already used
-  nonceStore.consume(nonce);
+  nonceStore.consume(nonce, correlationId);
 
   const serverKeypair = StellarSdk.Keypair.fromSecret(config.SEP10_SERVER_KEY);
 

@@ -123,6 +123,83 @@ describe('Integration Tests - Public Verify Endpoint (GET /v1/verify/:wallet)', 
     expect(res.body).toHaveProperty('error');
   });
 
+  it('Test: batch verification bounds batch size and parallelism', async () => {
+    const { verifyBatch } = require('../src/services/batchVerify');
+
+    const wallets = Array.from({ length: 25 }, () => StellarSdk.Keypair.random().publicKey());
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+
+    simulateContract.mockImplementation(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+      return StellarSdk.xdr.ScVal.scvVec([
+        StellarSdk.xdr.ScVal.scvBool(true),
+        StellarSdk.xdr.ScVal.scvVec([]),
+      ]);
+    });
+
+    const result = await verifyBatch(wallets, { requestId: 'batch-req-1' });
+
+    // All items processed
+    expect(result.results).toHaveLength(25);
+    // Parallelism is bounded by the documented limit
+    expect(maxInFlight).toBeLessThanOrEqual(verifyBatch.MAX_PARALLELISM);
+    expect(maxInFlight).toBeGreaterThan(1);
+    // Batch size is bounded by the documented limit
+    expect(verifyBatch.MAX_BATCH_SIZE).toBeGreaterThan(0);
+    expect(wallets.length).toBeLessThanOrEqual(verifyBatch.MAX_BATCH_SIZE);
+    // Request ID propagated to the batch result
+    expect(result.requestId).toBe('batch-req-1');
+  });
+
+  it('Test: batch verification rejects oversized batches', async () => {
+    const { verifyBatch } = require('../src/services/batchVerify');
+
+    const wallets = Array.from(
+      { length: verifyBatch.MAX_BATCH_SIZE + 1 },
+      () => StellarSdk.Keypair.random().publicKey()
+    );
+
+    await expect(verifyBatch(wallets, { requestId: 'too-big' })).rejects.toMatchObject({
+      status: 400,
+    });
+  });
+
+  it('Test: batch verification returns per-item errors for partial failures', async () => {
+    const { verifyBatch } = require('../src/services/batchVerify');
+
+    const okWallet = StellarSdk.Keypair.random().publicKey();
+    const failWallet = StellarSdk.Keypair.random().publicKey();
+
+    simulateContract.mockImplementation(async (wallet) => {
+      if (wallet === failWallet) {
+        throw new Error('Simulation failed: timeout');
+      }
+      return StellarSdk.xdr.ScVal.scvVec([
+        StellarSdk.xdr.ScVal.scvBool(true),
+        StellarSdk.xdr.ScVal.scvVec([]),
+      ]);
+    });
+
+    const result = await verifyBatch([okWallet, failWallet], { requestId: 'partial-1' });
+
+    expect(result.requestId).toBe('partial-1');
+    expect(result.results).toHaveLength(2);
+
+    const ok = result.results.find((r) => r.wallet === okWallet);
+    const failed = result.results.find((r) => r.wallet === failWallet);
+
+    expect(ok).toMatchObject({ ok: true, verified: true });
+    expect(failed).toMatchObject({ ok: false });
+    expect(failed.error).toBeTruthy();
+    // Internal stack traces must not leak
+    expect(JSON.stringify(failed)).not.toContain('at ');
+  });
+
   it('Test: response is served from cache on second request within TTL', async () => {
     const mockResult = StellarSdk.xdr.ScVal.scvVec([
       StellarSdk.xdr.ScVal.scvBool(true),

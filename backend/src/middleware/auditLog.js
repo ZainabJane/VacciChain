@@ -22,8 +22,9 @@ function writeAuditEntry(entry) {
  * @param {string} [opts.target] - Subject of the action (patient wallet, etc.)
  * @param {string} opts.result  - 'success' | 'failure'
  * @param {object} [opts.meta]  - Any extra context (token_id, error message, …)
+ * @param {string} [opts.requestId] - Correlation ID for tracing the workflow
  */
-function audit({ actor, action, target = null, result, meta = {} }) {
+function audit({ actor, action, target = null, result, meta = {}, requestId = null }) {
   const entry = {
     timestamp: new Date().toISOString(),
     actor,
@@ -32,7 +33,43 @@ function audit({ actor, action, target = null, result, meta = {} }) {
     result,
     meta,
   };
+  if (requestId) entry.requestId = requestId;
   writeAuditEntry(entry);
+}
+
+/**
+ * Record an explicit onboarding status transition with full audit metadata.
+ * Only the transition itself is persisted here; authorization and state
+ * validation are the caller's responsibility.
+ *
+ * @param {object} opts
+ * @param {string} opts.actor          - Stellar public key of the acting admin
+ * @param {string} opts.applicationId  - Issuer application identifier
+ * @param {string} opts.previousStatus - Status before the transition
+ * @param {string} opts.newStatus      - Status after the transition
+ * @param {string} [opts.requestId]    - Correlation ID for tracing
+ * @param {object} [opts.meta]         - Any extra context (reason, …)
+ */
+function auditStatusTransition({
+  actor,
+  applicationId,
+  previousStatus,
+  newStatus,
+  requestId = null,
+  meta = {},
+}) {
+  audit({
+    actor,
+    action: 'onboarding.status.transition',
+    target: applicationId,
+    result: 'success',
+    requestId,
+    meta: {
+      ...meta,
+      previousStatus,
+      newStatus,
+    },
+  });
 }
 
 /**
@@ -68,4 +105,4 @@ function queryAuditLog({ actor, from, to } = {}) {
   });
 }
 
-module.exports = { audit, queryAuditLog };
+module.exports = { audit, auditStatusTransition, queryAuditLog };
