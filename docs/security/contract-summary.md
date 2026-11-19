@@ -158,6 +158,65 @@ Anyone      │ No auth required                   │ verify_vaccination, batch
 All privileged operations use Soroban's `require_auth()` — the host enforces that the
 named address has signed the invocation. There is no off-chain bypass.
 
+### 6.1 Authorization Matrix (per entry point)
+
+Reviewed function-by-function against the implementation. "Auth" is the address on which
+`require_auth()` is invoked; "Checks" are the additional on-chain state validations
+performed after auth succeeds. Any failure aborts the invocation (no partial state).
+
+| Entry point | Auth required | Allowlist / revocation checks | Additional checks |
+|---|---|---|---|
+| `initialize(admin)` | `admin` | — | Reverts with `AlreadyInitialized` if `Initialized` is set |
+| `add_issuer(issuer, …)` | current admin | — | Reverts if caller is not the stored `Admin`; writes `IssuerRecord{authorized: true}` |
+| `revoke_issuer(issuer)` | current admin | — | Reverts if caller is not `Admin`; sets `authorized = false`, record preserved |
+| `propose_admin(new_admin)` | current admin | — | Reverts if caller is not `Admin`; sets `PendingAdmin` + 24h `AdminTransferExpiry` |
+| `accept_admin(new_admin)` | `new_admin` | — | Reverts if caller ≠ `PendingAdmin` or past `AdminTransferExpiry`; clears pending state |
+| `upgrade(new_wasm_hash)` | current admin | — | Reverts if caller is not `Admin`; replaces WASM, emits `upgraded` |
+| `mint_vaccination(patient, …, issuer)` | `issuer` | `Issuer(issuer).authorized == true`; `PatientAllowlist(patient) == true` | Duplicate detection; per-patient limit (50); reverts on any failure |
+| `revoke_vaccination(token_id, revoker)` | `revoker` | `revoker` must be the record's original issuer **or** the current admin | Reverts if token missing or already revoked; record never deleted |
+| `register_patient(patient)` | `patient` | — | Idempotent; sets `PatientAllowlist(patient) = true` |
+| `verify_vaccination(wallet)` | none | — | Read-only; returns active (non-revoked) records |
+| `batch_verify(wallets)` | none | — | Read-only; max 100 wallets |
+| `is_issuer(address)` | none | Reads `Issuer(address).authorized` | Read-only |
+| `get_all_issuers(start, limit)` | none | Filters `authorized == true` | Read-only; paginated |
+| `is_patient_registered(patient)` | none | Reads `PatientAllowlist(patient)` | Read-only |
+| `get_issuer(address)` | none | — | Read-only; returns `IssuerRecord` |
+| `transfer(from, to, token_id)` | none | — | Always reverts with `SoulboundToken` |
+
+### 6.2 Authorization invariants
+
+1. **No unauthenticated privileged path.** Every state-mutating entry point invokes
+   `require_auth()` on a specific address before touching storage.
+2. **Admin identity is read from storage, never from arguments.** Admin-gated functions
+   compare the authenticated caller against `DataKey::Admin`; a caller cannot self-declare
+   admin status.
+3. **Issuer authorization is re-checked at mint time.** `mint_vaccination` verifies
+   `Issuer(issuer).authorized` on every call, so a revoked issuer cannot mint even with a
+   valid signature.
+4. **Forged issuers fail.** An address with no `IssuerRecord` (or `authorized == false`)
+   cannot mint; the allowlist lookup fails closed.
+5. **Revocation is terminal for minting.** `revoke_issuer` sets `authorized = false`;
+   subsequent `mint_vaccination` calls by that issuer revert.
+6. **Revocation of records is restricted.** Only the original issuer or the current admin
+   may revoke a record; any other authenticated caller reverts.
+
+### 6.3 Authorization test coverage
+
+The test suite includes negative cases proving each privileged entry point rejects
+unauthorized callers:
+
+| Scenario | Expected result |
+|---|---|
+| Non-admin calls `add_issuer` / `revoke_issuer` / `propose_admin` / `upgrade` | Reverts (auth failure) |
+| Non-pending address calls `accept_admin` | Reverts |
+| `accept_admin` after `AdminTransferExpiry` | Reverts |
+| Unregistered address calls `mint_vaccination` (forged issuer) | Reverts |
+| Revoked issuer calls `mint_vaccination` | Reverts |
+| Issuer mints to a non-registered patient | Reverts |
+| Non-issuer, non-admin calls `revoke_vaccination` | Reverts |
+| `register_patient` without the patient's signature | Reverts (auth failure) |
+| `transfer` on any token | Reverts with `SoulboundToken` |
+
 ---
 
 ## 7. Trust Assumptions

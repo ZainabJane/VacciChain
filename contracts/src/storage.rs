@@ -102,6 +102,30 @@ pub struct VaccinationRecord {
     pub dose_series: Option<u32>,
 }
 
+/// Authorization-relevant data model
+/// --------------------------------
+/// Privileged operations rely exclusively on the following storage keys. Each
+/// key is a distinct `DataKey` variant, so the contract type system prevents
+/// one key from being read or written in place of another (e.g. an issuer
+/// record can never be stored under `Admin` or `PatientAllowlist`). Addresses
+/// are embedded in the key itself, so a caller cannot substitute a different
+/// address to reach another party's entry.
+///
+/// * `Admin` — the single privileged administrator. Only this address may
+///   perform admin actions (issuer management, pause/unpause, upgrades,
+///   admin transfer). It is set once at initialization and only mutated by a
+///   completed admin transfer.
+/// * `PendingAdmin` — the proposed successor during a two-step admin transfer.
+///   It carries no authority until the transfer is finalized; it cannot be
+///   used to bypass the current `Admin` check.
+/// * `Issuer(Address)` — per-issuer record. Minting authorization MUST consult
+///   `IssuerRecord.authorized` for the *caller's own* address; a forged or
+///   revoked issuer (record absent or `authorized == false`) must be rejected.
+/// * `PatientAllowlist(Address)` — per-patient self-registration flag. It only
+///   gates patient self-registration and never grants issuer or admin rights.
+///
+/// Because keys are derived from the authenticated caller address, an
+/// unauthorized caller cannot spoof another issuer's or admin's entry.
 #[contracttype]
 #[derive(Clone)]
 pub struct IssuerRecord {
@@ -112,6 +136,11 @@ pub struct IssuerRecord {
     /// Issuer country of operation.
     pub country: String,
     /// Authorization status for minting vaccination records.
+    ///
+    /// This is the single source of truth for mint authorization: mint paths
+    /// must require `authorized == true` for the caller's `Issuer(Address)`
+    /// record. Revocation sets this to `false` (or removes the record), and
+    /// both states must cause minting to fail.
     pub authorized: bool,
 }
 

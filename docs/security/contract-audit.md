@@ -52,6 +52,55 @@ Supporting documentation provided to auditor:
 - `docs/security/pre-audit-notes.md` — internal findings (all resolved before engagement)
 - `docs/security/threat-model.md` — full system threat model
 
+### Authorization Matrix
+
+The following matrix maps every privileged entry point to its intended on-chain
+authorization check, the implementation that enforces it, and the tests that prove
+unauthorized, forged-issuer, and revoked-issuer callers fail. It is reviewed
+function-by-function against `contracts/src/` and must be re-verified after any
+change to that directory.
+
+**Legend:** ✅ enforced and tested · ⚠️ enforced, test gap · ❌ not enforced
+
+#### Issuer Management
+
+| Function | Intended authorization | Implementation | Status | Tests |
+|---|---|---|---|---|
+| `add_issuer` | Admin `require_auth` | `lib.rs` — admin auth before write | ✅ | `test_add_issuer_requires_admin_auth`, `test_add_issuer_unauthorized_caller_fails` |
+| `remove_issuer` | Admin `require_auth` | `lib.rs` — admin auth before write | ✅ | `test_remove_issuer_requires_admin_auth`, `test_remove_issuer_unauthorized_caller_fails` |
+| `is_issuer` | Read-only, no auth | `lib.rs` — pure read | ✅ | `test_is_issuer_read_only` |
+
+#### Minting
+
+| Function | Intended authorization | Implementation | Status | Tests |
+|---|---|---|---|---|
+| `mint_vaccination` | Issuer `require_auth` **and** issuer allowlist membership | `mint.rs` — caller auth, then `is_issuer` allowlist check | ✅ | `test_mint_requires_issuer_auth`, `test_mint_forged_issuer_fails`, `test_mint_revoked_issuer_fails`, `test_mint_non_issuer_fails` |
+| `batch_mint` | Issuer `require_auth` **and** issuer allowlist membership | `mint.rs` — same checks as `mint_vaccination` | ✅ | `test_batch_mint_requires_issuer_auth`, `test_batch_mint_forged_issuer_fails`, `test_batch_mint_revoked_issuer_fails` |
+
+#### Administration
+
+| Function | Intended authorization | Implementation | Status | Tests |
+|---|---|---|---|---|
+| `initialize` | One-time; rejects re-initialization | `lib.rs` — initialized flag guard | ✅ | `test_initialize_twice_fails` |
+| `propose_admin` | Current admin `require_auth` | `lib.rs` — admin auth before write | ✅ | `test_propose_admin_requires_admin_auth`, `test_propose_admin_unauthorized_caller_fails` |
+| `accept_admin` | Proposed admin `require_auth` | `lib.rs` — proposed admin auth, expiry enforced | ✅ | `test_accept_admin_requires_proposed_admin_auth`, `test_accept_admin_expired_fails`, `test_accept_admin_wrong_caller_fails` |
+| `cancel_admin_transfer` | Current admin `require_auth` | `lib.rs` — admin auth before write | ✅ | `test_cancel_admin_transfer_requires_admin_auth` |
+
+#### Upgrade
+
+| Function | Intended authorization | Implementation | Status | Tests |
+|---|---|---|---|---|
+| `upgrade` | Admin `require_auth` | `lib.rs` — admin auth before `update_current_contract_wasm` | ✅ | `test_upgrade_requires_admin_auth`, `test_upgrade_unauthorized_caller_fails` |
+
+**Review notes:**
+- Every privileged entry point calls `require_auth` on the relevant address *before*
+  any state mutation; the issuer allowlist check in minting is applied in addition to
+  (not instead of) caller auth, so a forged or revoked issuer cannot mint.
+- Revoked issuers are rejected because `is_issuer` is evaluated at call time against
+  current storage, not against a cached or caller-supplied value.
+- Tests use `mock_all_auths`-free invocations for the negative cases so that missing
+  or mismatched auth surfaces as a failure rather than being silently satisfied.
+
 ### Audit Objectives
 
 1. Verify that access control (`require_auth`) is correctly applied to all privileged functions.

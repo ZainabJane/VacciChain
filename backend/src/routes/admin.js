@@ -10,6 +10,7 @@ const { approveProposal, getProposal } = require('../middleware/multiSig');
 const { isValidStellarPublicKey } = require('../middleware/wallet');
 const { addIssuer, revokeIssuer, simulateContract } = require('../stellar/soroban');
 const { isAuthorizedIssuer, invalidateCache } = require('../stellar/issuerCache');
+const { getIndexerStatus, pauseIndexer, resumeIndexer, reconcileRange } = require('../indexer/operations');
 const validate = require('../middleware/validate');
 const { addIssuerSchema, createApiKeySchema, rotateJwtSchema, approveProposalSchema } = require('./schemas/admin.schemas');
 
@@ -215,6 +216,87 @@ router.get('/multisig/proposals/:id', adminAuthMiddleware, adminOnly, (req, res)
     status: proposal.status,
     expires_at: new Date(proposal.expiresAt).toISOString(),
   });
+});
+
+// ── Indexer operations ────────────────────────────────────────────────────────
+
+/**
+ * GET /admin/indexer/status
+ * Reports poller progress, lag and state for operational monitoring.
+ */
+router.get('/indexer/status', adminAuthMiddleware, adminOnly, (_req, res) => {
+  try {
+    res.json(getIndexerStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /admin/indexer/pause
+ * Pauses the background poller so operators can respond to provider incidents.
+ */
+router.post('/indexer/pause', adminAuthMiddleware, adminOnly, (req, res) => {
+  try {
+    const status = pauseIndexer();
+    audit({ actor: req.user.wallet, action: 'admin.indexer.pause', result: 'success', meta: { state: status.state } });
+    res.json(status);
+  } catch (err) {
+    audit({ actor: req.user.wallet, action: 'admin.indexer.pause', result: 'failure', meta: { error: err.message } });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /admin/indexer/resume
+ * Resumes the background poller after a pause.
+ */
+router.post('/indexer/resume', adminAuthMiddleware, adminOnly, (req, res) => {
+  try {
+    const status = resumeIndexer();
+    audit({ actor: req.user.wallet, action: 'admin.indexer.resume', result: 'success', meta: { state: status.state } });
+    res.json(status);
+  } catch (err) {
+    audit({ actor: req.user.wallet, action: 'admin.indexer.resume', result: 'failure', meta: { error: err.message } });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /admin/indexer/reconcile
+ * Body: { from_ledger: number, to_ledger: number, repair?: boolean }
+ *
+ * Compares a bounded ledger range against persisted indexed events and
+ * reports actionable differences. When repair is true, missing records are
+ * re-indexed idempotently.
+ */
+router.post('/indexer/reconcile', adminAuthMiddleware, adminOnly, async (req, res) => {
+  const fromLedger = parseInt(req.body?.from_ledger, 10);
+  const toLedger = parseInt(req.body?.to_ledger, 10);
+  const repair = req.body?.repair === true;
+
+  if (!Number.isInteger(fromLedger) || !Number.isInteger(toLedger) || fromLedger < 0 || toLedger < fromLedger) {
+    return res.status(400).json({ error: 'Invalid ledger range: require 0 <= from_ledger <= to_ledger' });
+  }
+
+  try {
+    const result = await reconcileRange({ fromLedger, toLedger, repair });
+    audit({
+      actor: req.user.wallet,
+      action: 'admin.indexer.reconcile',
+      result: 'success',
+      meta: { fromLedger, toLedger, repair, differences: result.differences?.length ?? 0, repaired: result.repaired ?? 0 },
+    });
+    res.json(result);
+  } catch (err) {
+    audit({
+      actor: req.user.wallet,
+      action: 'admin.indexer.reconcile',
+      result: 'failure',
+      meta: { fromLedger, toLedger, repair, error: err.message },
+    });
+    res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = router;

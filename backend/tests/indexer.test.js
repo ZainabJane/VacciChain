@@ -137,6 +137,110 @@ describe('poller — parseEvent', () => {
   });
 });
 
+describe('reconciliation — detect and repair differences', () => {
+  const { reconcileRange, repairDifferences } = require('../src/indexer/reconcile');
+
+  const chainEvents = [
+    { id: 'rec-001', event_type: 'VaccinationMinted', ledger: 300, timestamp: 1700001000, contract_id: 'CABC', payload: { vaccine_name: 'Flu' } },
+    { id: 'rec-002', event_type: 'IssuerAdded', ledger: 301, timestamp: 1700001060, contract_id: 'CABC', payload: { issuer: 'GISSUER3' } },
+    { id: 'rec-003', event_type: 'IssuerRevoked', ledger: 302, timestamp: 1700001120, contract_id: 'CABC', payload: { issuer: 'GISSUER4' } },
+  ];
+
+  beforeEach(() => {
+    // Seed with a missing event (rec-002 absent) and a duplicate (rec-001 twice)
+    upsertEvents([chainEvents[0], chainEvents[0], chainEvents[2]]);
+  });
+
+  it('detects missing events in the indexed store', () => {
+    const diff = reconcileRange({ fromLedger: 300, toLedger: 302, chainEvents });
+    expect(diff.missing.map((e) => e.id)).toContain('rec-002');
+  });
+
+  it('detects duplicated indexed events', () => {
+    const diff = reconcileRange({ fromLedger: 300, toLedger: 302, chainEvents });
+    expect(diff.duplicates.map((e) => e.id)).toContain('rec-001');
+  });
+
+  it('detects stale/out-of-order indexed events', () => {
+    const diff = reconcileRange({ fromLedger: 300, toLedger: 302, chainEvents });
+    expect(Array.isArray(diff.stale)).toBe(true);
+  });
+
+  it('emits actionable differences with ledger range', () => {
+    const diff = reconcileRange({ fromLedger: 300, toLedger: 302, chainEvents });
+    expect(diff.fromLedger).toBe(300);
+    expect(diff.toLedger).toBe(302);
+    expect(diff).toHaveProperty('missing');
+    expect(diff).toHaveProperty('duplicates');
+  });
+
+  it('repair is idempotent and fixes missing/duplicate records', () => {
+    const diff = reconcileRange({ fromLedger: 300, toLedger: 302, chainEvents });
+    repairDifferences(diff, chainEvents);
+    const afterFirst = queryEvents();
+    const idsAfterFirst = afterFirst.map((e) => e.id).filter((id) => id.startsWith('rec-'));
+    expect(idsAfterFirst.filter((id) => id === 'rec-001').length).toBe(1);
+    expect(idsAfterFirst).toContain('rec-002');
+
+    // Second repair pass should not change anything
+    const diff2 = reconcileRange({ fromLedger: 300, toLedger: 302, chainEvents });
+    repairDifferences(diff2, chainEvents);
+    const afterSecond = queryEvents();
+    const idsAfterSecond = afterSecond.map((e) => e.id).filter((id) => id.startsWith('rec-'));
+    expect(idsAfterSecond.sort()).toEqual(idsAfterFirst.sort());
+  });
+
+  it('repair handles out-of-order events deterministically', () => {
+    const shuffled = [chainEvents[2], chainEvents[0], chainEvents[1]];
+    const diff = reconcileRange({ fromLedger: 300, toLedger: 302, chainEvents: shuffled });
+    repairDifferences(diff, shuffled);
+    const results = queryEvents().filter((e) => e.id.startsWith('rec-'));
+    const ledgers = results.map((e) => e.ledger);
+    expect(ledgers).toEqual([...ledgers].sort((a, b) => a - b));
+  });
+
+  it('repair emits an audit event', () => {
+    const auditSpy = jest.fn();
+    const diff = reconcileRange({ fromLedger: 300, toLedger: 302, chainEvents });
+    repairDifferences(diff, chainEvents, { audit: auditSpy });
+    expect(auditSpy).toHaveBeenCalled();
+    const auditEntry = auditSpy.mock.calls[0][0];
+    expect(auditEntry).toHaveProperty('action');
+    expect(auditEntry).toHaveProperty('fromLedger', 300);
+    expect(auditEntry).toHaveProperty('toLedger', 302);
+  });
+});
+
+describe('poller operational controls', () => {
+  const { getStatus, pausePoller, resumePoller } = require('../src/indexer/poller');
+
+  it('exposes progress, lag, and state via status', () => {
+    const status = getStatus();
+    expect(status).toHaveProperty('state');
+    expect(status).toHaveProperty('lastLedger');
+    expect(status).toHaveProperty('lag');
+  });
+
+  it('requires privileged authorization to pause', () => {
+    expect(() => pausePoller({ role: 'viewer' })).toThrow(/forbidden|unauthorized/i);
+  });
+
+  it('requires privileged authorization to resume', () => {
+    expect(() => resumePoller({ role: 'viewer' })).toThrow(/forbidden|unauthorized/i);
+  });
+
+  it('transitions state on pause and resume with audit events', () => {
+    const auditSpy = jest.fn();
+    pausePoller({ role: 'operator', audit: auditSpy });
+    expect(getStatus().state).toBe('paused');
+    expect(auditSpy).toHaveBeenCalledWith(expect.objectContaining({ action: 'poller.pause' }));
+
+    resumePoller({ role: 'operator', audit: auditSpy });
+    expect(getStatus().state).toBe('running');
+    expect(auditSpy).toHaveBeenCalledWith(expect.objectContaining({ action: 'poller.resume' }));
+  });
+});
+
 describe('GET /events route', () => {
   const request = require('supertest');
   const app = require('../src/app');

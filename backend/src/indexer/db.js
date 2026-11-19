@@ -156,7 +156,170 @@ function revokeApiKey(id) {
   flush();
 }
 
-module.exports = { initDb, upsertEvents, queryEvents, getLatestLedger, insertApiKey, getApiKeyByHash, listApiKeys, revokeApiKey, getConsent, recordConsent, hasConsented, insertIssuerApplication, getIssuerApplication, listIssuerApplications, updateIssuerApplicationStatus };
+// ── Reconciliation between chain and index ───────────────────────────────────
+
+/**
+ * Return all persisted events whose ledger falls within [fromLedger, toLedger].
+ * @param {number} fromLedger inclusive lower bound
+ * @param {number} toLedger inclusive upper bound
+ */
+function getEventsInLedgerRange(fromLedger, toLedger) {
+  const res = db.exec(
+    'SELECT * FROM events WHERE ledger >= ? AND ledger <= ? ORDER BY ledger ASC, id ASC',
+    [fromLedger, toLedger]
+  );
+  if (!res.length) return [];
+  const { columns, values } = res[0];
+  return values.map((row) => {
+    const obj = {};
+    columns.forEach((col, i) => { obj[col] = row[i]; });
+    obj.payload = JSON.parse(obj.payload);
+    return obj;
+  });
+}
+
+/** Normalize a canonical event into the shape persisted in the DB. */
+function normalizeEvent(e) {
+  return {
+    id: e.id,
+    event_type: e.event_type,
+    ledger: e.ledger,
+    timestamp: e.timestamp,
+    contract_id: e.contract_id,
+    payload: e.payload,
+  };
+}
+
+/** Stable comparison key for an event's content (ignores ordering). */
+function eventFingerprint(e) {
+  return JSON.stringify([
+    e.event_type,
+    e.ledger,
+    e.timestamp,
+    e.contract_id,
+    e.payload,
+  ]);
+}
+
+/**
+ * Compare a bounded ledger range of canonical (on-chain) events against the
+ * persisted index and emit actionable differences.
+ *
+ * @param {Array} canonicalEvents events sourced from the chain
+ * @param {{ fromLedger: number, toLedger: number }} range
+ * @returns {{ range, missing: Array, stale: Array, duplicates: Array, outOfOrder: Array, ok: boolean }}
+ */
+function reconcileEvents(canonicalEvents, { fromLedger, toLedger }) {
+  const inRange = (e) => e.ledger >= fromLedger && e.ledger <= toLedger;
+  const canonical = canonicalEvents.filter(inRange).map(normalizeEvent);
+  const persisted = getEventsInLedgerRange(fromLedger, toLedger);
+
+  // Detect duplicate ids within the canonical feed.
+  const canonicalById = new Map();
+  const duplicates = [];
+  for (const e of canonical) {
+    if (canonicalById.has(e.id)) {
+      duplicates.push({ id: e.id, ledger: e.ledger, reason: 'duplicate_in_chain_feed' });
+    } else {
+      canonicalById.set(e.id, e);
+    }
+  }
+
+  // Detect duplicate rows persisted in the index (should not happen with PK,
+  // but guard against corrupted stores).
+  const persistedById = new Map();
+  for (const e of persisted) {
+    if (persistedById.has(e.id)) {
+      duplicates.push({ id: e.id, ledger: e.ledger, reason: 'duplicate_in_index' });
+    } else {
+      persistedById.set(e.id, e);
+    }
+  }
+
+  // Missing: canonical events absent from the index.
+  const missing = [];
+  for (const [id, e] of canonicalById) {
+    if (!persistedById.has(id)) missing.push(e);
+  }
+
+  // Stale: indexed events whose content differs from the canonical record.
+  const stale = [];
+  for (const [id, e] of persistedById) {
+    const canon = canonicalById.get(id);
+    if (canon && eventFingerprint(canon) !== eventFingerprint(e)) {
+      stale.push({ id, ledger: e.ledger, indexed: e, canonical: canon });
+    }
+  }
+
+  // Out-of-order: canonical feed not sorted ascending by ledger.
+  const outOfOrder = [];
+  for (let i = 1; i < canonical.length; i++) {
+    if (canonical[i].ledger < canonical[i - 1].ledger) {
+      outOfOrder.push({ id: canonical[i].id, ledger: canonical[i].ledger });
+    }
+  }
+
+  const ok = missing.length === 0 && stale.length === 0 && duplicates.length === 0;
+
+  return { range: { fromLedger, toLedger }, missing, stale, duplicates, outOfOrder, ok };
+}
+
+/**
+ * Idempotently repair the index for a bounded ledger range using canonical
+ * events. Missing and stale records are upserted; duplicates are collapsed by
+ * the primary key. Safe to run repeatedly.
+ *
+ * @param {Array} canonicalEvents events sourced from the chain
+ * @param {{ fromLedger: number, toLedger: number }} range
+ * @returns {{ range, repaired: number, inserted: number, updated: number, skipped: number, report }}
+ */
+function repairEvents(canonicalEvents, { fromLedger, toLedger }) {
+  const report = reconcileEvents(canonicalEvents, { fromLedger, toLedger });
+
+  // Build the canonical set to write: missing + stale canonical records.
+  const toWrite = new Map();
+  for (const e of report.missing) toWrite.set(e.id, e);
+  for (const s of report.stale) toWrite.set(s.id, s.canonical);
+
+  let inserted = 0;
+  let updated = 0;
+
+  if (toWrite.size) {
+    const existing = new Set(
+      getEventsInLedgerRange(fromLedger, toLedger).map((e) => e.id)
+    );
+    const stmt = db.prepare(
+      `INSERT INTO events (id, event_type, ledger, timestamp, contract_id, payload)
+       VALUES (?,?,?,?,?,?)
+       ON CONFLICT(id) DO UPDATE SET
+         event_type = excluded.event_type,
+         ledger = excluded.ledger,
+         timestamp = excluded.timestamp,
+         contract_id = excluded.contract_id,
+         payload = excluded.payload`
+    );
+    for (const e of toWrite.values()) {
+      stmt.run([e.id, e.event_type, e.ledger, e.timestamp, e.contract_id, JSON.stringify(e.payload)]);
+      if (existing.has(e.id)) updated += 1;
+      else inserted += 1;
+    }
+    stmt.free();
+    flush();
+  }
+
+  const skipped = report.duplicates.length + report.outOfOrder.length;
+
+  return {
+    range: report.range,
+    repaired: inserted + updated,
+    inserted,
+    updated,
+    skipped,
+    report,
+  };
+}
+
+module.exports = { initDb, upsertEvents, queryEvents, getLatestLedger, getEventsInLedgerRange, reconcileEvents, repairEvents, insertApiKey, getApiKeyByHash, listApiKeys, revokeApiKey, getConsent, recordConsent, hasConsented, insertIssuerApplication, getIssuerApplication, listIssuerApplications, updateIssuerApplicationStatus };
 
 // ── Patient consent ───────────────────────────────────────────────────────────
 
