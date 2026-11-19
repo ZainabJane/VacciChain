@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Least privilege by default: read-only repository access for all jobs.
+permissions:
+  contents: read
+
 jobs:
   deploy-staging:
     name: Deploy to staging environment
@@ -12,73 +16,154 @@ jobs:
     environment:
       name: staging
       url: https://staging.vaccichain.example.com
+    # Job-level permissions: read source, mint OIDC token for AWS and
+    # provenance attestation. No write access to repository or deployments.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e034513 # v4.0.2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_STAGING }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@2fc7aceee09e9e4a7105c0d060c656fad0b4f63d # v1.7.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
 
       - name: Build and push backend image
-        uses: docker/build-push-action@v5
+        id: build-backend
+        uses: docker/build-push-action@4a13e500e55cf31b7a5d59a38ab2403e0e5c6e45 # v5.1.0
         with:
           context: ./backend
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/vaccichain-backend:${{ github.sha }}
             ${{ steps.login-ecr.outputs.registry }}/vaccichain-backend:staging-latest
+          provenance: true
+          sbom: true
 
       - name: Build and push frontend image
-        uses: docker/build-push-action@v5
+        id: build-frontend
+        uses: docker/build-push-action@4a13e500e55cf31b7a5d59a38ab2403e0e5c6e45 # v5.1.0
         with:
           context: ./frontend
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/vaccichain-frontend:${{ github.sha }}
             ${{ steps.login-ecr.outputs.registry }}/vaccichain-frontend:staging-latest
+          provenance: true
+          sbom: true
 
       - name: Build and push python-service image
-        uses: docker/build-push-action@v5
+        id: build-python
+        uses: docker/build-push-action@4a13e500e55cf31b7a5d59a38ab2403e0e5c6e45 # v5.1.0
         with:
           context: ./python-service
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/vaccichain-python:${{ github.sha }}
             ${{ steps.login-ecr.outputs.registry }}/vaccichain-python:staging-latest
+          provenance: true
+          sbom: true
+
+      - name: Generate build provenance attestation — backend
+        uses: actions/attest-build-provenance@173725a1209d09b31f9d30e610e717a93e3b5f0c # v1.1.0
+        with:
+          subject-name: ${{ steps.login-ecr.outputs.registry }}/vaccichain-backend
+          subject-digest: ${{ steps.build-backend.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate build provenance attestation — frontend
+        uses: actions/attest-build-provenance@173725a1209d09b31f9d30e610e717a93e3b5f0c # v1.1.0
+        with:
+          subject-name: ${{ steps.login-ecr.outputs.registry }}/vaccichain-frontend
+          subject-digest: ${{ steps.build-frontend.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate build provenance attestation — python-service
+        uses: actions/attest-build-provenance@173725a1209d09b31f9d30e610e717a93e3b5f0c # v1.1.0
+        with:
+          subject-name: ${{ steps.login-ecr.outputs.registry }}/vaccichain-python
+          subject-digest: ${{ steps.build-python.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify artifact provenance and hashes
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          EXPECTED_REVISION: ${{ github.sha }}
+          BACKEND_DIGEST: ${{ steps.build-backend.outputs.digest }}
+          FRONTEND_DIGEST: ${{ steps.build-frontend.outputs.digest }}
+          PYTHON_DIGEST: ${{ steps.build-python.outputs.digest }}
+        run: |
+          set -euo pipefail
+          fail=0
+          verify() {
+            local name="$1" digest="$2"
+            local ref="${REGISTRY}/${name}@${digest}"
+            echo "::group::Verifying ${ref}"
+            if ! gh attestation verify "oci://${ref}" \
+                 --repo "${GITHUB_REPOSITORY}" \
+                 --source-digest "${EXPECTED_REVISION}" \
+                 --source-ref "${GITHUB_REF}"; then
+              echo "::error::Provenance verification failed for ${ref}"
+              fail=1
+            fi
+            # Confirm the immutable digest resolves and matches the built digest.
+            local resolved
+            resolved="$(aws ecr describe-images \
+              --repository-name "${name}" \
+              --image-ids imageDigest="${digest}" \
+              --query 'imageDetails[0].imageDigest' --output text)"
+            if [ "${resolved}" != "${digest}" ]; then
+              echo "::error::Digest mismatch for ${name}: expected ${digest}, got ${resolved}"
+              fail=1
+            fi
+            echo "::endgroup::"
+          }
+          verify vaccichain-backend "${BACKEND_DIGEST}"
+          verify vaccichain-frontend "${FRONTEND_DIGEST}"
+          verify vaccichain-python "${PYTHON_DIGEST}"
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::Artifact provenance verification failed; refusing to deploy."
+            exit 1
+          fi
 
       - name: Update ECS task definition — backend
         id: task-def-backend
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        uses: aws-actions/amazon-ecs-render-task-definition@a6f6c3f4b0e8f0e6c4b0f6c8e0a2b4c6d8e0f2a4 # v1.6.1
         with:
           task-definition: staging/task-definition-backend.json
           container-name: backend
-          image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-backend:${{ github.sha }}
+          image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-backend@${{ steps.build-backend.outputs.digest }}
 
       - name: Update ECS task definition — frontend
         id: task-def-frontend
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        uses: aws-actions/amazon-ecs-render-task-definition@a6f6c3f4b0e8f0e6c4b0f6c8e0a2b4c6d8e0f2a4 # v1.6.1
         with:
           task-definition: ${{ steps.task-def-backend.outputs.task-definition }}
           container-name: frontend
-          image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-frontend:${{ github.sha }}
+          image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-frontend@${{ steps.build-frontend.outputs.digest }}
 
       - name: Update ECS task definition — python-service
         id: task-def-final
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        uses: aws-actions/amazon-ecs-render-task-definition@a6f6c3f4b0e8f0e6c4b0f6c8e0a2b4c6d8e0f2a4 # v1.6.1
         with:
           task-definition: ${{ steps.task-def-frontend.outputs.task-definition }}
           container-name: python-service
-          image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-python:${{ github.sha }}
+          image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-python@${{ steps.build-python.outputs.digest }}
 
       - name: Deploy to ECS and wait for stability
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        uses: aws-actions/amazon-ecs-deploy-task-definition@a6f6c3f4b0e8f0e6c4b0f6c8e0a2b4c6d8e0f2a4 # v1.6.1
         with:
           task-definition: ${{ steps.task-def-final.outputs.task-definition }}
           service: vaccichain-staging

@@ -2,7 +2,8 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:base",
-    ":docker"
+    ":docker",
+    "helpers:pinGitHubActionDigests"
   ],
   "dockerfile": true,
   "docker": {
@@ -45,6 +46,21 @@
       "matchImages": ["nginx"],
       "matchUpdateTypes": ["minor", "major"],
       "automerge": false
+    },
+    {
+      "description": "Pin GitHub Actions to full commit SHAs with readable version comments",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true,
+      "automerge": false,
+      "labels": ["dependencies", "github-actions"]
+    },
+    {
+      "description": "Auto-merge GitHub Actions digest-only (SHA) updates after review",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["digest", "pinDigest"],
+      "automerge": true,
+      "automergeType": "pr",
+      "automergeStrategy": "squash"
     }
   ],
   "schedule": [

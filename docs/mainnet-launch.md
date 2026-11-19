@@ -5,6 +5,48 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 **Last Updated**: April 28, 2026  
 **Status**: Ready for Review
 
+> **Related**: The per-release contract release checklist (security, resource, compatibility, and artifact-integrity gates) lives in [Contract Release Checklist](./contract-release-checklist.md). Every contract release must satisfy those gates before the mainnet gates below can be signed off.
+
+---
+
+## Mandatory Mainnet Release Gate
+
+No mainnet deployment may proceed unless **all** of the following are recorded and approved. This gate is enforced by the release-gate check (`make release-gate-check` / `scripts/release-gate-check.sh`), which fails the release if any required gate is missing or unapproved.
+
+### Required Gates
+
+| Gate | Requirement | Evidence | Status |
+|------|-------------|----------|--------|
+| Security gate | Audit sign-off; all critical/high findings resolved | Audit report + remediation log | ⬜ |
+| Resource gate | Contract resource limits (CPU, memory, ledger entries) within budget | Resource test results | ⬜ |
+| Compatibility gate | Contract ABI/interface compatible with deployed backend and clients | Compatibility test results | ⬜ |
+| Artifact-integrity gate | Deployed WASM hash matches the reviewed, checksummed build artifact | Artifact checksum + hash comparison | ⬜ |
+
+### Expected Contract and Network Identifiers
+
+These identifiers must be recorded and match the deployment target exactly. A mismatch is an automatic **No-Go**.
+
+| Identifier | Expected Value | Recorded Value | Verified |
+|------------|----------------|----------------|----------|
+| Network | `mainnet` | _______________ | ⬜ |
+| Network passphrase | `Public Global Stellar Network ; September 2015` | _______________ | ⬜ |
+| Horizon URL | `https://horizon.stellar.org` | _______________ | ⬜ |
+| Soroban RPC URL | _______________ (official mainnet RPC) | _______________ | ⬜ |
+| Contract ID | _______________ (reviewed release artifact) | _______________ | ⬜ |
+| WASM artifact hash | _______________ (from artifact-integrity gate) | _______________ | ⬜ |
+
+### Recorded Approval
+
+Mainnet release cannot proceed without recorded approval from the required approvers below.
+
+| Approver Role | Name | Date | Approval |
+|---------------|------|------|----------|
+| Security Lead | _______________ | _______________ | ⬜ |
+| Dev Lead | _______________ | _______________ | ⬜ |
+| DevOps Lead | _______________ | _______________ | ⬜ |
+
+**Go/No-Go Criteria**: All four gates pass, all identifiers match the expected values, and all approvals are recorded. Otherwise the release is **No-Go**.
+
 ---
 
 ## Pre-Launch Phase (2-4 weeks before)
@@ -20,7 +62,7 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 | Dependency vulnerability scan | DevOps | ⬜ | Run `npm audit`, `cargo audit`, `pip audit` |
 | Penetration testing (optional) | Security Lead | ⬜ | Consider for high-value deployments |
 
-**Go/No-Go Criteria**: All critical findings resolved; audit report approved.
+**Go/No-Go Criteria**: All critical findings resolved; audit report approved. This is the **security gate** referenced in the Mandatory Mainnet Release Gate.
 
 ---
 
@@ -57,7 +99,7 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 | Set up audit logging | DevOps | ⬜ | Configure `AUDIT_LOG_PATH` to persistent storage |
 | Verify all required env vars are set | DevOps | ⬜ | Run backend startup check |
 
-**Go/No-Go Criteria**: All environment variables configured; backend starts without errors.
+**Go/No-Go Criteria**: All environment variables configured; backend starts without errors. The network passphrase, Horizon URL, and Soroban RPC URL recorded here must match the expected identifiers in the Mandatory Mainnet Release Gate.
 
 ---
 
@@ -75,7 +117,7 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 | Add initial issuer (if applicable) | Dev Lead | ⬜ | Call `add_issuer` with authorized healthcare provider |
 | Document contract address | Dev Lead | ⬜ | Share with all teams |
 
-**Go/No-Go Criteria**: Contract deployed; all functions callable; issuer allowlist configured.
+**Go/No-Go Criteria**: Contract deployed; all functions callable; issuer allowlist configured. The recorded contract ID and WASM hash must match the expected identifiers in the Mandatory Mainnet Release Gate (artifact-integrity gate).
 
 ---
 
@@ -158,7 +200,7 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 | Verify contract is immutable | Security Lead | ⬜ | Confirm no upgrade path exists |
 | Verify soulbound enforcement | Security Lead | ⬜ | Attempt transfer; should fail |
 
-**Go/No-Go Criteria**: All security checks pass; no vulnerabilities found.
+**Go/No-Go Criteria**: All security checks pass; no vulnerabilities found. This confirms the **security gate** and **compatibility gate** from the contract release checklist.
 
 ---
 
@@ -175,7 +217,7 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 | Prepare rollback plan | DevOps | ⬜ | Document rollback steps |
 | Have incident response team on standby | DevOps | ⬜ | Team available for 24 hours post-launch |
 
-**Go/No-Go Criteria**: All systems operational; team ready; rollback plan documented.
+**Go/No-Go Criteria**: All systems operational; team ready; rollback plan documented. Confirm the Mandatory Mainnet Release Gate is fully approved and the release-gate check passes before proceeding.
 
 ---
 
@@ -259,6 +301,7 @@ This checklist must be reviewed and approved by at least two contributors before
 
 ## References
 
+- [Contract Release Checklist](./contract-release-checklist.md)
 - [Stellar Documentation](https://developers.stellar.org/)
 - [Soroban Smart Contracts](https://soroban.stellar.org/)
 - [VacciChain Architecture](../README.md)

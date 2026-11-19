@@ -16,17 +16,19 @@ This guide covers deploying VacciChain to a production environment on AWS ECS Fa
 ## Table of Contents
 
 1. [Pre-Deployment Checklist](#1-pre-deployment-checklist)
-2. [Key Generation](#2-key-generation)
-3. [Contract Deployment to Stellar Mainnet](#3-contract-deployment-to-stellar-mainnet)
-4. [AWS Infrastructure Setup](#4-aws-infrastructure-setup)
-5. [Environment Variable Configuration](#5-environment-variable-configuration)
-6. [Build and Push Container Images](#6-build-and-push-container-images)
-7. [Deploy Services to ECS Fargate](#7-deploy-services-to-ecs-fargate)
-8. [TLS and Domain Configuration](#8-tls-and-domain-configuration)
-9. [Verifying a Successful Deployment](#9-verifying-a-successful-deployment)
-10. [Monitoring and Alerting](#10-monitoring-and-alerting)
-11. [CloudWatch Logs](#11-cloudwatch-logs)
-12. [Rollback Procedure](#12-rollback-procedure)
+2. [Contract Release Checklist and Go/No-Go Gates](#2-contract-release-checklist-and-gono-go-gates)
+3. [Artifact Provenance Verification](#3-artifact-provenance-verification)
+4. [Key Generation](#4-key-generation)
+5. [Contract Deployment to Stellar Mainnet](#5-contract-deployment-to-stellar-mainnet)
+6. [AWS Infrastructure Setup](#6-aws-infrastructure-setup)
+7. [Environment Variable Configuration](#7-environment-variable-configuration)
+8. [Build and Push Container Images](#8-build-and-push-container-images)
+9. [Deploy Services to ECS Fargate](#9-deploy-services-to-ecs-fargate)
+10. [TLS and Domain Configuration](#10-tls-and-domain-configuration)
+11. [Verifying a Successful Deployment](#11-verifying-a-successful-deployment)
+12. [Monitoring and Alerting](#12-monitoring-and-alerting)
+13. [CloudWatch Logs](#13-cloudwatch-logs)
+14. [Rollback Procedure](#14-rollback-procedure)
 
 ---
 
@@ -40,10 +42,110 @@ Complete these steps before touching any infrastructure.
 - [ ] Domain DNS configured and propagated
 - [ ] AWS account limits reviewed (ECS tasks, ECR storage, Secrets Manager)
 - [ ] Mainnet launch checklist reviewed: [`docs/mainnet-launch.md`](./mainnet-launch.md)
+- [ ] Contract release checklist completed and signed off: [`docs/contract-release-checklist.md`](./contract-release-checklist.md)
+- [ ] Artifact provenance verified for every image and WASM being deployed (see [section 3](#3-artifact-provenance-verification))
 
 ---
 
-## 2. Key Generation
+## 2. Contract Release Checklist and Go/No-Go Gates
+
+Every contract release — testnet, staging, or mainnet — **must** be gated by the
+[Contract Release Checklist](./contract-release-checklist.md). The checklist is the
+single source of truth for release prerequisites; this section summarizes the gates
+and how they are enforced. Do not deploy a contract until every gate below is marked
+**GO** and recorded in the checklist.
+
+### 2.1 Go/No-Go Gates
+
+| Gate | What must be recorded | Blocking condition (NO-GO) |
+|---|---|---|
+| **Security** | External audit report reference, all critical/high findings resolved, dependency scans clean (`npm audit`, `cargo audit`, `pip audit`) | Any unresolved critical/high finding, or a scan with known exploitable advisories |
+| **Resource** | Contract resource profile (CPU instructions, memory, ledger entry reads/writes) within the limits agreed for the network | Any operation exceeds the configured Soroban resource limits or the documented budget |
+| **Compatibility** | Contract ABI/interface version, client SDK version, and storage schema compatibility confirmed | Breaking ABI change without a migration plan, or storage layout incompatible with existing on-chain state |
+| **Artifact integrity** | SHA-256 hash of the WASM and container images, matching the hash produced by the release build | Hash mismatch between the reviewed artifact and the artifact being deployed |
+| **Network identifiers** | `STELLAR_NETWORK`, `STELLAR_NETWORK_PASSPHRASE`, `SOROBAN_RPC_URL`, `HORIZON_URL`, and the expected `VACCINATIONS_CONTRACT_ID` | Any identifier missing, or a value that does not match the target network |
+| **Admin keys** | Admin public key, issuer public key, SEP-10 server key, and multisig threshold, with confirmation that secrets are held in Secrets Manager / hardware wallet | Keys stored in plaintext, committed to the repo, or an admin key that differs from the approved key |
+| **Verification** | Post-deploy verification results: `verify_vaccination` call succeeds, contract visible on Stellar Expert, SEP-10 challenge/verify flow passes | Any verification step failing or not performed |
+
+### 2.2 Mainnet Approval Requirement
+
+A mainnet contract release **cannot proceed** unless all of the following are true:
+
+- Every gate in [section 2.1](#21-gono-go-gates) is marked **GO** in the checklist.
+- The checklist records an explicit **approval** (approver name, role, UTC timestamp,
+  and the release commit SHA) from an authorized release approver.
+- The recorded `VACCINATIONS_CONTRACT_ID` and network identifiers match the values
+  configured in `vaccichain/prod/stellar` (see [section 7](#7-environment-variable-configuration)).
+- The artifact hashes recorded in the checklist match the artifacts verified in
+  [section 3](#3-artifact-provenance-verification).
+
+If any of these conditions is unmet, the release is **NO-GO** and must not be deployed.
+
+---
+
+## 3. Artifact Provenance Verification
+
+Before deploying to **staging or production**, verify that every container image and
+the contract WASM were built from the expected source revision by the trusted build
+workflow, and that their hashes match the values recorded in the release checklist.
+
+### 3.1 Expected Inputs
+
+Record these values in the release checklist before verification:
+
+- **Source revision** — the full Git commit SHA being released (`git rev-parse HEAD`).
+- **Build workflow** — the CI workflow run that produced the artifacts (e.g. the
+  GitHub Actions run URL/ID for `.github/workflows/cd.yml`).
+- **Dependency inputs** — lockfile hashes (`package-lock.json`, `Cargo.lock`,
+  `requirements.txt` / lockfile) used by the build.
+- **Expected hashes** — SHA-256 of the WASM and of each container image digest.
+
+### 3.2 Verify Artifact Hashes
+
+```bash
+# Contract WASM: rebuild from the recorded source revision and compare hashes
+git checkout <SOURCE_REVISION>
+cd contracts && make build
+sha256sum target/wasm32-unknown-unknown/release/vaccichain.wasm
+# Must equal the hash recorded in docs/contract-release-checklist.md
+
+# Container images: compare the registry digest to the recorded digest
+aws ecr describe-images \
+  --repository-name vaccichain-backend \
+  --image-ids imageTag=<TAG> \
+  --query 'imageDetails[0].imageDigest' \
+  --region us-east-1
+# Repeat for vaccichain-frontend and vaccichain-python
+```
+
+### 3.3 Verify Provenance and Attestations
+
+Confirm the artifacts carry trusted provenance metadata linking them to the source
+revision, build workflow, and dependency inputs:
+
+```bash
+# Inspect the build provenance attestation for an image (SLSA / in-toto)
+cosign verify-attestation \
+  --type slsaprovenance \
+  --certificate-identity-regexp 'https://github.com/<ORG>/<REPO>/.github/workflows/cd.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/vaccichain-backend@<DIGEST>
+
+# Confirm the attested source revision matches the release commit
+cosign verify-attestation \
+  --type slsaprovenance \
+  <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/vaccichain-backend@<DIGEST> \
+  | jq -r '.payload' | base64 -d | jq '.predicate.invocation.configSource'
+```
+
+**Deployment is blocked** if any artifact is missing provenance metadata, if the
+attested source revision differs from the release commit, or if a hash does not match
+the value recorded in the checklist. Record the verification result (pass/fail, hashes,
+attestation references) in the release checklist before proceeding.
+
+---
+
+## 4. Key Generation
 
 Generate all Stellar keypairs before deploying. Use a hardware wallet or an air-gapped machine for mainnet keys. **Never store secret keys in plaintext or commit them to version control.**
 
@@ -73,9 +175,14 @@ stellar account show <ISSUER_PUBLIC_KEY> --network mainnet
 
 ---
 
-## 3. Contract Deployment to Stellar Mainnet
+## 5. Contract Deployment to Stellar Mainnet
 
-### 3.1 Build the Contract
+> **Mandatory prerequisite:** the [Contract Release Checklist](./contract-release-checklist.md)
+> must be complete with all gates **GO** and, for mainnet, a recorded approval
+> (see [section 2](#2-contract-release-checklist-and-gono-go-gates)). Provenance must be
+> verified per [section 3](#3-artifact-provenance-verification).
+
+### 5.1 Build the Contract
 
 ```bash
 cd contracts
@@ -85,7 +192,7 @@ make build
 The compiled WASM artifact is written to:
 `contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm`
 
-### 3.2 Deploy to Mainnet
+### 5.2 Deploy to Mainnet
 
 The `Makefile` targets `testnet` by default. For mainnet, pass the network flags explicitly:
 
@@ -102,7 +209,7 @@ stellar contract deploy \
 
 The command prints the contract ID (a 56-character address starting with `C`). **Record this value** — it becomes `VACCINATIONS_CONTRACT_ID`.
 
-### 3.3 Initialize the Contract
+### 5.3 Initialize the Contract
 
 The contract must be initialized once after deployment to set the admin address:
 
@@ -117,7 +224,7 @@ stellar contract invoke \
   --admin <ADMIN_PUBLIC_KEY>
 ```
 
-### 3.4 Add the Initial Issuer
+### 5.4 Add the Initial Issuer
 
 Authorize the issuer account to mint vaccination records:
 
@@ -135,7 +242,7 @@ stellar contract invoke \
   --country "US"
 ```
 
-### 3.5 Verify the Contract
+### 5.5 Verify the Contract
 
 Confirm the contract is live and callable:
 
@@ -156,11 +263,11 @@ Also confirm the contract is visible on Stellar Expert:
 
 ---
 
-## 4. AWS Infrastructure Setup
+## 6. AWS Infrastructure Setup
 
 VacciChain uses Terraform to provision all AWS resources. The production configuration lives in `infra/envs/production/`.
 
-### 4.1 Bootstrap Remote State
+### 6.1 Bootstrap Remote State
 
 Create the S3 bucket for Terraform state once per AWS account:
 
@@ -182,7 +289,7 @@ aws s3api put-bucket-encryption \
   }'
 ```
 
-### 4.2 Create ECR Repositories
+### 6.2 Create ECR Repositories
 
 ```bash
 for repo in vaccichain-backend vaccichain-frontend vaccichain-python; do
@@ -196,7 +303,7 @@ done
 
 Note the repository URIs from the output — you will need them in step 6.
 
-### 4.3 Create IAM Roles
+### 6.3 Create IAM Roles
 
 **ECS Task Execution Role** (used by ECS to pull images and fetch secrets):
 
@@ -254,7 +361,7 @@ aws iam put-role-policy \
   }'
 ```
 
-### 4.4 Provision Infrastructure with Terraform
+### 6.4 Provision Infrastructure with Terraform
 
 ```bash
 cd infra/envs/production
@@ -277,11 +384,11 @@ Terraform provisions: VPC, subnets, NAT gateways, ECS cluster, Fargate services,
 
 ---
 
-## 5. Environment Variable Configuration
+## 7. Environment Variable Configuration
 
 Production secrets are stored in AWS Secrets Manager and injected into containers at runtime. **Do not use `.env` files in production.**
 
-### 5.1 Create the Production Secret
+### 7.1 Create the Production Secret
 
 ```bash
 aws secretsmanager create-secret \
@@ -292,16 +399,16 @@ aws secretsmanager create-secret \
     "HORIZON_URL": "https://horizon.stellar.org",
     "SOROBAN_RPC_URL": "https://mainnet.sorobanrpc.com",
     "STELLAR_NETWORK_PASSPHRASE": "Public Global Stellar Network ; September 2015",
-    "VACCINATIONS_CONTRACT_ID": "<CONTRACT_ID from step 3.2>",
-    "ADMIN_SECRET_KEY": "<S... from step 2>",
-    "ADMIN_PUBLIC_KEY": "<G... from step 2>",
-    "SEP10_SERVER_KEY": "<S... from step 2>",
-    "ISSUER_SECRET_KEY": "<S... from step 2>",
+    "VACCINATIONS_CONTRACT_ID": "<CONTRACT_ID from step 5.2>",
+    "ADMIN_SECRET_KEY": "<S... from step 4>",
+    "ADMIN_PUBLIC_KEY": "<G... from step 4>",
+    "SEP10_SERVER_KEY": "<S... from step 4>",
+    "ISSUER_SECRET_KEY": "<S... from step 4>",
     "JWT_SECRET": "<generate with: openssl rand -hex 32>"
   }'
 ```
 
-### 5.2 Non-Secret Environment Variables
+### 7.2 Non-Secret Environment Variables
 
 These are safe to set directly in the ECS task definition (not in Secrets Manager):
 
@@ -325,7 +432,7 @@ These are safe to set directly in the ECS task definition (not in Secrets Manage
 | `SOROBAN_FEE` | `1000` | Higher fee for mainnet priority |
 | `MULTISIG_THRESHOLD` | `2` | Require 2 approvals for admin ops |
 
-### 5.3 Production Task Definition
+### 7.3 Production Task Definition
 
 Create `infra/envs/production/task-definition.json` based on the staging template at `staging/task-definition-backend.json`, with these key differences:
 
@@ -349,9 +456,12 @@ For full secrets management documentation, see [`docs/secrets-management.md`](./
 
 ---
 
-## 6. Build and Push Container Images
+## 8. Build and Push Container Images
 
-### 6.1 Authenticate with ECR
+> **Mandatory prerequisite:** verify artifact provenance and hashes per
+> [section 3](#3-artifact-provenance-verification) before pushing or deploying images.
+
+### 8.1 Authenticate with ECR
 
 ```bash
 aws ecr get-login-password --region us-east-1 | \
@@ -359,7 +469,7 @@ aws ecr get-login-password --region us-east-1 | \
   <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
 ```
 
-### 6.2 Build and Tag Images
+### 8.2 Build and Tag Images
 
 Use a versioned tag (e.g., the Git SHA or a semantic version) — never deploy `latest` to production.
 
@@ -380,7 +490,7 @@ docker build -t vaccichain-python:$TAG ./python-service
 docker tag vaccichain-python:$TAG $ECR/vaccichain-python:$TAG
 ```
 
-### 6.3 Push Images
+### 8.3 Push Images
 
 ```bash
 docker push $ECR/vaccichain-backend:$TAG
@@ -390,9 +500,9 @@ docker push $ECR/vaccichain-python:$TAG
 
 ---
 
-## 7. Deploy Services to ECS Fargate
+## 9. Deploy Services to ECS Fargate
 
-### 7.1 Create the ECS Cluster
+### 9.1 Create the ECS Cluster
 
 ```bash
 aws ecs create-cluster \
@@ -401,7 +511,7 @@ aws ecs create-cluster \
   --region us-east-1
 ```
 
-### 7.2 Create ECS Services
+### 9.2 Create ECS Services
 
 ```bash
 # Get subnet and security group IDs from Terraform output
@@ -427,7 +537,7 @@ aws ecs create-service \
   --region us-east-1
 ```
 
-### 7.3 Configure GitHub Actions for CI/CD
+### 9.3 Configure GitHub Actions for CI/CD
 
 Add these secrets to your GitHub repository for automated deployments:
 
@@ -443,9 +553,9 @@ The GitHub Actions workflow at `.github/workflows/cd.yml` handles image builds a
 
 ---
 
-## 8. TLS and Domain Configuration
+## 10. TLS and Domain Configuration
 
-### 8.1 Request an ACM Certificate
+### 10.1 Request an ACM Certificate
 
 ```bash
 aws acm request-certificate \
@@ -456,7 +566,7 @@ aws acm request-certificate \
 
 Follow the DNS validation instructions in the AWS Console to confirm domain ownership.
 
-### 8.2 Configure the ALB Listener
+### 10.2 Configure the ALB Listener
 
 ```bash
 # Get the certificate ARN from ACM
@@ -491,7 +601,7 @@ aws elbv2 create-listener \
   }]'
 ```
 
-### 8.3 Update DNS
+### 10.3 Update DNS
 
 Point your domain's A record (or CNAME) to the ALB DNS name:
 
@@ -506,11 +616,12 @@ For full TLS configuration details, see [`docs/tls-setup.md`](./tls-setup.md).
 
 ---
 
-## 9. Verifying a Successful Deployment
+## 11. Verifying a Successful Deployment
 
-Run these checks after every production deployment.
+Run these checks after every production deployment and record the results in the
+[Contract Release Checklist](./contract-release-checklist.md) verification gate.
 
-### 9.1 Service Health
+### 11.1 Service Health
 
 ```bash
 # Check ECS service is stable (all tasks running)
@@ -528,7 +639,7 @@ curl -sf -o /dev/null -w "%{http_code}" https://app.yourdomain.com/docs
 # Expected: 200
 ```
 
-### 9.2 Stellar Connectivity
+### 11.2 Stellar Connectivity
 
 ```bash
 # Confirm backend is connected to mainnet (check logs)
@@ -539,7 +650,7 @@ curl -sf https://app.yourdomain.com/verify/<ANY_MAINNET_WALLET_ADDRESS>
 # Expected: {"vaccinated": false, "records": []}
 ```
 
-### 9.3 Authentication Flow
+### 11.3 Authentication Flow
 
 ```bash
 # Step 1: Request a SEP-10 challenge
@@ -550,7 +661,7 @@ curl -sf "https://app.yourdomain.com/auth/challenge?account=<YOUR_WALLET_ADDRESS
 # Expected: JSON with "token" field (JWT)
 ```
 
-### 9.4 Contract Verification
+### 11.4 Contract Verification
 
 Confirm the deployed contract is visible and callable on Stellar Expert:
 
@@ -558,7 +669,7 @@ Confirm the deployed contract is visible and callable on Stellar Expert:
 https://stellar.expert/explorer/public/contract/<VACCINATIONS_CONTRACT_ID>
 ```
 
-### 9.5 Log Inspection
+### 11.5 Log Inspection
 
 ```bash
 # Tail live logs for all services
@@ -571,7 +682,7 @@ aws logs filter-log-events \
   --start-time $(date -d '10 minutes ago' +%s000)
 ```
 
-### 9.6 End-to-End Smoke Test
+### 11.6 End-to-End Smoke Test
 
 1. Connect a Freighter wallet (mainnet) to `https://app.yourdomain.com`
 2. Authenticate via SEP-10 — you should receive a JWT
@@ -581,9 +692,9 @@ aws logs filter-log-events \
 
 ---
 
-## 10. Monitoring and Alerting
+## 12. Monitoring and Alerting
 
-### 10.1 CloudWatch Alarms
+### 12.1 CloudWatch Alarms
 
 Set up alarms for critical metrics:
 
@@ -614,7 +725,7 @@ aws cloudwatch put-metric-alarm \
   --alarm-actions <SNS_TOPIC_ARN>
 ```
 
-### 10.2 Anomaly Detection Alerts
+### 12.2 Anomaly Detection Alerts
 
 Configure the Python analytics service to send alerts when issuers exceed the mint threshold. Set these in Secrets Manager or the task definition:
 
@@ -626,7 +737,7 @@ ANOMALY_THRESHOLD   — 50 (adjust after observing baseline traffic)
 
 See [`docs/configuration.md`](./configuration.md) for full alert configuration options.
 
-### 10.3 Audit Log Monitoring
+### 12.3 Audit Log Monitoring
 
 The backend writes an append-only NDJSON audit log to `AUDIT_LOG_PATH`. In production this is on the EFS mount at `/data/audit.log`. Review it regularly for suspicious activity:
 
@@ -645,7 +756,7 @@ aws ecs execute-command \
 
 ---
 
-## 11. CloudWatch Logs
+## 13. CloudWatch Logs
 
 All services ship logs to CloudWatch Logs via the `awslogs` log driver configured in each ECS task definition.
 
@@ -701,9 +812,9 @@ The ECS task execution role (`ecsTaskExecutionRole`) is granted `logs:CreateLogS
 
 ---
 
-## 12. Rollback Procedure
+## 14. Rollback Procedure
 
-### 11.1 Rolling Back a Service
+### 14.1 Rolling Back a Service
 
 To revert to the previous image tag:
 
@@ -722,7 +833,7 @@ aws ecs update-service \
   --region us-east-1
 ```
 
-### 11.2 Rolling Back a Contract Deployment
+### 14.2 Rolling Back a Contract Deployment
 
 The Soroban contract supports upgrades via the `upgrade` function (admin-only). To revert:
 
@@ -746,7 +857,7 @@ The Soroban contract supports upgrades via the `upgrade` function (admin-only). 
 
 See [`docs/contract-upgrade.md`](./contract-upgrade.md) for the full upgrade and rollback process.
 
-### 11.3 Rollback Criteria
+### 14.3 Rollback Criteria
 
 Initiate a rollback if any of the following occur within 30 minutes of deployment:
 
@@ -764,6 +875,7 @@ Initiate a rollback if any of the following occur within 30 minutes of deploymen
 - [Secrets Management](./secrets-management.md) — AWS Secrets Manager setup
 - [Configuration Reference](./configuration.md) — All environment variables
 - [TLS Setup](./tls-setup.md) — HTTPS and certificate configuration
+- [Contract Release Checklist](./contract-release-checklist.md) — Mandatory go/no-go gates for every contract release
 - [Mainnet Launch Checklist](./mainnet-launch.md) — Pre-launch sign-off checklist
 - [Contract Upgrade Guide](./contract-upgrade.md) — Upgrading the Soroban contract
 - [Staging Setup](./staging-setup.md) — Staging environment reference

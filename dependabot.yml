@@ -19,3 +19,16 @@ updates:
     directory: "/contracts"
     schedule:
       interval: "daily"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "ci"
+      - "security"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

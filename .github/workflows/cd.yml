@@ -7,23 +7,31 @@ on:
     paths:
       - "contracts/**"
 
+# Least privilege by default: the workflow token is read-only unless a job
+# explicitly opts in to additional scopes below.
+permissions:
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for build provenance attestation
     defaults:
       run:
         working-directory: contracts
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1c7c31fa0e0a2f0d2b0a0b0b0b0b0b0b0b0b0b0b # stable
         with:
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             ~/.cargo/registry
@@ -38,6 +46,38 @@ jobs:
 
       - name: Build WASM
         run: make build
+
+      - name: Record artifact hash
+        id: artifact
+        run: |
+          WASM=target/wasm32-unknown-unknown/release/vaccichain.wasm
+          HASH=$(sha256sum "$WASM" | awk '{print $1}')
+          echo "wasm_path=$WASM" >> "$GITHUB_OUTPUT"
+          echo "sha256=$HASH" >> "$GITHUB_OUTPUT"
+          echo "WASM SHA256: $HASH"
+
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@1c608d11d69870c2092266b3f9a6f3abbf17002c # v2.0.1
+        with:
+          subject-path: contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm
+
+      - name: Verify artifact provenance before deploy
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          WASM="${{ steps.artifact.outputs.wasm_path }}"
+          EXPECTED_HASH="${{ steps.artifact.outputs.sha256 }}"
+          ACTUAL_HASH=$(sha256sum "$WASM" | awk '{print $1}')
+          if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
+            echo "::error::Artifact hash mismatch: expected $EXPECTED_HASH, got $ACTUAL_HASH"
+            exit 1
+          fi
+          gh attestation verify "$WASM" \
+            --repo "${{ github.repository }}" \
+            --signer-workflow "${{ github.repository }}/.github/workflows/cd.yml" \
+            --source-ref "${{ github.ref }}" \
+            --source-digest "${{ github.sha }}"
+          echo "Provenance verified for $WASM at ${{ github.sha }}"
 
       - name: Deploy to Stellar Testnet
         id: deploy
