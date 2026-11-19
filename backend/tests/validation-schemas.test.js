@@ -9,6 +9,7 @@ const { addIssuerSchema, createApiKeySchema, rotateJwtSchema, approveProposalSch
 const { registerSchema } = require('../src/routes/schemas/patient.schemas');
 const { recordConsentSchema } = require('../src/routes/schemas/consent.schemas');
 const { applySchema, reviewSchema } = require('../src/routes/schemas/onboarding.schemas');
+const { paginationSchema } = require('../src/routes/schemas/common.schemas');
 
 describe('Request Body Validation Schemas', () => {
   describe('Auth Schemas', () => {
@@ -400,6 +401,159 @@ describe('Request Body Validation Schemas', () => {
           reviewer_note: 'a'.repeat(501),
         });
         expect(result.success).toBe(false);
+      });
+    });
+  });
+
+  describe('Boundary Limits', () => {
+    const VALID_WALLET = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';
+
+    const expectStable4xx = (result) => {
+      expect(result.success).toBe(false);
+      expect(result.error.issues.length).toBeGreaterThan(0);
+      expect(result.error.issues[0].code).toBeTruthy();
+    };
+
+    describe('oversized strings', () => {
+      it('rejects oversized vaccine_name in issueSchema', () => {
+        expectStable4xx(issueSchema.safeParse({
+          patient_address: VALID_WALLET,
+          vaccine_name: 'a'.repeat(10000),
+          date_administered: '2024-01-15T10:30:00Z',
+        }));
+      });
+
+      it('rejects oversized transaction in verifySchema', () => {
+        expectStable4xx(verifySchema.safeParse({
+          transaction: 'A'.repeat(100000),
+          nonce: 'abc123',
+        }));
+      });
+
+      it('rejects oversized nonce in verifySchema', () => {
+        expectStable4xx(verifySchema.safeParse({
+          transaction: 'AAAAAgAAAABIW8...',
+          nonce: 'a'.repeat(10000),
+        }));
+      });
+
+      it('rejects oversized token_id in revokeSchema', () => {
+        expectStable4xx(revokeSchema.safeParse({
+          token_id: '1'.repeat(10000),
+        }));
+      });
+
+      it('rejects oversized license_number in applySchema', () => {
+        expectStable4xx(applySchema.safeParse({
+          name: 'Health Clinic',
+          license_number: 'L'.repeat(10000),
+          country: 'US',
+          wallet: VALID_WALLET,
+        }));
+      });
+
+      it('rejects oversized new_secret in rotateJwtSchema', () => {
+        expectStable4xx(rotateJwtSchema.safeParse({
+          new_secret: 'a'.repeat(100000),
+        }));
+      });
+    });
+
+    describe('oversized arrays', () => {
+      it('rejects array where string expected in createApiKeySchema', () => {
+        expectStable4xx(createApiKeySchema.safeParse({
+          label: new Array(1000).fill('a'),
+        }));
+      });
+
+      it('rejects array where string expected in addIssuerSchema', () => {
+        expectStable4xx(addIssuerSchema.safeParse({
+          address: new Array(1000).fill(VALID_WALLET),
+        }));
+      });
+
+      it('rejects array where string expected in sep10Schema', () => {
+        expectStable4xx(sep10Schema.safeParse({
+          public_key: new Array(1000).fill(VALID_WALLET),
+        }));
+      });
+    });
+
+    describe('nested objects', () => {
+      it('rejects nested object where string expected in issueSchema', () => {
+        expectStable4xx(issueSchema.safeParse({
+          patient_address: VALID_WALLET,
+          vaccine_name: { nested: { deep: 'value' } },
+          date_administered: '2024-01-15T10:30:00Z',
+        }));
+      });
+
+      it('rejects deeply nested object in applySchema', () => {
+        let nested = 'value';
+        for (let i = 0; i < 100; i += 1) {
+          nested = { child: nested };
+        }
+        expectStable4xx(applySchema.safeParse({
+          name: 'Health Clinic',
+          license_number: 'HC-12345',
+          country: 'US',
+          wallet: nested,
+        }));
+      });
+
+      it('rejects nested object in reviewSchema decision', () => {
+        expectStable4xx(reviewSchema.safeParse({
+          decision: { nested: 'approved' },
+        }));
+      });
+    });
+
+    describe('pagination values', () => {
+      it('rejects negative page', () => {
+        expectStable4xx(paginationSchema.safeParse({ page: -1, limit: 10 }));
+      });
+
+      it('rejects zero page', () => {
+        expectStable4xx(paginationSchema.safeParse({ page: 0, limit: 10 }));
+      });
+
+      it('rejects oversized limit', () => {
+        expectStable4xx(paginationSchema.safeParse({ page: 1, limit: 100000 }));
+      });
+
+      it('rejects non-integer limit', () => {
+        expectStable4xx(paginationSchema.safeParse({ page: 1, limit: 10.5 }));
+      });
+
+      it('rejects string pagination values', () => {
+        expectStable4xx(paginationSchema.safeParse({ page: 'abc', limit: 'xyz' }));
+      });
+
+      it('accepts boundary pagination values', () => {
+        expect(paginationSchema.safeParse({ page: 1, limit: 1 }).success).toBe(true);
+        expect(paginationSchema.safeParse({ page: 1, limit: 100 }).success).toBe(true);
+      });
+    });
+
+    describe('boundary inputs accepted', () => {
+      it('accepts max-length label in createApiKeySchema', () => {
+        expect(createApiKeySchema.safeParse({ label: 'a'.repeat(255) }).success).toBe(true);
+      });
+
+      it('accepts max-length name in applySchema', () => {
+        expect(applySchema.safeParse({
+          name: 'a'.repeat(120),
+          license_number: 'HC-12345',
+          country: 'US',
+          wallet: VALID_WALLET,
+        }).success).toBe(true);
+      });
+
+      it('accepts max-length reviewer_note in reviewSchema', () => {
+        expect(reviewSchema.safeParse({
+          decision: 'approved',
+          reviewer_note: 'a'.repeat(500),
+        }).success).toBe(true);
       });
     });
   });

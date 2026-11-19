@@ -4,6 +4,65 @@ use soroban_sdk::{Address, Env, String as SorobanString, testutils::Address as T
 use crate::{VacciChainContract, ContractError, storage::VaccinationRecord};
 
 #[test]
+fn test_upgrade_requires_admin_authorization() {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+    let non_admin = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+
+    // Admin can trigger an upgrade
+    let admin_result = VacciChainContract::upgrade(env.clone(), admin.clone());
+    assert!(admin_result.is_ok(), "admin should be authorized to upgrade");
+
+    // Non-admin caller must be rejected
+    let non_admin_result = VacciChainContract::upgrade(env.clone(), non_admin.clone());
+    assert_eq!(
+        non_admin_result,
+        Err(ContractError::Unauthorized),
+        "non-admin should not be authorized to upgrade"
+    );
+}
+
+#[test]
+fn test_upgrade_fails_before_initialization() {
+    let env = Env::default();
+    let caller = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    // No initialize call: upgrade must fail because there is no admin
+    let result = VacciChainContract::upgrade(env.clone(), caller.clone());
+    assert!(
+        result.is_err(),
+        "upgrade should fail when contract is not initialized"
+    );
+}
+
+#[test]
+fn test_upgrade_requires_auth_of_admin() {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+    let non_admin = TestAddress::random(&env);
+
+    // Do not mock all auths: require real authorization from the admin address
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+
+    // Admin-signed upgrade succeeds
+    let admin_result = VacciChainContract::upgrade(env.clone(), admin.clone());
+    assert!(admin_result.is_ok(), "admin-signed upgrade should succeed");
+
+    // Caller without admin auth must fail
+    let non_admin_result = VacciChainContract::upgrade(env.clone(), non_admin.clone());
+    assert!(
+        non_admin_result.is_err(),
+        "upgrade without admin authorization should fail"
+    );
+}
+
+#[test]
 fn test_upgrade_v1_to_v2_data_persistence() {
     let env = Env::default();
     let admin = TestAddress::random(&env);

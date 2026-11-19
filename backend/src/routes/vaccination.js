@@ -7,8 +7,9 @@ const { invokeContract, simulateContract, mintVaccination, sendRpcTimeout, Sorob
 const { resolveContractErrorMessage, mapContractError } = require('../stellar/contractErrors');
 const { audit } = require('../middleware/auditLog');
 const validate = require('../middleware/validate');
+const { validateQuery } = require('../middleware/validate');
 const { hasConsented } = require('../indexer/db');
-const { issueSchema, revokeSchema } = require('./schemas/vaccination.schemas');
+const { issueSchema, revokeSchema, paginationSchema } = require('./schemas/vaccination.schemas');
 
 const router = express.Router();
 
@@ -255,18 +256,16 @@ router.post(
  *               $ref: '#/components/schemas/Error'
  */
 // GET /vaccination/:wallet — fetch paginated records for a wallet
-router.get('/:wallet', authMiddleware, validateStellarPublicKey('params', 'wallet'), async (req, res) => {
+router.get(
+  '/:wallet',
+  authMiddleware,
+  validateStellarPublicKey('params', 'wallet'),
+  validateQuery(paginationSchema),
+  async (req, res) => {
   const { wallet } = req.params;
 
   const rawPage = req.query.page !== undefined ? Number(req.query.page) : 1;
   const rawLimit = req.query.limit !== undefined ? Number(req.query.limit) : 20;
-
-  if (!Number.isInteger(rawPage) || rawPage < 1) {
-    return res.status(400).json({ error: 'page must be a positive integer' });
-  }
-  if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 100) {
-    return res.status(400).json({ error: 'limit must be an integer between 1 and 100' });
-  }
 
   try {
     const args = [StellarSdk.Address.fromString(wallet).toScVal()];
@@ -283,6 +282,7 @@ router.get('/:wallet', authMiddleware, validateStellarPublicKey('params', 'walle
     const errorMessage = resolveContractErrorMessage(err);
     res.status(500).json({ error: errorMessage });
   }
-});
+  }
+);
 
 module.exports = router;

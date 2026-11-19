@@ -140,6 +140,14 @@ impl VacciChainContract {
         Ok(())
     }
 
+    /// Returns the current admin address, if the contract has been initialized.
+    ///
+    /// # Authorization
+    /// This is a public read-only function; no authorization required.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::Admin)
+    }
+
     /// Pause the contract. Admin only. All state-changing calls will return `ContractPaused`.
     pub fn pause(env: Env) -> Result<(), ContractError> {
         let admin: Address = env
@@ -521,7 +529,7 @@ impl VacciChainContract {
     pub fn is_issuer(env: Env, address: Address) -> bool {
         env.storage()
             .persistent()
-            .get::<DataKey, IssuerRecord>(&DataKey::Issuer(address))
+            .get::<DataKey, IssuerRecord>(&DataKey::IssuerMeta(hash_address(&env, &address)))
             .map(|r| r.authorized)
             .unwrap_or(false)
     }
@@ -927,5 +935,186 @@ mod tests {
             &String::from_str(&env, "USA"),
         );
         assert_eq!(result, Err(Ok(ContractError::InvalidInputIssuerName)));
+    }
+
+    // ---------------------------------------------------------------------
+    // Authorization matrix tests (Backlog 074)
+    // ---------------------------------------------------------------------
+
+    /// Builds a client with no mocked auths so that `require_auth` failures surface.
+    fn setup_env_no_mock_auth() -> (Env, VacciChainContractClient<'static>, Address) {
+        let env = Env::default();
+        let contract_id = env.register(VacciChainContract, ());
+        let client = VacciChainContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        env.mock_all_auths();
+        client.initialize(&admin).unwrap();
+        // Reset mocks so subsequent calls must present real auth.
+        env.set_auths(&[]);
+        (env, client, admin)
+    }
+
+    #[test]
+    fn test_unauthorized_add_issuer_fails() {
+        let (env, client, _admin) = setup_env_no_mock_auth();
+        let issuer = Address::generate(&env);
+        let result = client.try_add_issuer(
+            &issuer,
+            &String::from_str(&env, "Hospital"),
+            &String::from_str(&env, "LIC"),
+            &String::from_str(&env, "USA"),
+        );
+        assert!(result.is_err());
+        assert!(!client.is_issuer(&issuer));
+    }
+
+    #[test]
+    fn test_unauthorized_revoke_issuer_fails() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+        client
+            .add_issuer(
+                &issuer,
+                &String::from_str(&env, "Hospital"),
+                &String::from_str(&env, "LIC"),
+                &String::from_str(&env, "USA"),
+            )
+            .unwrap();
+
+        // Drop mocked auths: revoke_issuer must fail without admin auth.
+        env.set_auths(&[]);
+        let result = client.try_revoke_issuer(&issuer);
+        assert!(result.is_err());
+        assert!(client.is_issuer(&issuer));
+    }
+
+    #[test]
+    fn test_unauthorized_pause_unpause_fails() {
+        let (env, client, _admin) = setup_env();
+        env.set_auths(&[]);
+        assert!(client.try_pause().is_err());
+        assert!(!client.is_paused());
+        assert!(client.try_unpause().is_err());
+    }
+
+    #[test]
+    fn test_unauthorized_upgrade_fails() {
+        let (env, client, _admin) = setup_env();
+        env.set_auths(&[]);
+        let hash = BytesN::from_array(&env, &[0u8; 32]);
+        assert!(client.try_upgrade(&hash).is_err());
+    }
+
+    #[test]
+    fn test_unauthorized_propose_admin_fails() {
+        let (env, client, _admin) = setup_env();
+        env.set_auths(&[]);
+        let new_admin = Address::generate(&env);
+        assert!(client.try_propose_admin(&new_admin).is_err());
+    }
+
+    #[test]
+    fn test_unauthorized_accept_admin_fails() {
+        let (env, client, _admin) = setup_env();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin).unwrap();
+
+        // The pending admin must authorize; without auth the call must fail.
+        env.set_auths(&[]);
+        assert!(client.try_accept_admin().is_err());
+        // Admin must remain unchanged.
+        assert_ne!(client.get_admin().unwrap(), new_admin);
+    }
+
+    #[test]
+    fn test_unauthorized_register_patient_fails() {
+        let (env, client, _admin) = setup_env();
+        let patient = Address::generate(&env);
+        env.set_auths(&[]);
+        assert!(client.try_register_patient(&patient).is_err());
+        assert!(!client.is_patient_registered(&patient));
+    }
+
+    #[test]
+    fn test_forged_issuer_mint_fails() {
+        let (env, client, _admin) = setup_env();
+        let real_issuer = Address::generate(&env);
+        let forger = Address::generate(&env);
+        let patient = Address::generate(&env);
+
+        client
+            .add_issuer(
+                &real_issuer,
+                &String::from_str(&env, "Hospital"),
+                &String::from_str(&env, "LIC"),
+                &String::from_str(&env, "USA"),
+            )
+            .unwrap();
+
+        // A non-allowlisted address cannot mint even if it claims to be an issuer.
+        let result = client.try_mint_vaccination(
+            &patient,
+            &String::from_str(&env, "COVID-19"),
+            &String::from_str(&env, "2024-01-15"),
+            &forger,
+            &None::<u32>,
+            &None::<u32>,
+        );
+        assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_revoked_issuer_mint_fails() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+        let patient = Address::generate(&env);
+
+        client
+            .add_issuer(
+                &issuer,
+                &String::from_str(&env, "Hospital"),
+                &String::from_str(&env, "LIC"),
+                &String::from_str(&env, "USA"),
+            )
+            .unwrap();
+        client.revoke_issuer(&issuer).unwrap();
+
+        let result = client.try_mint_vaccination(
+            &patient,
+            &String::from_str(&env, "COVID-19"),
+            &String::from_str(&env, "2024-01-15"),
+            &issuer,
+            &None::<u32>,
+            &None::<u32>,
+        );
+        assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_unauthorized_revoke_vaccination_fails() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+        let patient = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        client
+            .add_issuer(
+                &issuer,
+                &String::from_str(&env, "Hospital"),
+                &String::from_str(&env, "LIC"),
+                &String::from_str(&env, "USA"),
+            )
+            .unwrap();
+        let token_id = client.mint_vaccination(
+            &patient,
+            &String::from_str(&env, "COVID-19"),
+            &String::from_str(&env, "2024-01-15"),
+            &issuer,
+            &None::<u32>,
+            &None::<u32>,
+        );
+
+        let result = client.try_revoke_vaccination(&token_id, &stranger);
+        assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
     }
 }

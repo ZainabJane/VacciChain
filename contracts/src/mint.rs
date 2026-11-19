@@ -37,13 +37,16 @@ pub fn mint_vaccination(
     // Require that the issuer has signed the transaction before checking authorization.
     issuer.require_auth();
 
-    // Authorized issuers are stored under DataKey::Issuer(issuer).
-    let is_authorized: bool = env
+    // Authorized issuers are stored under DataKey::Issuer(issuer). A forged
+    // issuer (no record) or a revoked issuer (authorized == false) must fail.
+    let issuer_record: Option<IssuerRecord> = env
         .storage()
         .persistent()
-        .get::<DataKey, IssuerRecord>(&DataKey::Issuer(issuer.clone()))
-        .map(|r| r.authorized)
-        .unwrap_or(false);
+        .get::<DataKey, IssuerRecord>(&DataKey::Issuer(issuer.clone()));
+    let is_authorized: bool = match issuer_record {
+        Some(record) => record.authorized,
+        None => false,
+    };
     if !is_authorized {
         return Err(ContractError::Unauthorized);
     }
