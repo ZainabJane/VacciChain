@@ -335,3 +335,149 @@ proptest! {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Resource baselines (Backlog 086)
+//
+// These tests measure the CPU instruction and memory byte cost of the
+// representative mint, verify, revoke and batch operations. Each measurement
+// is printed in a stable, machine-readable format so the benchmark harness
+// (scripts/check_resource_baseline.sh) can capture it and compare against the
+// committed baselines in contracts/resource_baselines.json.
+//
+// Format: `RESOURCE_BASELINE op=<name> cpu=<u64> mem=<u64>`
+// ---------------------------------------------------------------------------
+
+/// Emit a single machine-readable resource measurement line.
+fn emit_resource_baseline(op: &str, cpu: u64, mem: u64) {
+    // `std::println!` is available in test builds; the harness greps for the
+    // `RESOURCE_BASELINE` prefix.
+    std::println!("RESOURCE_BASELINE op={} cpu={} mem={}", op, cpu, mem);
+}
+
+/// Measure the resources consumed by `f` on the given env, returning
+/// (cpu_instructions, memory_bytes).
+fn measure<F: FnOnce()>(env: &Env, f: F) -> (u64, u64) {
+    env.budget().reset_unlimited();
+    f();
+    let cpu = env.budget().cpu_instruction_cost();
+    let mem = env.budget().memory_bytes_cost();
+    (cpu, mem)
+}
+
+/// Shared setup: initialize contract, register an issuer and a patient.
+fn setup_env() -> (Env, Address, Address, Address) {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+    let issuer = TestAddress::random(&env);
+    let patient = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+    let _ = VacciChainContract::add_issuer(
+        env.clone(),
+        issuer.clone(),
+        SorobanString::from_slice(&env, b"Test Issuer"),
+        SorobanString::from_slice(&env, b"LIC123"),
+        SorobanString::from_slice(&env, b"US"),
+    );
+    let _ = VacciChainContract::register_patient(env.clone(), patient.clone());
+
+    (env, admin, issuer, patient)
+}
+
+#[test]
+fn resource_baseline_mint() {
+    let (env, _admin, issuer, patient) = setup_env();
+    let vaccine = SorobanString::from_slice(&env, b"COVID-19");
+    let date = SorobanString::from_slice(&env, b"2024-01-15");
+
+    let (cpu, mem) = measure(&env, || {
+        let _ = VacciChainContract::mint_vaccination(
+            env.clone(),
+            patient.clone(),
+            vaccine.clone(),
+            date.clone(),
+            issuer.clone(),
+            None,
+            None,
+        );
+    });
+
+    emit_resource_baseline("mint", cpu, mem);
+}
+
+#[test]
+fn resource_baseline_verify() {
+    let (env, _admin, issuer, patient) = setup_env();
+    let vaccine = SorobanString::from_slice(&env, b"COVID-19");
+    let date = SorobanString::from_slice(&env, b"2024-01-15");
+
+    let _ = VacciChainContract::mint_vaccination(
+        env.clone(),
+        patient.clone(),
+        vaccine,
+        date,
+        issuer.clone(),
+        None,
+        None,
+    );
+
+    let (cpu, mem) = measure(&env, || {
+        let _ = VacciChainContract::verify_vaccination(env.clone(), patient.clone());
+    });
+
+    emit_resource_baseline("verify", cpu, mem);
+}
+
+#[test]
+fn resource_baseline_revoke() {
+    let (env, _admin, issuer, patient) = setup_env();
+    let vaccine = SorobanString::from_slice(&env, b"COVID-19");
+    let date = SorobanString::from_slice(&env, b"2024-01-15");
+
+    let token_id = VacciChainContract::mint_vaccination(
+        env.clone(),
+        patient.clone(),
+        vaccine,
+        date,
+        issuer.clone(),
+        None,
+        None,
+    )
+    .expect("mint should succeed for revoke baseline");
+
+    let (cpu, mem) = measure(&env, || {
+        let _ = VacciChainContract::revoke_vaccination(env.clone(), token_id, issuer.clone());
+    });
+
+    emit_resource_baseline("revoke", cpu, mem);
+}
+
+#[test]
+fn resource_baseline_batch() {
+    let (env, _admin, issuer, patient) = setup_env();
+    let vaccine = SorobanString::from_slice(&env, b"COVID-19");
+    let date = SorobanString::from_slice(&env, b"2024-01-15");
+
+    // Batch of sequential mints for the same patient (representative batch op).
+    const BATCH_SIZE: u32 = 5;
+
+    let (cpu, mem) = measure(&env, || {
+        for i in 0..BATCH_SIZE {
+            let v = SorobanString::from_slice(&env, format!("COVID-19-{}", i).as_bytes());
+            let _ = VacciChainContract::mint_vaccination(
+                env.clone(),
+                patient.clone(),
+                v,
+                date.clone(),
+                issuer.clone(),
+                None,
+                None,
+            );
+        }
+    });
+
+    emit_resource_baseline("batch", cpu, mem);
+}

@@ -24,6 +24,46 @@ use soroban_sdk::{contract, contractimpl, contracterror, Address, BytesN, Env, S
 use storage::{DataKey, IssuerRecord, VaccinationRecord, hash_address, compute_token_id};
 use verify::DoseStatus;
 
+/// Current storage schema version. Bump when the persisted layout changes.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Minimum TTL (in ledgers) applied to every persistent entry on write.
+/// ~30 days at 5s ledgers; extended again on each subsequent write.
+pub const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
+/// Target TTL (in ledgers) for persistent entries after extension.
+/// ~1 year at 5s ledgers.
+pub const PERSISTENT_TTL_EXTEND_TO: u32 = 6_307_200;
+
+/// Extend the TTL of a persistent entry after a write so long-lived
+/// vaccination histories and issuer records do not silently expire.
+pub(crate) fn extend_persistent_ttl<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    key: &K,
+) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+}
+
+/// Read the persisted schema version, defaulting to `SCHEMA_VERSION` for
+/// state written before versioning was introduced.
+pub(crate) fn read_schema_version(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get::<DataKey, u32>(&DataKey::SchemaVersion)
+        .unwrap_or(SCHEMA_VERSION)
+}
+
+/// Ensure the persisted schema version is one this contract can read.
+/// Returns `ContractError::UnsupportedSchemaVersion` for unknown versions.
+pub(crate) fn require_supported_schema(env: &Env) -> Result<(), ContractError> {
+    let version = read_schema_version(env);
+    if version != SCHEMA_VERSION {
+        return Err(ContractError::UnsupportedSchemaVersion);
+    }
+    Ok(())
+}
+
 /// Contract errors.
 ///
 /// | Code | Name                         | Description                                      |
@@ -64,6 +104,7 @@ pub enum ContractError {
     SoulboundToken = 15,
     PatientNotRegistered = 16,
     ContractPaused = 17,
+    UnsupportedSchemaVersion = 18,
 }
 
 const MAX_STRING_LENGTH: u32 = 100;
@@ -136,7 +177,11 @@ impl VacciChainContract {
         }
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Initialized, &true);
+        extend_persistent_ttl(&env, &DataKey::Initialized);
         env.storage().persistent().set(&DataKey::Admin, &admin);
+        extend_persistent_ttl(&env, &DataKey::Admin);
+        env.storage().persistent().set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
+        extend_persistent_ttl(&env, &DataKey::SchemaVersion);
         Ok(())
     }
 
@@ -149,6 +194,7 @@ impl VacciChainContract {
             .ok_or(ContractError::NotInitialized)?;
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Paused, &true);
+        extend_persistent_ttl(&env, &DataKey::Paused);
         events::emit_contract_paused(&env, &admin);
         Ok(())
     }
@@ -162,6 +208,7 @@ impl VacciChainContract {
             .ok_or(ContractError::NotInitialized)?;
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Paused, &false);
+        extend_persistent_ttl(&env, &DataKey::Paused);
         events::emit_contract_unpaused(&env, &admin);
         Ok(())
     }
@@ -205,6 +252,7 @@ impl VacciChainContract {
         country: String,
     ) -> Result<(), ContractError> {
         require_not_paused(&env)?;
+        require_supported_schema(&env)?;
         let admin: Address = env
             .storage()
             .persistent()
@@ -222,7 +270,9 @@ impl VacciChainContract {
             authorized: true,
         };
 
-        env.storage().persistent().set(&DataKey::IssuerMeta(hash_address(&env, &issuer)), &record);
+        let issuer_key = DataKey::IssuerMeta(hash_address(&env, &issuer));
+        env.storage().persistent().set(&issuer_key, &record);
+        extend_persistent_ttl(&env, &issuer_key);
 
         let mut issuers: Vec<Address> = env
             .storage()
@@ -239,6 +289,7 @@ impl VacciChainContract {
         if !exists {
             issuers.push_back(issuer.clone());
             env.storage().persistent().set(&DataKey::IssuerList, &issuers);
+            extend_persistent_ttl(&env, &DataKey::IssuerList);
         }
         events::emit_issuer_added(&env, &issuer, &admin);
         Ok(())
@@ -257,6 +308,9 @@ impl VacciChainContract {
     /// # Authorization
     /// This is a public read-only function; no authorization required.
     pub fn get_issuer(env: Env, address: Address) -> Option<IssuerRecord> {
+        if require_supported_schema(&env).is_err() {
+            return None;
+        }
         env.storage()
             .persistent()
             .get(&DataKey::IssuerMeta(hash_address(&env, &address)))
@@ -284,6 +338,7 @@ impl VacciChainContract {
     /// Emits `IssuerRevoked` event on success.
     pub fn revoke_issuer(env: Env, issuer: Address) -> Result<(), ContractError> {
         require_not_paused(&env)?;
+        require_supported_schema(&env)?;
         let admin: Address = env
             .storage()
             .persistent()
@@ -291,15 +346,15 @@ impl VacciChainContract {
             .ok_or(ContractError::NotInitialized)?;
         admin.require_auth();
 
+        let issuer_key = DataKey::IssuerMeta(hash_address(&env, &issuer));
         if let Some(mut record) = env
             .storage()
             .persistent()
-            .get::<DataKey, IssuerRecord>(&DataKey::IssuerMeta(hash_address(&env, &issuer)))
+            .get::<DataKey, IssuerRecord>(&issuer_key)
         {
             record.authorized = false;
-            env.storage()
-                .persistent()
-                .set(&DataKey::IssuerMeta(hash_address(&env, &issuer)), &record);
+            env.storage().persistent().set(&issuer_key, &record);
+            extend_persistent_ttl(&env, &issuer_key);
         }
         Ok(())
     }
@@ -323,10 +378,11 @@ impl VacciChainContract {
     /// Emits `PatientRegistered` event on success.
     pub fn register_patient(env: Env, patient: Address) -> Result<(), ContractError> {
         require_not_paused(&env)?;
+        require_supported_schema(&env)?;
         patient.require_auth();
-        env.storage()
-            .persistent()
-            .set(&DataKey::PatientAllowlist(patient.clone()), &true);
+        let patient_key = DataKey::PatientAllowlist(patient.clone());
+        env.storage().persistent().set(&patient_key, &true);
+        extend_persistent_ttl(&env, &patient_key);
         events::emit_patient_registered(&env, &patient);
         Ok(())
     }
@@ -387,6 +443,7 @@ impl VacciChainContract {
         dose_series: Option<u32>,
     ) -> Result<u64, ContractError> {
         require_not_paused(&env)?;
+        require_supported_schema(&env)?;
         mint::mint_vaccination(&env, patient, vaccine_name, date_administered, issuer, dose_number, dose_series)
     }
 
@@ -417,6 +474,7 @@ impl VacciChainContract {
     /// Emits `VaccinationRevoked` event on success.
     pub fn revoke_vaccination(env: Env, token_id: u64, revoker: Address) -> Result<(), ContractError> {
         require_not_paused(&env)?;
+        require_supported_schema(&env)?;
         revoker.require_auth();
 
         let mut record: VaccinationRecord = env
@@ -441,7 +499,9 @@ impl VacciChainContract {
 
         record.revoked = true;
         env.storage().persistent().set(&DataKey::Token(token_id), &record);
+        extend_persistent_ttl(&env, &DataKey::Token(token_id));
         env.storage().persistent().set(&DataKey::Revoked(token_id), &true);
+        extend_persistent_ttl(&env, &DataKey::Revoked(token_id));
         events::emit_revoked(&env, token_id, &revoker);
         Ok(())
     }
@@ -519,9 +579,12 @@ impl VacciChainContract {
     /// # Authorization
     /// This is a public read-only function; no authorization required.
     pub fn is_issuer(env: Env, address: Address) -> bool {
+        if require_supported_schema(&env).is_err() {
+            return false;
+        }
         env.storage()
             .persistent()
-            .get::<DataKey, IssuerRecord>(&DataKey::Issuer(address))
+            .get::<DataKey, IssuerRecord>(&DataKey::IssuerMeta(hash_address(&env, &address)))
             .map(|r| r.authorized)
             .unwrap_or(false)
     }
@@ -593,6 +656,7 @@ impl VacciChainContract {
     /// # Events
     /// Emits `AdminTransferProposed` event on success.
     pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
+        require_supported_schema(&env)?;
         let admin: Address = env
             .storage()
             .persistent()
@@ -601,7 +665,9 @@ impl VacciChainContract {
         admin.require_auth();
         let expires_at = env.ledger().timestamp() + 86400;
         env.storage().persistent().set(&DataKey::PendingAdmin, &new_admin);
+        extend_persistent_ttl(&env, &DataKey::PendingAdmin);
         env.storage().persistent().set(&DataKey::AdminTransferExpiry, &expires_at);
+        extend_persistent_ttl(&env, &DataKey::AdminTransferExpiry);
         events::emit_admin_transfer_proposed(&env, &admin, &new_admin, expires_at);
         Ok(())
     }
@@ -624,6 +690,7 @@ impl VacciChainContract {
     /// # Events
     /// Emits `AdminTransferAccepted` event on success.
     pub fn accept_admin(env: Env) -> Result<(), ContractError> {
+        require_supported_schema(&env)?;
         let pending: Address = env
             .storage()
             .persistent()
@@ -639,6 +706,7 @@ impl VacciChainContract {
         }
         pending.require_auth();
         env.storage().persistent().set(&DataKey::Admin, &pending);
+        extend_persistent_ttl(&env, &DataKey::Admin);
         env.storage().persistent().remove(&DataKey::PendingAdmin);
         env.storage().persistent().remove(&DataKey::AdminTransferExpiry);
         events::emit_admin_transfer_accepted(&env, &pending);
@@ -674,6 +742,14 @@ impl VacciChainContract {
         env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         events::emit_contract_upgraded(&env, &new_wasm_hash, &admin);
         Ok(())
+    }
+
+    /// Return the persisted storage schema version.
+    ///
+    /// # Authorization
+    /// This is a public read-only function; no authorization required.
+    pub fn schema_version(env: Env) -> u32 {
+        read_schema_version(&env)
     }
 }
 
