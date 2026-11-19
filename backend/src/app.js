@@ -20,7 +20,7 @@ const onboardingRoutes = require('./routes/onboarding');
 const apiVersion = require('./middleware/apiVersion');
 const securityHeaders = require('./middleware/securityHeaders');
 const { getRpcServer } = require('./stellar/soroban');
-const { getHealthStatus, startHealthProbe } = require('./health');
+const { getHealthStatus, getReadinessStatus, startHealthProbe } = require('./health');
 
 const requestId = require('./middleware/requestId');
 const { sanitizeInputs } = require('./middleware/sanitize');
@@ -102,6 +102,21 @@ app.use(errorHandler);
 app.get('/health', async (_req, res) => {
   const body = getHealthStatus();
   res.status(body.status === 'ok' ? 200 : 503).json(body);
+});
+
+/**
+ * Readiness check endpoint for ECS container health checks and target groups.
+ *
+ * Returns 200 only when all dependencies (database, secrets, poller) are ready;
+ * otherwise 503 so the task is removed from traffic without masking crashes.
+ *
+ * @route GET /ready
+ * @returns {Object} 200 - { status: "ready", checks: {...} }
+ * @returns {Object} 503 - { status: "not_ready", checks: {...} }
+ */
+app.get('/ready', async (_req, res) => {
+  const body = getReadinessStatus();
+  res.status(body.status === 'ready' ? 200 : 503).json(body);
 });
 
 if (require.main === module) {
