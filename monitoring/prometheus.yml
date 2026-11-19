@@ -70,3 +70,31 @@ scrape_configs:
   - job_name: blackbox
     static_configs:
       - targets: ["blackbox:9115"]
+
+  # ── ECS task autoscaling / capacity metrics ───────────────────────────────
+  # ECS and Application Auto Scaling metrics live in CloudWatch, not on the
+  # tasks themselves. They are bridged into Prometheus by the CloudWatch
+  # exporter (yet-another-cloudwatch-exporter) running as the `cloudwatch`
+  # service. Capacity alarms (CPU/memory high, min/max task count reached,
+  # backend/database concurrency guardrails) are defined in CloudWatch and
+  # mirrored in /etc/prometheus/alerts.yml so Alertmanager sees them too.
+  # See monitoring/README.md ("ECS autoscaling & capacity alarms") for the
+  # per-service scaling policy definitions and load-test procedure.
+  - job_name: ecs_cloudwatch
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["cloudwatch:9106"]
+        labels:
+          env: local
+          source: cloudwatch
+
+  # ── ECS container-level resource usage (cAdvisor) ─────────────────────────
+  # Provides per-task CPU/memory so scaling decisions can be validated
+  # against the CloudWatch-derived metrics above.
+  - job_name: ecs_cadvisor
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["cadvisor:8080"]
+        labels:
+          env: local
+          source: cadvisor

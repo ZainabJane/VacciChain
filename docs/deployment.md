@@ -158,31 +158,123 @@ Also confirm the contract is visible on Stellar Expert:
 
 ## 4. AWS Infrastructure Setup
 
-VacciChain uses Terraform to provision all AWS resources. The production configuration lives in `infra/envs/production/`.
+VacciChain uses Terraform to provision all AWS resources. Each environment has its own configuration directory (`infra/envs/staging/`, `infra/envs/production/`) and its own isolated remote state. **No environment may reference another environment's state bucket, key, or lock table.**
 
-### 4.1 Bootstrap Remote State
+### 4.1 Configure the Terraform Backend Per Environment
 
-Create the S3 bucket for Terraform state once per AWS account:
+Backend settings are supplied at `terraform init` time via a per-environment backend config file (`infra/envs/<env>/backend.hcl`). Nothing about the account, region, or bucket is hardcoded in the Terraform source.
+
+`infra/envs/staging/backend.hcl`:
+
+```hcl
+bucket         = "vaccichain-tfstate-staging"
+key            = "staging/terraform.tfstate"
+region         = "us-east-1"
+dynamodb_table = "vaccichain-tflock-staging"
+encrypt        = true
+```
+
+`infra/envs/production/backend.hcl`:
+
+```hcl
+bucket         = "vaccichain-tfstate-production"
+key            = "production/terraform.tfstate"
+region         = "us-east-1"
+dynamodb_table = "vaccichain-tflock-production"
+encrypt        = true
+```
+
+Account ID, region, and environment-specific values are passed as variables (or via `terraform.tfvars` / `TF_VAR_*` environment variables) — never committed as literal values in shared modules.
+
+### 4.2 Bootstrap Prerequisites (Once Per Environment)
+
+Run the bootstrap for **each** environment separately. The commands below are parameterized; substitute the environment name and values from that environment's `backend.hcl`.
 
 ```bash
-aws s3api create-bucket \
-  --bucket vaccichain-tfstate \
-  --region us-east-1
+export ENV=staging          # or: production
+export AWS_REGION=us-east-1
+export STATE_BUCKET=vaccichain-tfstate-$ENV
+export LOCK_TABLE=vaccichain-tflock-$ENV
+
+# State bucket (versioned + encrypted + public access blocked)
+aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_REGION"
 
 aws s3api put-bucket-versioning \
-  --bucket vaccichain-tfstate \
+  --bucket "$STATE_BUCKET" \
   --versioning-configuration Status=Enabled
 
 aws s3api put-bucket-encryption \
-  --bucket vaccichain-tfstate \
+  --bucket "$STATE_BUCKET" \
   --server-side-encryption-configuration '{
     "Rules": [{
       "ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}
     }]
   }'
+
+aws s3api put-public-access-block \
+  --bucket "$STATE_BUCKET" \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+# State lock table
+aws dynamodb create-table \
+  --table-name "$LOCK_TABLE" \
+  --attribute-definitions AttributeName=LockID,AttributeType=S \
+  --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region "$AWS_REGION"
 ```
 
-### 4.2 Create ECR Repositories
+State credentials are never stored in the repository. Terraform authenticates via the standard AWS credential chain (SSO, assumed role, or CI OIDC role) and the state bucket is encrypted at rest with access restricted by IAM.
+
+### 4.3 Validate the Backend Configuration
+
+Before planning, confirm the backend resolves to the intended environment and does not point at another environment's state:
+
+```bash
+cd infra/envs/$ENV
+
+terraform init -backend-config=backend.hcl -reconfigure
+
+# Confirm the resolved backend (bucket/key must match this environment only)
+terraform init -backend-config=backend.hcl -get=true -input=false >/dev/null
+terraform providers
+
+# Fail fast if the state key belongs to another environment
+terraform state list | head -n 5
+```
+
+Validation checklist per environment:
+
+- [ ] `backend.hcl` bucket/key/lock table are unique to this environment
+- [ ] `terraform init -reconfigure` succeeds with no warnings about backend mismatch
+- [ ] `terraform state list` shows only resources for this environment
+- [ ] `terraform plan` produces no changes that reference the other environment's resources
+
+### 4.4 Verify Staging Isolation
+
+A clean staging plan must run without any reference to production state. Verify this explicitly:
+
+```bash
+cd infra/envs/staging
+
+# Fresh init from the staging backend only
+rm -rf .terraform .terraform.lock.hcl
+terraform init -backend-config=backend.hcl -reconfigure
+
+# Plan must succeed with no production state access
+terraform plan -var-file=staging.tfvars -out=staging.tfplan
+
+# Confirm no production identifiers leaked into the plan
+terraform show -json staging.tfplan | \
+  grep -E 'vaccichain-tfstate-production|vaccichain-tflock-production' && \
+  { echo "ERROR: staging plan references production state"; exit 1; } || \
+  echo "OK: staging plan is isolated from production state"
+```
+
+If the grep finds a production reference, stop and fix the backend/variable configuration before applying.
+
+### 4.5 Create ECR Repositories
 
 ```bash
 for repo in vaccichain-backend vaccichain-frontend vaccichain-python; do
@@ -196,7 +288,7 @@ done
 
 Note the repository URIs from the output — you will need them in step 6.
 
-### 4.3 Create IAM Roles
+### 4.6 Create IAM Roles
 
 **ECS Task Execution Role** (used by ECS to pull images and fetch secrets):
 
@@ -254,26 +346,141 @@ aws iam put-role-policy \
   }'
 ```
 
-### 4.4 Provision Infrastructure with Terraform
+### 4.7 Provision Infrastructure with Terraform
 
 ```bash
 cd infra/envs/production
 
-terraform init
+terraform init -backend-config=backend.hcl
 
 # Review the plan before applying
 terraform plan \
+  -var="aws_account_id=<ACCOUNT_ID>" \
+  -var="aws_region=us-east-1" \
   -var="backend_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/vaccichain-backend:<TAG>" \
   -var="frontend_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/vaccichain-frontend:<TAG>" \
   -var="analytics_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/vaccichain-python:<TAG>"
 
 terraform apply \
+  -var="aws_account_id=<ACCOUNT_ID>" \
+  -var="aws_region=us-east-1" \
   -var="backend_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/vaccichain-backend:<TAG>" \
   -var="frontend_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/vaccichain-frontend:<TAG>" \
   -var="analytics_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/vaccichain-python:<TAG>"
 ```
 
 Terraform provisions: VPC, subnets, NAT gateways, ECS cluster, Fargate services, Application Load Balancer, EFS volume for the SQLite database, and CloudWatch log groups.
+
+### 4.8 Network Egress for Scheduled Tasks and Polling
+
+Private ECS tasks (scheduled jobs and the Stellar polling workers) run in private subnets with `assignPublicIp=DISABLED` and reach the internet only through NAT gateways. Egress is restricted to an explicit allowlist.
+
+**Required egress destinations:**
+
+| Destination | Port | Purpose |
+|---|---|---|
+| `horizon.stellar.org` | 443 | Horizon queries and transaction submission |
+| `mainnet.sorobanrpc.com` (or your Soroban RPC provider) | 443 | Soroban contract reads/invokes |
+| `*.amazonaws.com` (regional endpoints) | 443 | Secrets Manager, CloudWatch Logs, ECR, S3 |
+| Internal ALB / service discovery name | 4000 | Calls to the backend API |
+
+**DNS:** private subnets use the VPC resolver; NAT gateways provide outbound DNS resolution for the allowlisted public hosts. No public IPs are assigned to tasks.
+
+**NAT design:** one NAT gateway per AZ for high availability in production; a single NAT gateway is acceptable in staging to control cost. Route tables for private subnets send `0.0.0.0/0` to the NAT gateway only.
+
+**Restricting egress:** attach a security group egress rule set and, where available, an AWS Network Firewall or VPC endpoint policy that permits only the destinations above. Administrative endpoints (SSH, ECS exec control plane, AWS console APIs) must not be reachable from task subnets.
+
+**Validation:**
+
+```bash
+# From inside a running task, confirm allowlisted hosts resolve and connect
+aws ecs execute-command --cluster vaccichain-prod \
+  --task $TASK_ARN --container backend --interactive \
+  --command "curl -sf -o /dev/null -w '%{http_code}\n' https://horizon.stellar.org/"
+
+# Confirm an unnecessary public endpoint is NOT reachable
+aws ecs execute-command --cluster vaccichain-prod \
+  --task $TASK_ARN --container backend --interactive \
+  --command "curl -sf --max-time 5 https://example.com/ || echo 'blocked as expected'"
+```
+
+### 4.9 Autoscaling and Capacity Alarms
+
+Each ECS service has a target-tracking autoscaling policy with per-service bounds. Scaling is driven by measured load and capped to protect shared persistence (see 4.10).
+
+| Service | Metric | Target | Min | Max | Scale-out cooldown | Scale-in cooldown |
+|---|---|---|---|---|---|---|
+| Backend | ALB `RequestCountPerTarget` | 500 req/min/task | 2 | 6 | 60s | 300s |
+| Backend | CPU utilization | 65% | 2 | 6 | 60s | 300s |
+| Python analytics | SQS/queue depth or CPU | 70% | 1 | 3 | 120s | 600s |
+| Scheduled tasks | *(no autoscaling — fixed count)* | — | 1 | 1 | — | — |
+
+Cost limits: maximum task counts above are the hard ceiling; alarms fire before the ceiling is reached.
+
+```bash
+# Register scalable target for the backend service
+aws application-autoscaling register-scalable-target \
+  --service-namespace ecs \
+  --resource-id service/vaccichain-prod/vaccichain-backend \
+  --scalable-dimension ecs:service:DesiredCount \
+  --min-capacity 2 --max-capacity 6
+
+# Target-tracking policy on ALB request count
+aws application-autoscaling put-scaling-policy \
+  --service-namespace ecs \
+  --resource-id service/vaccichain-prod/vaccichain-backend \
+  --scalable-dimension ecs:service:DesiredCount \
+  --policy-name backend-requests \
+  --policy-type TargetTrackingScaling \
+  --target-tracking-scaling-policy-configuration '{
+    "TargetValue": 500,
+    "PredefinedMetricSpecification": {
+      "PredefinedMetricType": "ALBRequestCountPerTarget",
+      "ResourceLabel": "<ALB_ARN_SUFFIX>/<TG_ARN_SUFFIX>"
+    },
+    "ScaleOutCooldown": 60,
+    "ScaleInCooldown": 300
+  }'
+
+# Capacity alarm: alert when the service is pinned at max
+aws cloudwatch put-metric-alarm \
+  --alarm-name vaccichain-prod-backend-at-max \
+  --metric-name RunningTaskCount \
+  --namespace ECS/ContainerInsights \
+  --dimensions Name=ClusterName,Value=vaccichain-prod Name=ServiceName,Value=vaccichain-backend \
+  --statistic Average --period 60 --threshold 6 \
+  --comparison-operator GreaterThanOrEqualToThreshold \
+  --evaluation-periods 3 --alarm-actions <SNS_TOPIC_ARN>
+```
+
+Load testing must demonstrate that scaling occurs under load and that alarms fire, **without** corrupting shared persistence — see 4.10 for the single-writer constraint that makes this safe.
+
+### 4.10 Persistent Storage and Single-Writer Safety
+
+The backend uses SQLite on an EFS mount (`/data/vaccichain.db`) plus an append-only audit log (`/data/audit.log`). SQLite over EFS is **not safe for concurrent writers**, so the deployment explicitly constrains the backend to a single writer instance.
+
+**Architecture:**
+
+- The backend service runs with `desired_count = 1` and autoscaling **disabled** for the writer task. This is the single writer for the SQLite database and index state.
+- Read-only or stateless work (frontend, analytics) may scale freely.
+- If additional backend capacity is needed, it must be added as read replicas backed by a different store — not as additional SQLite writers.
+- EFS access is serialized through the single writer; no other task mounts `/data` for writing.
+
+**Enforcement:** the Terraform ECS module sets `desired_count = 1` and omits autoscaling for the backend writer service. A CI check fails the plan if the backend writer's max capacity exceeds 1.
+
+**Failure and recovery validation:**
+
+```bash
+# Force a task replacement and confirm data durability
+aws ecs update-service --cluster vaccichain-prod \
+  --service vaccichain-backend --force-new-deployment
+
+# After the new task is healthy, confirm records written before replacement persist
+curl -sf https://app.yourdomain.com/verify/<WALLET_WRITTEN_BEFORE_REPLACEMENT>
+# Expected: the previously written record is still returned
+```
+
+Recovery tests must confirm: (1) no split-brain — only one task holds the writer role at a time; (2) records written before a task replacement are still readable afterward; (3) the audit log is not truncated or duplicated across replacements.
 
 ---
 
@@ -410,12 +617,12 @@ SUBNET_IDS=$(terraform output -raw private_subnet_ids)
 SG_ID=$(terraform output -raw ecs_security_group_id)
 TG_ARN=$(terraform output -raw target_group_arn)
 
-# Create backend service
+# Create backend service (single writer — see 4.10)
 aws ecs create-service \
   --cluster vaccichain-prod \
   --service-name vaccichain-backend \
   --task-definition vaccichain-prod:1 \
-  --desired-count 2 \
+  --desired-count 1 \
   --launch-type FARGATE \
   --network-configuration "awsvpcConfiguration={
     subnets=[$SUBNET_IDS],
@@ -761,6 +968,7 @@ Initiate a rollback if any of the following occur within 30 minutes of deploymen
 ## References
 
 - [Infra README](../infra/README.md) — Terraform module details
+- [Staging Setup](./staging-setup.md) — Staging backend and isolation validation
 - [Secrets Management](./secrets-management.md) — AWS Secrets Manager setup
 - [Configuration Reference](./configuration.md) — All environment variables
 - [TLS Setup](./tls-setup.md) — HTTPS and certificate configuration

@@ -40,6 +40,57 @@ const schema = z.object({
   // Indexer
   EVENT_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(15000),
   DATABASE_PATH: z.string().default('/data/vaccichain.db'),
+
+  // Autoscaling / capacity (backlog #116)
+  ENABLE_AUTOSCALING: z.coerce.boolean().default(false),
+  MIN_TASKS: z.coerce.number().int().positive().default(1),
+  MAX_TASKS: z.coerce.number().int().positive().default(1),
+  // Cooldown between scaling actions, in seconds
+  SCALING_COOLDOWN_SECONDS: z.coerce.number().int().nonnegative().default(60),
+  // Maximum number of concurrent backend writers allowed against shared storage
+  MAX_CONCURRENT_WRITERS: z.coerce.number().int().positive().default(1),
+
+  // Storage / multi-task write safety (backlog #117)
+  // When true, only a single backend task may write to the shared database.
+  SINGLE_WRITER_MODE: z.coerce.boolean().default(true),
+
+  // Network egress allowlist (backlog #114)
+  // Comma-separated list of allowed egress hostnames (e.g. horizon-testnet.stellar.org).
+  EGRESS_ALLOWLIST: z.string().default(''),
+  // When true, outbound requests to hosts outside the allowlist are rejected.
+  ENFORCE_EGRESS_ALLOWLIST: z.coerce.boolean().default(false),
+}).superRefine((val, ctx) => {
+  if (val.MIN_TASKS > val.MAX_TASKS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['MIN_TASKS'],
+      message: 'MIN_TASKS must be less than or equal to MAX_TASKS',
+    });
+  }
+  if (val.ENABLE_AUTOSCALING && val.MAX_TASKS < 2) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['MAX_TASKS'],
+      message: 'MAX_TASKS must be at least 2 when ENABLE_AUTOSCALING is true',
+    });
+  }
+  if (val.SINGLE_WRITER_MODE && val.MAX_CONCURRENT_WRITERS !== 1) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['MAX_CONCURRENT_WRITERS'],
+      message: 'MAX_CONCURRENT_WRITERS must be 1 when SINGLE_WRITER_MODE is true',
+    });
+  }
+  if (val.ENFORCE_EGRESS_ALLOWLIST) {
+    const hosts = val.EGRESS_ALLOWLIST.split(',').map(h => h.trim()).filter(Boolean);
+    if (hosts.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['EGRESS_ALLOWLIST'],
+        message: 'EGRESS_ALLOWLIST must list at least one host when ENFORCE_EGRESS_ALLOWLIST is true',
+      });
+    }
+  }
 });
 
 function validateEnv(env) {
@@ -48,7 +99,15 @@ function validateEnv(env) {
     const missing = result.error.issues.map(i => `  ${i.path[0]}: ${i.message}`).join('\n');
     throw new Error(`[config] Missing or invalid environment variables:\n${missing}`);
   }
-  return result.data;
+  const data = result.data;
+  // Derived helpers consumed by the backend to adjust runtime behavior.
+  data.egressAllowlist = data.EGRESS_ALLOWLIST
+    .split(',')
+    .map(h => h.trim().toLowerCase())
+    .filter(Boolean);
+  // Effective writer limit: single-writer mode constrains writers to one instance.
+  data.effectiveMaxWriters = data.SINGLE_WRITER_MODE ? 1 : data.MAX_CONCURRENT_WRITERS;
+  return data;
 }
 
 const config = (() => {

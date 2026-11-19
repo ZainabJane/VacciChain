@@ -13,6 +13,12 @@ on:
         default: testnet
         type: choice
         options: [testnet, mainnet]
+      environment:
+        description: "Deployment environment (selects Terraform backend config)"
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
 
 jobs:
   build:
@@ -59,8 +65,31 @@ jobs:
       url: https://stellar.expert/explorer/testnet/contract/${{ steps.deploy.outputs.contract_id }}
     outputs:
       contract_id: ${{ steps.deploy.outputs.contract_id }}
+    env:
+      # Environment-specific Terraform backend config; no hardcoded account/region/bucket.
+      TF_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'staging' }}
+      TF_BACKEND_CONFIG: infra/backend/${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'staging' }}.backend.hcl
+      TF_VAR_FILE: infra/envs/${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'staging' }}.tfvars
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate Terraform backend config
+        run: |
+          set -euo pipefail
+          if [ ! -f "$TF_BACKEND_CONFIG" ]; then
+            echo "::error::Missing backend config: $TF_BACKEND_CONFIG"
+            exit 1
+          fi
+          if [ ! -f "$TF_VAR_FILE" ]; then
+            echo "::error::Missing env var file: $TF_VAR_FILE"
+            exit 1
+          fi
+          # Ensure the selected backend does not reference production state.
+          if grep -qi 'production' "$TF_BACKEND_CONFIG"; then
+            echo "::error::$TF_BACKEND_CONFIG references production state; refusing to run."
+            exit 1
+          fi
+          echo "Backend config validated: $TF_BACKEND_CONFIG (env: $TF_ENV)"
 
       - uses: actions/download-artifact@v4
         with:
@@ -117,8 +146,38 @@ jobs:
       url: https://stellar.expert/explorer/public/contract/${{ steps.deploy.outputs.contract_id }}
     outputs:
       contract_id: ${{ steps.deploy.outputs.contract_id }}
+    env:
+      # Production always uses the production-specific Terraform backend config.
+      TF_ENV: production
+      TF_BACKEND_CONFIG: infra/backend/production.backend.hcl
+      TF_VAR_FILE: infra/envs/production.tfvars
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate production Terraform backend config
+        run: |
+          set -euo pipefail
+          if [ ! -f "$TF_BACKEND_CONFIG" ]; then
+            echo "::error::Missing production backend config: $TF_BACKEND_CONFIG"
+            exit 1
+          fi
+          if [ ! -f "$TF_VAR_FILE" ]; then
+            echo "::error::Missing production env var file: $TF_VAR_FILE"
+            exit 1
+          fi
+          # Production must not reference staging state.
+          if grep -qi 'staging' "$TF_BACKEND_CONFIG"; then
+            echo "::error::$TF_BACKEND_CONFIG references staging state; refusing to run."
+            exit 1
+          fi
+          # Required backend keys must be present (values come from the config file, not hardcoded here).
+          for key in bucket key region; do
+            if ! grep -qE "^\s*${key}\s*=" "$TF_BACKEND_CONFIG"; then
+              echo "::error::Backend config missing required key: $key"
+              exit 1
+            fi
+          done
+          echo "Production backend config validated: $TF_BACKEND_CONFIG"
 
       - uses: actions/download-artifact@v4
         with:

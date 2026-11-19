@@ -4,6 +4,11 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "1024",
   "memory": "2048",
+  "desiredCount": 1,
+  "deploymentConfiguration": {
+    "maximumPercent": 100,
+    "minimumHealthyPercent": 0
+  },
   "containerDefinitions": [
     {
       "name": "frontend",
@@ -72,6 +77,45 @@
         {
           "name": "PORT",
           "value": "4000"
+        },
+        {
+          "name": "DEPLOYMENT_ENV",
+          "value": "staging"
+        },
+        {
+          "name": "BACKEND_WRITER_MODE",
+          "value": "single-writer"
+        },
+        {
+          "name": "SQLITE_DB_PATH",
+          "value": "/mnt/efs/vaccichain/staging/vaccichain.db"
+        },
+        {
+          "name": "SQLITE_BUSY_TIMEOUT_MS",
+          "value": "5000"
+        },
+        {
+          "name": "EFS_MOUNT_PATH",
+          "value": "/mnt/efs"
+        },
+        {
+          "name": "AUTOSCALING_MIN_TASKS",
+          "value": "1"
+        },
+        {
+          "name": "AUTOSCALING_MAX_TASKS",
+          "value": "1"
+        },
+        {
+          "name": "EGRESS_MODE",
+          "value": "nat-gateway"
+        }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "efs-vaccichain-staging",
+          "containerPath": "/mnt/efs",
+          "readOnly": false
         }
       ],
       "secrets": [
@@ -138,6 +182,16 @@
           "awslogs-region": "REGION",
           "awslogs-stream-prefix": "python-service"
         }
+      }
+    }
+  ],
+  "volumes": [
+    {
+      "name": "efs-vaccichain-staging",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "EFS_FILESYSTEM_ID",
+        "transitEncryption": "ENABLED",
+        "rootDirectory": "/vaccichain/staging"
       }
     }
   ],

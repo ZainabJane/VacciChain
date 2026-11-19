@@ -260,6 +260,101 @@ When an anomaly is detected the service POSTs a JSON payload to `ALERT_WEBHOOK_U
 
 ---
 
+## Deployment networking
+
+Private ECS tasks (backend, analytics, scheduled jobs) run in private subnets with no public IP. All outbound traffic leaves through a NAT gateway; inbound traffic arrives only via the internal load balancer. See `docs/networking.md` for the full egress/DNS/NAT design and the tested allow-list of destinations.
+
+### `EGRESS_ALLOWLIST`
+- Required: no
+- Default: `horizon-testnet.stellar.org,soroban-testnet.stellar.org`
+- Format: comma-separated DNS names (no scheme, no path)
+- Description: Hostnames the private tasks are permitted to reach. The security group egress rules and the NAT egress policy are generated from this list. Anything not listed (including administrative endpoints and arbitrary public hosts) is blocked. Update this when switching to mainnet.
+- Example (mainnet): `EGRESS_ALLOWLIST=horizon.stellar.org,mainnet.sorobanrpc.com`
+
+### `INTERNAL_API_ALLOWLIST`
+- Required: no
+- Default: `backend.vaccichain.internal,analytics.vaccichain.internal`
+- Format: comma-separated internal DNS names
+- Description: Internal service names that tasks may call. Used to scope the internal security-group ingress rules so tasks cannot reach unrelated internal hosts.
+- Example: `INTERNAL_API_ALLOWLIST=backend.vaccichain.internal`
+
+### `NAT_GATEWAY_ENABLED`
+- Required: no
+- Default: `true`
+- Format: boolean (`true` | `false`)
+- Description: Whether private subnets route egress through a NAT gateway. Set to `false` only for fully air-gapped environments where all dependencies are internal.
+- Example: `NAT_GATEWAY_ENABLED=true`
+
+---
+
+## Autoscaling
+
+Per-service autoscaling is configured through these variables. Scaling is driven by measured load but is capped so backend/database concurrency stays within safe limits (see `docs/scaling.md`).
+
+### `AUTOSCALING_ENABLED`
+- Required: no
+- Default: `false`
+- Format: boolean (`true` | `false`)
+- Description: Master switch for ECS service autoscaling. Must remain `false` while `SINGLE_WRITER_MODE=true` unless the writer service is pinned to one task.
+- Example: `AUTOSCALING_ENABLED=true`
+
+### `AUTOSCALING_MIN_TASKS`
+- Required: no
+- Default: `1`
+- Format: positive integer
+- Description: Minimum desired task count for the scaled service. Must be at least `1`.
+- Example: `AUTOSCALING_MIN_TASKS=1`
+
+### `AUTOSCALING_MAX_TASKS`
+- Required: no
+- Default: `4`
+- Format: positive integer, must be `>= AUTOSCALING_MIN_TASKS`
+- Description: Maximum task count. Acts as the cost ceiling and the hard cap on concurrent writers to shared persistence.
+- Example: `AUTOSCALING_MAX_TASKS=4`
+
+### `AUTOSCALING_TARGET_CPU_PERCENT`
+- Required: no
+- Default: `70`
+- Format: integer 1–100
+- Description: Target-average CPU utilization that drives scale-out/scale-in.
+- Example: `AUTOSCALING_TARGET_CPU_PERCENT=70`
+
+### `AUTOSCALING_SCALE_OUT_COOLDOWN_SECONDS`
+- Required: no
+- Default: `60`
+- Format: positive integer (seconds)
+- Description: Cooldown after a scale-out event before another scale-out can occur.
+- Example: `AUTOSCALING_SCALE_OUT_COOLDOWN_SECONDS=60`
+
+### `AUTOSCALING_SCALE_IN_COOLDOWN_SECONDS`
+- Required: no
+- Default: `300`
+- Format: positive integer (seconds)
+- Description: Cooldown after a scale-in event. Keep this longer than scale-out to avoid flapping.
+- Example: `AUTOSCALING_SCALE_IN_COOLDOWN_SECONDS=300`
+
+---
+
+## Persistent storage / single-writer mode
+
+The backend persists state in SQLite on EFS. Because SQLite does not support safe multi-writer access over a network filesystem, the backend must run as a single writer unless a tested concurrency-safe backend is configured.
+
+### `SINGLE_WRITER_MODE`
+- Required: no
+- Default: `true`
+- Format: boolean (`true` | `false`)
+- Description: When `true`, the backend deployment is constrained to exactly one task and autoscaling for the writer service is disabled. This prevents corruption and split-brain index state. Set to `false` only after validating a concurrency-safe persistence backend.
+- Example: `SINGLE_WRITER_MODE=true`
+
+### `DATABASE_PATH`
+- Required: no
+- Default: `/data/vaccichain.db`
+- Format: absolute file path on the mounted EFS volume
+- Description: SQLite database file location. In single-writer mode this path is mounted read-write by exactly one task.
+- Example: `DATABASE_PATH=/data/vaccichain.db`
+
+---
+
 ## Validation summary
 
 | Variable | Required | Validated by | Rule |
@@ -294,3 +389,13 @@ When an anomaly is detected the service POSTs a JSON payload to `ALERT_WEBHOOK_U
 | `ALERT_WEBHOOK_TYPE` | no | runtime | enum: `slack` \| `pagerduty` \| `email`, default `slack` |
 | `PAGERDUTY_ROUTING_KEY` | when type=pagerduty | runtime | 32-char hex string |
 | `ALERT_EMAIL_TO` | when type=email | runtime | valid email address |
+| `EGRESS_ALLOWLIST` | no | runtime | comma-separated DNS names |
+| `INTERNAL_API_ALLOWLIST` | no | runtime | comma-separated internal DNS names |
+| `NAT_GATEWAY_ENABLED` | no | runtime | boolean, default `true` |
+| `AUTOSCALING_ENABLED` | no | runtime | boolean, default `false` |
+| `AUTOSCALING_MIN_TASKS` | no | runtime | positive integer, default 1 |
+| `AUTOSCALING_MAX_TASKS` | no | runtime | positive integer `>=` min, default 4 |
+| `AUTOSCALING_TARGET_CPU_PERCENT` | no | runtime | integer 1–100, default 70 |
+| `AUTOSCALING_SCALE_OUT_COOLDOWN_SECONDS` | no | runtime | positive integer, default 60 |
+| `AUTOSCALING_SCALE_IN_COOLDOWN_SECONDS` | no | runtime | positive integer, default 300 |
+| `SINGLE_WRITER_MODE` | no | runtime | boolean, default `true` |
