@@ -57,7 +57,7 @@ export default function PatientDashboard() {
         </div>
         {records.length > 0 && (
           <span style={{ color: '#64748b', fontSize: '0.85rem' }}>
-            {records.length} records
+            {t('patient.recordCount', { count: records.length })}
           </span>
         )}
       </div>

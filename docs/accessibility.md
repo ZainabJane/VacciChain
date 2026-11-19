@@ -78,9 +78,55 @@ All ratios computed using the WCAG relative luminance formula.
 
 ---
 
+## Verification Status Cues (Color-Independent)
+
+Record validity and revocation are never communicated by color alone. Every status
+renders a textual label plus an icon, and exposes an accessible name that does not
+depend on color.
+
+| Status | Textual label | Icon | Accessible name | Colors |
+|--------|---------------|------|-----------------|--------|
+| Valid | `Valid` | ✓ (check) | "Status: Valid" | `#4ade80` on `#14532d` |
+| Revoked | `Revoked` | ✕ (cross) | "Status: Revoked" | `#f87171` on `#450a0a` |
+| Unknown / not found | `Not found` | ? (question) | "Status: Not found" | `#94a3b8` on `#1e293b` |
+
+- The label text is always visible; the icon is decorative (`aria-hidden="true"`)
+  and the accessible name is provided via `aria-label` on the status container.
+- Color is a redundant enhancement only — removing it does not change meaning.
+
+---
+
+## Visual Review Checklist
+
+Run this checklist for any change touching status, badge, or verification UI.
+
+### Contrast
+
+- [ ] Status label text meets 4.5:1 against its badge background.
+- [ ] Status icons meet 3:1 against their background (non-text contrast).
+- [ ] Focus indicators on status-related controls meet 3:1 against adjacent colors.
+- [ ] Ratios re-verified with the WCAG relative luminance formula (see table above).
+
+### Color-Vision Simulations
+
+- [ ] Protanopia simulation: Valid vs. Revoked remain distinguishable by label and icon.
+- [ ] Deuteranopia simulation: Valid vs. Revoked remain distinguishable by label and icon.
+- [ ] Tritanopia simulation: Valid vs. Revoked remain distinguishable by label and icon.
+- [ ] Achromatopsia (grayscale) simulation: all statuses remain distinguishable.
+- [ ] No status relies on hue alone; text and iconography carry the meaning.
+
+### Assistive Technology
+
+- [ ] Screen reader announces the status label and accessible name.
+- [ ] Status is not conveyed solely through `title` or hover-only affordances.
+
+---
+
 ## Notes
 
 - The application uses a single dark theme. There is no light mode; light-mode contrast is not applicable.
 - All interactive elements (buttons, links) meet the 3:1 minimum after fixes.
 - Large text elements (h1, h2) all passed without changes.
 - `VerificationBadge` colors (`#4ade80`/`#14532d` and `#f87171`/`#450a0a`) both pass without changes.
+- Verification statuses are color-independent: each has a textual label, icon, and
+  accessible name (see "Verification Status Cues" above).

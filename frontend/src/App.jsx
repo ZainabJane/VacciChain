@@ -6,6 +6,7 @@ import VerifyPage from './pages/VerifyPage';
 import AdminDashboard from './pages/AdminDashboard';
 import IssuerOnboarding from './pages/IssuerOnboarding';
 import AnalyticsDashboard from './pages/AnalyticsDashboard';
+import { useEffect } from 'react';
 import { AuthProvider } from './hooks/useFreighter';
 import { useDarkMode } from './hooks/useDarkMode';
 import FreighterBanner from './components/FreighterBanner';
@@ -15,6 +16,15 @@ import SkipToContent from './components/SkipToContent';
 
 export default function App() {
   const [dark, setDark] = useDarkMode();
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (dark) {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+  }, [dark]);
 
   return (
     <AuthProvider>

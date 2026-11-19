@@ -1,8 +1,9 @@
 import { useTranslation } from 'react-i18next';
 import CopyButton from './CopyButton';
 import NFTCardSkeleton from './NFTCardSkeleton';
+import { formatDate, formatCount } from '../i18n/formatters';
 
-async function exportCertificate(record) {
+async function exportCertificate(record, locale, t) {
   const [{ jsPDF }, QRCode] = await Promise.all([
     import('jspdf'),
     import('qrcode'),
@@ -15,9 +16,11 @@ async function exportCertificate(record) {
   doc.setFontSize(20);
   doc.text('VacciChain Vaccination Certificate', 105, 20, { align: 'center' });
 
+  const formattedDate = formatDate(record.date_administered, locale, t('nftCard.invalidDate', 'Date unavailable'));
+
   doc.setFontSize(12);
   doc.text(`Vaccine: ${record.vaccine_name}`, 20, 45);
-  doc.text(`Date Administered: ${record.date_administered}`, 20, 57);
+  doc.text(`Date Administered: ${formattedDate}`, 20, 57);
   doc.text(`Issuer: ${record.issuer?.slice(0, 8)}…${record.issuer?.slice(-4)}`, 20, 69);
   doc.text(`Wallet: ${record.patient?.slice(0, 8) ?? 'N/A'}…${record.patient?.slice(-4) ?? ''}`, 20, 81);
   doc.text(`Token ID: #${record.token_id}`, 20, 93);
@@ -27,13 +30,20 @@ async function exportCertificate(record) {
   doc.text('Scan to verify on-chain', 155, 84);
 
   const safeName = record.vaccine_name.replace(/\s+/g, '_');
-  doc.save(`VacciChain_${safeName}_${record.date_administered}.pdf`);
+  doc.save(`VacciChain_${safeName}_${formattedDate}.pdf`);
 }
 
 export default function NFTCard({ record, onClick, loading = false }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = i18n.language;
 
   if (loading) return <NFTCardSkeleton count={1} />;
+
+  const formattedDate = formatDate(
+    record.date_administered,
+    locale,
+    t('nftCard.invalidDate', 'Date unavailable'),
+  );
 
   return (
     <div
@@ -64,7 +74,18 @@ export default function NFTCard({ record, onClick, loading = false }) {
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
           {record.dose_number != null && (
             <span
-              aria-label={`Dose ${record.dose_number}${record.dose_series != null ? ` of ${record.dose_series}` : ''}`}
+              aria-label={
+                record.dose_series != null
+                  ? t('nftCard.doseOfSeries', {
+                      dose: formatCount(record.dose_number, locale),
+                      series: formatCount(record.dose_series, locale),
+                      defaultValue: 'Dose {{dose}} of {{series}}',
+                    })
+                  : t('nftCard.dose', {
+                      dose: formatCount(record.dose_number, locale),
+                      defaultValue: 'Dose {{dose}}',
+                    })
+              }
               style={{
                 fontSize: '0.72rem',
                 fontWeight: 600,
@@ -80,25 +101,32 @@ export default function NFTCard({ record, onClick, loading = false }) {
               }}
             >
               {record.dose_series != null
-                ? `${record.dose_number}/${record.dose_series} doses`
-                : `Dose ${record.dose_number}`}
+                ? t('nftCard.doseCount', {
+                    dose: formatCount(record.dose_number, locale),
+                    series: formatCount(record.dose_series, locale),
+                    defaultValue: '{{dose}}/{{series}} doses',
+                  })
+                : t('nftCard.dose', {
+                    dose: formatCount(record.dose_number, locale),
+                    defaultValue: 'Dose {{dose}}',
+                  })}
             </span>
           )}
-          <span style={{ fontSize: '0.75rem', color: '#94a3b8', display: 'inline-flex', alignItems: 'center' }} aria-label={`Token ID ${record.token_id}`}>
-            #{record.token_id}
+          <span style={{ fontSize: '0.75rem', color: '#94a3b8', display: 'inline-flex', alignItems: 'center' }} aria-label={t('nftCard.tokenId', { id: formatCount(record.token_id, locale), defaultValue: 'Token ID {{id}}' })}>
+            #{formatCount(record.token_id, locale)}
             <CopyButton text={String(record.token_id)} label="token ID" />
           </span>
         </div>
       </div>
       <p style={{ color: 'var(--text-muted)', marginTop: '0.5rem', fontSize: '0.9rem' }}>
-        Date: {record.date_administered}
+        {t('nftCard.date', { date: formattedDate, defaultValue: 'Date: {{date}}' })}
       </p>
       <p style={{ color: '#94a3b8', fontSize: '0.8rem', marginTop: '0.25rem' }}>
         Issuer: {record.issuer?.slice(0, 8)}…{record.issuer?.slice(-4)}
       </p>
       <button
         aria-label={`Export certificate for ${record.vaccine_name}`}
-        onClick={(e) => { e.stopPropagation(); exportCertificate(record); }}
+        onClick={(e) => { e.stopPropagation(); exportCertificate(record, locale, t); }}
         style={{
           marginTop: '0.75rem',
           padding: '0.35rem 0.85rem',

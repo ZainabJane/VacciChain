@@ -21,6 +21,7 @@
     "title": "My Vaccination Records",
     "recordCount_one": "{{count}} record",
     "recordCount_other": "{{count}} records",
+    "recordCount_zero": "No records",
     "wallet": "Wallet: {{address}}",
     "loading": "Loading…",
     "error": "Error: {{message}}",
@@ -58,14 +59,24 @@
   },
   "nftCard": {
     "date": "Date: {{date}}",
-    "issuer": "Issuer: {{address}}"
+    "issuer": "Issuer: {{address}}",
+    "dose": "Dose {{dose}}",
+    "doseOfSeries": "Dose {{dose}} of {{total}}"
   },
   "badge": {
-    "verified": "Verified: {{count}} Record",
+    "verified_one": "Verified: {{count}} Record",
     "verified_other": "Verified: {{count}} Records",
+    "verified_zero": "Verified: No Records",
     "notFound": "No Records Found",
     "revoked": "Certificate Revoked",
-    "verifying": "Verifying Status..."
+    "verifying": "Verifying Status...",
+    "statusLabel": "Verification status: {{status}}",
+    "status": {
+      "verified": "Verified",
+      "notFound": "Not found",
+      "revoked": "Revoked",
+      "verifying": "Verifying"
+    }
   },
   "modal": {
     "title": "💉 Vaccination Record",

@@ -5,6 +5,25 @@ import NFTCard from '../components/NFTCard';
 import CopyButton from '../components/CopyButton';
 import { useToast } from '../hooks/useToast';
 
+// Redact anything that looks like a token/secret and strip record details from
+// messages before they reach the console, toasts, or error UI.
+const SENSITIVE_PATTERN = /(bearer\s+)?[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|token[=:]\s*\S+|api[_-]?key[=:]\s*\S+/gi;
+
+function sanitizeMessage(message) {
+  const fallback = 'Verification failed. Please try again.';
+  if (typeof message !== 'string' || !message.trim()) return fallback;
+  const redacted = message.replace(SENSITIVE_PATTERN, '[redacted]');
+  // Only surface short, generic messages; drop anything that may embed record data.
+  return redacted.length > 200 ? fallback : redacted;
+}
+
+function deriveStatus(result) {
+  if (!result) return 'not-found';
+  if (result.revoked) return 'revoked';
+  if (result.vaccinated) return 'verified';
+  return 'not-found';
+}
+
 const styles = {
   page: { maxWidth: 600, margin: '2rem auto', padding: '0 1rem' },
   input: { padding: '0.6rem 0.75rem', background: 'var(--input-bg)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: '1rem', width: '100%' },
@@ -29,8 +48,9 @@ export default function VerifyPage() {
       if (!res.ok) throw new Error(data.error);
       setResult(data);
     } catch (e) {
-      setError(e.message || 'Verification failed.');
-      toast(e.message || 'Verification failed.', 'error');
+      const message = sanitizeMessage(e.message);
+      setError(message);
+      toast(message, 'error');
     } finally {
       setLoading(false);
     }
@@ -81,7 +101,11 @@ export default function VerifyPage() {
 
       {result && (
         <div style={{ marginTop: '1.5rem' }} aria-live="polite">
-          <VerificationBadge vaccinated={result.vaccinated} recordCount={result.record_count} />
+          <VerificationBadge
+            status={deriveStatus(result)}
+            vaccinated={result.vaccinated}
+            recordCount={result.record_count}
+          />
           <p style={{ color: '#64748b', fontSize: '0.85rem', marginTop: '1rem', wordBreak: 'break-all', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.25rem' }}>
             Wallet: {wallet}
             <CopyButton text={wallet} label="wallet address" />
