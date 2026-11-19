@@ -1,13 +1,38 @@
 /**
  * SQLite-backed event store using sql.js (pure WASM — no native build required).
  * The DB is loaded from disk on init and flushed to disk after every write.
+ *
+ * PERSISTENCE MODEL (see docs/deployment.md):
+ *   The database file lives on an EFS access point and is only safe for a
+ *   SINGLE writer. The indexer/API service MUST run with desired count 1 and a
+ *   deployment configuration that never overlaps old and new tasks
+ *   (maxSurge=0, maxUnavailable=1, single replica). To defend against
+ *   misconfiguration (or a rolling deploy that briefly overlaps), startup
+ *   acquires an exclusive advisory lock file next to the DB. If another live
+ *   process holds the lock, initDb() throws instead of opening the DB, which
+ *   prevents split-brain index state and corruption.
+ *
+ *   Writes are flushed atomically (temp file + rename) so a task killed
+ *   mid-write leaves either the previous or the new DB image on disk, never a
+ *   truncated one. WAL mode is enabled for crash resilience; because sql.js
+ *   exports a full image on flush, the WAL is checkpointed into the exported
+ *   bytes and no separate -wal/-shm files need to be shared across tasks.
  */
 const initSqlJs = require('sql.js');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 let db = null;
 let dbPath = null;
+let lockPath = null;
+let lockFd = null;
+let lockAcquired = false;
+
+const LOCK_STALE_MS = Number(process.env.DB_LOCK_STALE_MS || 5 * 60 * 1000);
+const LOCK_HEARTBEAT_MS = Number(process.env.DB_LOCK_HEARTBEAT_MS || 30 * 1000);
+let lockHeartbeat = null;
+let lockOwner = null;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS events (
@@ -47,16 +72,122 @@ const SCHEMA = `
   );
 `;
 
-/** Persist in-memory DB to disk. */
+/**
+ * Persist in-memory DB to disk atomically.
+ * Writes to a temp file in the same directory then renames over the target so
+ * a crash mid-write cannot leave a partially written / corrupt DB image.
+ */
 function flush() {
   if (!db || !dbPath) return;
-  const data = db.export();
-  fs.writeFileSync(dbPath, Buffer.from(data));
+  const data = Buffer.from(db.export());
+  const tmpPath = `${dbPath}.tmp-${process.pid}-${Date.now()}`;
+  const fd = fs.openSync(tmpPath, 'w');
+  try {
+    fs.writeSync(fd, data, 0, data.length, 0);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmpPath, dbPath);
+  // Best-effort fsync of the directory so the rename is durable.
+  try {
+    const dirFd = fs.openSync(path.dirname(dbPath), 'r');
+    try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+  } catch (_) { /* directory fsync unsupported on some platforms */ }
+}
+
+function isProcessAlive(pid) {
+  if (!pid || pid === process.pid) return pid === process.pid;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+function readLockOwner() {
+  try {
+    return JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Acquire an exclusive advisory lock next to the DB file.
+ * Uses O_EXCL create so only one process can win. A lock is considered stale
+ * if its owner PID is dead or its heartbeat is older than DB_LOCK_STALE_MS.
+ */
+function acquireLock() {
+  lockPath = `${dbPath}.lock`;
+  lockOwner = {
+    pid: process.pid,
+    host: os.hostname(),
+    acquiredAt: new Date().toISOString(),
+    heartbeat: Date.now(),
+  };
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      lockFd = fs.openSync(lockPath, 'wx');
+      fs.writeSync(lockFd, JSON.stringify(lockOwner));
+      fs.fsyncSync(lockFd);
+      lockAcquired = true;
+      startLockHeartbeat();
+      return;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      const existing = readLockOwner();
+      const stale = !existing
+        || !isProcessAlive(existing.pid)
+        || (Date.now() - (existing.heartbeat || 0)) > LOCK_STALE_MS;
+      if (!stale) {
+        throw new Error(
+          `Database is locked by another writer (pid=${existing && existing.pid}, ` +
+          `host=${existing && existing.host}). Refusing to start to avoid split-brain. ` +
+          `Ensure the service runs with a single task (desired count 1).`
+        );
+      }
+      // Stale lock — remove and retry once.
+      try { fs.unlinkSync(lockPath); } catch (_) { /* raced */ }
+    }
+  }
+  throw new Error('Unable to acquire database lock after retry.');
+}
+
+function startLockHeartbeat() {
+  if (lockHeartbeat) return;
+  lockHeartbeat = setInterval(() => {
+    if (!lockAcquired || !lockFd) return;
+    try {
+      lockOwner.heartbeat = Date.now();
+      fs.ftruncateSync(lockFd, 0);
+      fs.writeSync(lockFd, JSON.stringify(lockOwner), 0);
+    } catch (_) { /* best effort */ }
+  }, LOCK_HEARTBEAT_MS);
+  if (lockHeartbeat.unref) lockHeartbeat.unref();
+}
+
+/** Release the advisory lock (called on graceful shutdown). */
+function releaseLock() {
+  if (lockHeartbeat) { clearInterval(lockHeartbeat); lockHeartbeat = null; }
+  if (lockFd != null) {
+    try { fs.closeSync(lockFd); } catch (_) { /* ignore */ }
+    lockFd = null;
+  }
+  if (lockAcquired && lockPath) {
+    try { fs.unlinkSync(lockPath); } catch (_) { /* ignore */ }
+  }
+  lockAcquired = false;
 }
 
 /** Initialize (or load) the database. */
 async function initDb(filePath) {
   dbPath = filePath;
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  acquireLock();
+
   const SQL = await initSqlJs();
 
   if (fs.existsSync(filePath)) {
@@ -64,12 +195,21 @@ async function initDb(filePath) {
     db = new SQL.Database(fileBuffer);
   } else {
     db = new SQL.Database();
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
   }
 
+  // WAL improves crash resilience for the on-disk image; sql.js checkpoints
+  // the WAL into the exported bytes on flush().
+  try { db.run('PRAGMA journal_mode = WAL;'); } catch (_) { /* not fatal */ }
   db.run(SCHEMA);
   flush();
   return db;
+}
+
+/** Close the DB and release the writer lock. Safe to call multiple times. */
+function closeDb() {
+  try { if (db) db.close(); } catch (_) { /* ignore */ }
+  db = null;
+  releaseLock();
 }
 
 /**
@@ -156,7 +296,7 @@ function revokeApiKey(id) {
   flush();
 }
 
-module.exports = { initDb, upsertEvents, queryEvents, getLatestLedger, insertApiKey, getApiKeyByHash, listApiKeys, revokeApiKey, getConsent, recordConsent, hasConsented, insertIssuerApplication, getIssuerApplication, listIssuerApplications, updateIssuerApplicationStatus };
+module.exports = { initDb, closeDb, upsertEvents, queryEvents, getLatestLedger, insertApiKey, getApiKeyByHash, listApiKeys, revokeApiKey, getConsent, recordConsent, hasConsented, insertIssuerApplication, getIssuerApplication, listIssuerApplications, updateIssuerApplicationStatus };
 
 // ── Patient consent ───────────────────────────────────────────────────────────
 
