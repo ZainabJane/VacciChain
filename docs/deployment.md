@@ -429,17 +429,49 @@ aws ecs create-service \
 
 ### 7.3 Configure GitHub Actions for CI/CD
 
-Add these secrets to your GitHub repository for automated deployments:
+Deployments are driven by GitHub Actions. Two things gate every merge and deploy: the required CI check and the deployment environments.
 
-```
-AWS_ROLE_TO_ASSUME_PROD   — ARN of the GitHub Actions IAM role
-AWS_REGION                — us-east-1
-ECR_REGISTRY              — <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
-ECS_CLUSTER_PROD          — vaccichain-prod
-ECS_SERVICE_PROD          — vaccichain-backend
-```
+#### Required CI check
 
-The GitHub Actions workflow at `.github/workflows/cd.yml` handles image builds and service updates on pushes to `main`.
+Branch protection on `main` requires a single status check named **`ci-required`**. That job is an aggregate gate that depends on the individual lint, test, coverage, dependency-scan, and image-scan jobs. Each test suite runs exactly once per workflow path and uploads its real coverage output as an artifact; the aggregate job only inspects those results, so no suite is executed twice. Do not add the individual job names to branch protection — only `ci-required` should be required, so the required-check list stays stable as jobs are added or renamed.
+
+#### GitHub Environments
+
+Two separate GitHub Environments isolate staging from production:
+
+| Environment | Secrets scope | Protection |
+|---|---|---|
+| `staging` | `AWS_ROLE_TO_ASSUME_STAGING`, `ECS_CLUSTER_STAGING`, `ECS_SERVICE_STAGING`, testnet Stellar keys | No reviewers; restricted to `develop` |
+| `production` | `AWS_ROLE_TO_ASSUME_PROD`, `ECS_CLUSTER_PROD`, `ECS_SERVICE_PROD`, mainnet Stellar keys | Required reviewers; restricted to `main` |
+
+Secrets are defined per environment, never at repository scope, so a staging run cannot read production credentials (and vice versa). The `production` environment must have **required reviewers** configured in repository settings; a production deploy job will wait for manual approval before it starts. Shared non-sensitive values (`AWS_REGION`, `ECR_REGISTRY`) may remain repository-level variables.
+
+#### Pre-deploy policy gate
+
+A policy job runs before any deploy job and blocks production deploys unless all of the following hold:
+
+- the ref is `main` (staging is restricted to `develop`)
+- the triggering event is `push` or an approved `workflow_dispatch` — `pull_request` and other events are rejected for production
+- the `ci-required` check succeeded for the same commit
+- the `production` environment approval has been granted
+
+If any condition fails, the deploy job is skipped and the workflow fails the gate. This prevents a production deploy from an unapproved branch or event even if the environment is misconfigured.
+
+#### Contract deploy / upgrade / no-op decision
+
+Contract changes no longer deploy a new contract on every push. The workflow inspects the change set and the deployment manifest (`contracts/deployments/<network>.json`, which records the deployed contract ID and WASM hash) and takes one of three paths:
+
+| Path | When | Action |
+|---|---|---|
+| `deploy` | No contract recorded in the manifest for the network | `stellar contract deploy`, then write the new contract ID to the manifest |
+| `upgrade` | Manifest has a contract ID and the WASM hash differs | `stellar contract install` + `upgrade` on the **explicit** `target_contract` input |
+| `no-op` | Manifest contract ID and WASM hash already match the build | Skip; report success without touching the network |
+
+Upgrades require an explicit `target_contract` workflow input (the contract ID to upgrade); the workflow fails if it is missing or does not match the manifest. Because the manifest is committed back after a successful deploy, re-running a completed deployment resolves to `no-op` and cannot silently create a second production contract. See [`docs/contract-upgrade.md`](./contract-upgrade.md) for the manual equivalent.
+
+#### Terraform fmt / validate / plan review
+
+CI runs `terraform fmt -check -recursive` and `terraform validate` for every directory under `infra/envs/*` and `infra/modules/*`. On pull requests, a plan job runs with **isolated, read-only credentials** (a dedicated plan role that cannot apply) and posts the plan for review. `terraform apply` runs only after the plan is approved and the environment gate passes; it uses the environment-scoped apply role, never the plan credentials.
 
 ---
 
@@ -703,7 +735,7 @@ The ECS task execution role (`ecsTaskExecutionRole`) is granted `logs:CreateLogS
 
 ## 12. Rollback Procedure
 
-### 11.1 Rolling Back a Service
+### 12.1 Rolling Back a Service
 
 To revert to the previous image tag:
 
@@ -722,7 +754,7 @@ aws ecs update-service \
   --region us-east-1
 ```
 
-### 11.2 Rolling Back a Contract Deployment
+### 12.2 Rolling Back a Contract Deployment
 
 The Soroban contract supports upgrades via the `upgrade` function (admin-only). To revert:
 
@@ -746,7 +778,7 @@ The Soroban contract supports upgrades via the `upgrade` function (admin-only). 
 
 See [`docs/contract-upgrade.md`](./contract-upgrade.md) for the full upgrade and rollback process.
 
-### 11.3 Rollback Criteria
+### 12.3 Rollback Criteria
 
 Initiate a rollback if any of the following occur within 30 minutes of deployment:
 

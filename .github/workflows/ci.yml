@@ -33,10 +33,6 @@ jobs:
         working-directory: contracts
         run: make build
 
-      - name: Run contract tests
-        working-directory: contracts
-        run: cargo test
-
       - name: Run contract tests with coverage
         working-directory: contracts
         run: |
@@ -85,13 +81,9 @@ jobs:
         working-directory: backend
         run: npm run lint
 
-      - name: Run tests
-        working-directory: backend
-        run: npm test
-
       - name: Run tests with coverage
         working-directory: backend
-        run: npm test
+        run: npm run test:coverage
 
       - name: Upload Backend Coverage to Codecov
         uses: codecov/codecov-action@v4
@@ -131,10 +123,6 @@ jobs:
       - name: Lint
         working-directory: frontend
         run: npm run lint
-
-      - name: Run tests
-        working-directory: frontend
-        run: npm test
 
       - name: Run tests with coverage
         working-directory: frontend
@@ -179,10 +167,6 @@ jobs:
         working-directory: python-service
         run: flake8 .
 
-      - name: Run tests
-        working-directory: python-service
-        run: pytest
-
       - name: Run tests with coverage
         working-directory: python-service
         run: pytest --cov --cov-report=xml
@@ -208,25 +192,155 @@ jobs:
           name: python-audit-report
           path: python-service/audit-report.txt
 
-  # Gate job: all test jobs must pass before a PR can be merged.
-  # Configure this job name ("All tests passed") as a required status check
-  # in Settings → Branches → Branch protection rules for `main`.
-  all-tests:
-    name: All tests passed
+  dependency-scan:
+    name: Dependency security scan
     runs-on: ubuntu-latest
-    needs: [contract, backend, frontend, python]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Backend dependency audit
+        working-directory: backend
+        run: npm audit --audit-level=high | tee audit-report.txt
+
+      - name: Upload backend audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-audit-report
+          path: backend/audit-report.txt
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Frontend dependency audit
+        working-directory: frontend
+        run: npm audit --audit-level=high | tee audit-report.txt
+
+      - name: Upload frontend audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-audit-report
+          path: frontend/audit-report.txt
+
+      - name: Install Rust + cargo-audit
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Contract dependency audit
+        working-directory: contracts
+        run: cargo audit | tee audit-report.txt
+
+      - name: Upload contract audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-audit-report
+          path: contracts/audit-report.txt
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Python dependency audit
+        working-directory: python-service
+        run: pip-audit -r requirements.txt | tee audit-report.txt
+
+      - name: Upload python audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-audit-report
+          path: python-service/audit-report.txt
+
+  terraform:
+    name: Terraform format and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform fmt check
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dirs=(infra/envs/*/ infra/modules/*/)
+          if [[ ${#dirs[@]} -eq 0 ]]; then
+            echo "No Terraform directories found."
+            exit 0
+          fi
+          for dir in "${dirs[@]}"; do
+            echo "::group::fmt ${dir}"
+            terraform fmt -check -recursive "${dir}"
+            echo "::endgroup::"
+          done
+
+      - name: Terraform validate
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dirs=(infra/envs/*/ infra/modules/*/)
+          if [[ ${#dirs[@]} -eq 0 ]]; then
+            echo "No Terraform directories found."
+            exit 0
+          fi
+          for dir in "${dirs[@]}"; do
+            echo "::group::validate ${dir}"
+            (cd "${dir}" && terraform init -backend=false -input=false && terraform validate)
+            echo "::endgroup::"
+          done
+
+  # Gate job: the single stable required status check for branch protection.
+  # Configure "ci-required" as the sole required status check in
+  # Settings → Branches → Branch protection rules for `main`.
+  ci-required:
+    name: ci-required
+    runs-on: ubuntu-latest
+    needs:
+      - contract
+      - backend
+      - frontend
+      - python
+      - docker
+      - container-scan
+      - dependency-scan
+      - terraform
     if: always()
     steps:
-      - name: Check all test jobs succeeded
+      - name: Check all required jobs succeeded
         run: |
-          if [[ "${{ needs.contract.result }}" != "success" || \
-                "${{ needs.backend.result }}"  != "success" || \
-                "${{ needs.frontend.result }}"  != "success" || \
-                "${{ needs.python.result }}"    != "success" ]]; then
-            echo "One or more test jobs failed."
+          if [[ "${{ needs.contract.result }}"        != "success" || \
+                "${{ needs.backend.result }}"         != "success" || \
+                "${{ needs.frontend.result }}"        != "success" || \
+                "${{ needs.python.result }}"          != "success" || \
+                "${{ needs.docker.result }}"          != "success" || \
+                "${{ needs.container-scan.result }}"  != "success" || \
+                "${{ needs.dependency-scan.result }}" != "success" || \
+                "${{ needs.terraform.result }}"       != "success" ]]; then
+            echo "One or more required jobs failed."
             exit 1
           fi
-          echo "All test jobs passed."
+          echo "All required jobs passed."
 
   docker:
     name: Docker build validation

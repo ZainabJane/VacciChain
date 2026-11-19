@@ -6,10 +6,143 @@ on:
       - main
     paths:
       - "contracts/**"
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      target_contract:
+        description: "Contract ID to upgrade (required when action resolves to upgrade)"
+        required: false
+        type: string
+      override_existing:
+        description: "Allow creating a new production contract even if the manifest already records one"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
 
 jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.decide.outputs.action }}
+      target_contract: ${{ steps.decide.outputs.target_contract }}
+      manifest_contract_id: ${{ steps.decide.outputs.manifest_contract_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine changed paths
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            BASE="${{ github.event.before }}"
+            if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+              BASE="HEAD~1"
+            fi
+            CHANGED=$(git diff --name-only "$BASE" HEAD || true)
+          else
+            CHANGED=""
+          fi
+          echo "changed<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Read deployment manifest
+        id: manifest
+        run: |
+          MANIFEST="contracts/deployments.json"
+          if [ -f "$MANIFEST" ]; then
+            ID=$(jq -r '.production.contract_id // empty' "$MANIFEST")
+          else
+            ID=""
+          fi
+          echo "contract_id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Decide deploy / upgrade / no-op
+        id: decide
+        env:
+          CHANGED: ${{ steps.changes.outputs.changed }}
+          MANIFEST_ID: ${{ steps.manifest.outputs.contract_id }}
+          TARGET_INPUT: ${{ github.event.inputs.target_contract }}
+          OVERRIDE: ${{ github.event.inputs.override_existing }}
+        run: |
+          set -euo pipefail
+          ACTION="no-op"
+          TARGET=""
+
+          if [ -n "$TARGET_INPUT" ]; then
+            ACTION="upgrade"
+            TARGET="$TARGET_INPUT"
+          elif [ -n "$MANIFEST_ID" ]; then
+            if echo "$CHANGED" | grep -qE '^contracts/'; then
+              ACTION="upgrade"
+              TARGET="$MANIFEST_ID"
+            else
+              ACTION="no-op"
+            fi
+          else
+            if echo "$CHANGED" | grep -qE '^contracts/'; then
+              ACTION="deploy"
+            else
+              ACTION="no-op"
+            fi
+          fi
+
+          if [ "$ACTION" = "upgrade" ] && [ -z "$TARGET" ]; then
+            echo "::error::Upgrade requested but no target contract was provided."
+            exit 1
+          fi
+
+          if [ "$ACTION" = "deploy" ] && [ -n "$MANIFEST_ID" ] && [ "$OVERRIDE" != "true" ]; then
+            echo "::error::Manifest already records production contract $MANIFEST_ID; refusing to create a second one. Set override_existing=true to proceed."
+            exit 1
+          fi
+
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "target_contract=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "manifest_contract_id=$MANIFEST_ID" >> "$GITHUB_OUTPUT"
+          echo "Resolved action: $ACTION (target: ${TARGET:-none})"
+
+  policy:
+    runs-on: ubuntu-latest
+    needs: decide
+    steps:
+      - name: Enforce production deployment policy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          ACTION: ${{ needs.decide.outputs.action }}
+        run: |
+          set -euo pipefail
+          if [ "$ACTION" = "no-op" ]; then
+            echo "No deployment action required; policy check skipped."
+            exit 0
+          fi
+          case "$EVENT_NAME" in
+            workflow_dispatch|release) ;;
+            *)
+              echo "::error::Production deploys are only allowed from workflow_dispatch or release events (got: $EVENT_NAME)."
+              exit 1
+              ;;
+          esac
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Production deploys from workflow_dispatch must run on main (got: $REF)."
+            exit 1
+          fi
+          echo "Policy check passed for $EVENT_NAME on $REF."
+
   deploy:
     runs-on: ubuntu-latest
+    needs:
+      - decide
+      - policy
+    if: needs.decide.outputs.action != 'no-op'
+    environment: production
     defaults:
       run:
         working-directory: contracts
@@ -39,16 +172,71 @@ jobs:
       - name: Build WASM
         run: make build
 
-      - name: Deploy to Stellar Testnet
+      - name: Deploy or upgrade contract
         id: deploy
         env:
           ADMIN_SECRET_KEY: ${{ secrets.ADMIN_SECRET_KEY }}
+          ACTION: ${{ needs.decide.outputs.action }}
+          TARGET_CONTRACT: ${{ needs.decide.outputs.target_contract }}
         run: |
-          CONTRACT_ID=$(stellar contract deploy \
-            --wasm target/wasm32-unknown-unknown/release/vaccichain.wasm \
-            --source "$ADMIN_SECRET_KEY" \
-            --network testnet)
+          set -euo pipefail
+          WASM=target/wasm32-unknown-unknown/release/vaccichain.wasm
+          if [ "$ACTION" = "deploy" ]; then
+            CONTRACT_ID=$(stellar contract deploy \
+              --wasm "$WASM" \
+              --source "$ADMIN_SECRET_KEY" \
+              --network testnet)
+          elif [ "$ACTION" = "upgrade" ]; then
+            if [ -z "$TARGET_CONTRACT" ]; then
+              echo "::error::Upgrade requires an explicit target contract."
+              exit 1
+            fi
+            stellar contract upload \
+              --wasm "$WASM" \
+              --source "$ADMIN_SECRET_KEY" \
+              --network testnet >/dev/null
+            stellar contract invoke \
+              --id "$TARGET_CONTRACT" \
+              --source "$ADMIN_SECRET_KEY" \
+              --network testnet \
+              -- upgrade \
+              --new_wasm_hash "$(stellar contract upload --wasm "$WASM" --source "$ADMIN_SECRET_KEY" --network testnet)"
+            CONTRACT_ID="$TARGET_CONTRACT"
+          else
+            echo "::error::Unexpected action '$ACTION'."
+            exit 1
+          fi
           echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Record contract ID in deployment manifest
+        env:
+          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          ACTION: ${{ needs.decide.outputs.action }}
+        run: |
+          set -euo pipefail
+          MANIFEST=deployments.json
+          if [ ! -f "$MANIFEST" ]; then
+            echo '{}' > "$MANIFEST"
+          fi
+          jq --arg id "$CONTRACT_ID" --arg action "$ACTION" \
+            '.production = {contract_id: $id, last_action: $action}' \
+            "$MANIFEST" > "$MANIFEST.tmp"
+          mv "$MANIFEST.tmp" "$MANIFEST"
+
+      - name: Commit manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deployments.json
+          if git diff --cached --quiet; then
+            echo "Manifest unchanged; nothing to commit."
+          else
+            git commit -m "chore: record production contract ${{ steps.deploy.outputs.contract_id }}"
+            git push
+          fi
 
       - name: Store contract ID as secret
         env:

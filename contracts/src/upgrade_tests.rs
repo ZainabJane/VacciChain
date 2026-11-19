@@ -3,6 +3,174 @@
 use soroban_sdk::{Address, Env, String as SorobanString, testutils::Address as TestAddress, Vec};
 use crate::{VacciChainContract, ContractError, storage::VaccinationRecord};
 
+/// Deployment action decided by the deployment workflow for a contract-path push.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeployAction {
+    /// No existing production contract: create a new deployment.
+    Deploy,
+    /// Existing production contract and an explicit target: upgrade it in place.
+    Upgrade,
+    /// Existing production contract and no explicit target: do nothing.
+    NoOp,
+}
+
+/// Minimal representation of the deployment manifest used by the workflow.
+#[derive(Clone, Debug, Default)]
+pub struct DeploymentManifest {
+    /// Contract id of the existing production deployment, if any.
+    pub production_contract: Option<SorobanString>,
+    /// Contract id explicitly targeted by an upgrade request, if any.
+    pub target_contract: Option<SorobanString>,
+    /// Explicit operator override allowing a second production contract.
+    pub allow_redeploy: bool,
+}
+
+/// Error returned when the deployment decision cannot be satisfied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeployError {
+    /// An upgrade was requested without naming the target contract.
+    UpgradeRequiresTarget,
+    /// A redeploy was attempted while a production contract already exists.
+    DuplicateProductionContract,
+}
+
+/// Decide what the workflow should do for a contract-path push.
+///
+/// * No production contract -> `Deploy`.
+/// * Production contract + explicit target -> `Upgrade`.
+/// * Production contract + no target -> `NoOp` (idempotent re-run).
+pub fn decide_deploy_action(manifest: &DeploymentManifest) -> Result<DeployAction, DeployError> {
+    match (&manifest.production_contract, &manifest.target_contract) {
+        (None, _) => Ok(DeployAction::Deploy),
+        (Some(_), Some(_)) => Ok(DeployAction::Upgrade),
+        (Some(_), None) => Ok(DeployAction::NoOp),
+    }
+}
+
+/// Guard against silently creating a second production contract.
+///
+/// Returns `Ok(())` when the action is safe, otherwise the blocking error.
+pub fn guard_duplicate_production(
+    manifest: &DeploymentManifest,
+    action: DeployAction,
+) -> Result<(), DeployError> {
+    if action == DeployAction::Deploy
+        && manifest.production_contract.is_some()
+        && !manifest.allow_redeploy
+    {
+        return Err(DeployError::DuplicateProductionContract);
+    }
+    Ok(())
+}
+
+/// Validate that an upgrade names an explicit target contract.
+pub fn validate_upgrade_target(
+    manifest: &DeploymentManifest,
+    action: DeployAction,
+) -> Result<(), DeployError> {
+    if action == DeployAction::Upgrade && manifest.target_contract.is_none() {
+        return Err(DeployError::UpgradeRequiresTarget);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_deploy_when_no_production_contract() {
+    let env = Env::default();
+    let manifest = DeploymentManifest::default();
+
+    let action = decide_deploy_action(&manifest).expect("decision should succeed");
+    assert_eq!(action, DeployAction::Deploy, "fresh manifest should deploy");
+    assert!(guard_duplicate_production(&manifest, action).is_ok());
+    assert!(validate_upgrade_target(&manifest, action).is_ok());
+}
+
+#[test]
+fn test_noop_when_production_contract_exists_without_target() {
+    let env = Env::default();
+    let manifest = DeploymentManifest {
+        production_contract: Some(SorobanString::from_slice(&env, b"CPROD123")),
+        target_contract: None,
+        allow_redeploy: false,
+    };
+
+    let action = decide_deploy_action(&manifest).expect("decision should succeed");
+    assert_eq!(
+        action,
+        DeployAction::NoOp,
+        "re-running a completed deployment must be a no-op"
+    );
+    // A no-op must never be treated as a fresh deploy, so the duplicate guard passes.
+    assert!(guard_duplicate_production(&manifest, action).is_ok());
+}
+
+#[test]
+fn test_upgrade_when_production_contract_and_target_present() {
+    let env = Env::default();
+    let manifest = DeploymentManifest {
+        production_contract: Some(SorobanString::from_slice(&env, b"CPROD123")),
+        target_contract: Some(SorobanString::from_slice(&env, b"CPROD123")),
+        allow_redeploy: false,
+    };
+
+    let action = decide_deploy_action(&manifest).expect("decision should succeed");
+    assert_eq!(action, DeployAction::Upgrade, "explicit target should upgrade");
+    assert!(validate_upgrade_target(&manifest, action).is_ok());
+    assert!(guard_duplicate_production(&manifest, action).is_ok());
+}
+
+#[test]
+fn test_upgrade_without_target_is_rejected() {
+    let env = Env::default();
+    let manifest = DeploymentManifest {
+        production_contract: Some(SorobanString::from_slice(&env, b"CPROD123")),
+        target_contract: None,
+        allow_redeploy: false,
+    };
+
+    // Forcing an upgrade decision without a target must be rejected.
+    let result = validate_upgrade_target(&manifest, DeployAction::Upgrade);
+    assert_eq!(
+        result,
+        Err(DeployError::UpgradeRequiresTarget),
+        "upgrade must require an explicit target contract"
+    );
+}
+
+#[test]
+fn test_duplicate_production_deploy_is_blocked_without_override() {
+    let env = Env::default();
+    let manifest = DeploymentManifest {
+        production_contract: Some(SorobanString::from_slice(&env, b"CPROD123")),
+        target_contract: None,
+        allow_redeploy: false,
+    };
+
+    // Even if something forces a Deploy action, the guard must block it.
+    let result = guard_duplicate_production(&manifest, DeployAction::Deploy);
+    assert_eq!(
+        result,
+        Err(DeployError::DuplicateProductionContract),
+        "re-deploying over an existing production contract must be blocked"
+    );
+}
+
+#[test]
+fn test_duplicate_production_deploy_allowed_with_explicit_override() {
+    let env = Env::default();
+    let manifest = DeploymentManifest {
+        production_contract: Some(SorobanString::from_slice(&env, b"CPROD123")),
+        target_contract: None,
+        allow_redeploy: true,
+    };
+
+    let result = guard_duplicate_production(&manifest, DeployAction::Deploy);
+    assert!(
+        result.is_ok(),
+        "explicit override should permit an intentional redeploy"
+    );
+}
+
 #[test]
 fn test_upgrade_v1_to_v2_data_persistence() {
     let env = Env::default();

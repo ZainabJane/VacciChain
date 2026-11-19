@@ -1,13 +1,57 @@
 name: Deploy to Staging
 
+# NOTE: This workflow is for the STAGING environment only. It is bound to the
+# 'staging' GitHub environment, which holds staging-scoped secrets and targets
+# staging AWS resources. Production/mainnet deployments are handled by a
+# separate workflow (deploy-production.yml) that requires deliberate approval
+# via the 'production' environment's required reviewers. Do not add production
+# secrets or mainnet resource names to this workflow.
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
+  policy-guard:
+    name: Enforce staging-only deployment policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Block unapproved branches and events
+        run: |
+          set -euo pipefail
+          echo "Event: ${{ github.event_name }}"
+          echo "Ref:   ${{ github.ref }}"
+
+          if [ "${{ github.event_name }}" != "push" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "::error::Staging deploys are only allowed from push or workflow_dispatch events."
+            exit 1
+          fi
+
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Staging deploys are only allowed from the main branch (got '${{ github.ref }}')."
+            exit 1
+          fi
+
+          echo "Policy guard passed: staging deploy from main via ${{ github.event_name }}."
+
+      - name: Assert no production/mainnet references
+        run: |
+          set -euo pipefail
+          # Fail if this workflow references production/mainnet secrets or resources.
+          if grep -nEi 'AWS_ROLE_TO_ASSUME_PROD|PRODUCTION_|MAINNET|vaccichain-prod|vaccichain-mainnet' .github/workflows/deploy-staging.yml; then
+            echo "::error::Production/mainnet references detected in the staging workflow."
+            exit 1
+          fi
+          echo "No production/mainnet references found."
+
   deploy-staging:
     name: Deploy to staging environment
+    needs: policy-guard
     runs-on: ubuntu-latest
     environment:
       name: staging
@@ -19,6 +63,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
+          # Staging-scoped secret only; never use a production role here.
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_STAGING }}
           aws-region: ${{ secrets.AWS_REGION }}
 
@@ -81,6 +126,8 @@ jobs:
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           task-definition: ${{ steps.task-def-final.outputs.task-definition }}
+          # Staging ECS resources only; production is deployed by a separate,
+          # approval-gated workflow.
           service: vaccichain-staging
           cluster: vaccichain-staging
           wait-for-service-stability: true
@@ -92,6 +139,7 @@ jobs:
           echo "- **Deployed by:** \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **URL:** https://staging.vaccichain.example.com" >> $GITHUB_STEP_SUMMARY
           echo "- **Timestamp:** $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Note:** Production deploys are handled by a separate approval-gated workflow." >> $GITHUB_STEP_SUMMARY
 
       - name: Alert on deployment failure
         if: failure()

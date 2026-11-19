@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - "contracts/**"
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       network:
@@ -13,8 +15,56 @@ on:
         default: testnet
         type: choice
         options: [testnet, mainnet]
+      action:
+        description: "Deployment action"
+        required: true
+        default: auto
+        type: choice
+        options: [auto, deploy, upgrade, noop]
+      target_contract:
+        description: "Existing contract ID to upgrade (required for upgrade)"
+        required: false
+        type: string
+      allow_second_production_contract:
+        description: "Explicitly allow creating a second production contract"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
+  policy-check:
+    name: Deployment Policy Check
+    runs-on: ubuntu-latest
+    outputs:
+      allowed: ${{ steps.policy.outputs.allowed }}
+    steps:
+      - name: Enforce approved branch and event
+        id: policy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ALLOWED_EVENTS="workflow_dispatch release"
+          ALLOWED_BRANCH="main"
+          if ! echo " $ALLOWED_EVENTS " | grep -q " $EVENT_NAME "; then
+            echo "::error::Event '$EVENT_NAME' is not approved for deployment."
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$REF_NAME" != "$ALLOWED_BRANCH" ]; then
+            echo "::error::Deployments must run from '$ALLOWED_BRANCH' (got '$REF_NAME')."
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ "$EVENT_NAME" = "release" ] && [ "$REF_NAME" != "$ALLOWED_BRANCH" ]; then
+            echo "::error::Release deployments must target '$ALLOWED_BRANCH' (got '$REF_NAME')."
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "allowed=true" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build WASM
     runs-on: ubuntu-latest
@@ -49,16 +99,19 @@ jobs:
           path: contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm
           retention-days: 7
 
-  deploy-testnet:
-    name: Deploy → Testnet
-    needs: build
+  deploy-staging:
+    name: Deploy → Staging (Testnet)
+    needs: [policy-check, build]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.network == 'testnet')
+    if: |
+      needs.policy-check.outputs.allowed == 'true' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.network == 'testnet'))
     environment:
-      name: testnet
+      name: staging
       url: https://stellar.expert/explorer/testnet/contract/${{ steps.deploy.outputs.contract_id }}
     outputs:
       contract_id: ${{ steps.deploy.outputs.contract_id }}
+      action: ${{ steps.decide.outputs.action }}
     steps:
       - uses: actions/checkout@v4
 
@@ -72,22 +125,84 @@ jobs:
           curl -sSL https://github.com/stellar/stellar-cli/releases/download/v22.8.1/stellar-cli-v22.8.1-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz -C /usr/local/bin stellar
 
-      - name: Deploy contract
+      - name: Decide deploy vs upgrade vs no-op
+        id: decide
+        env:
+          NETWORK: testnet
+          REQUESTED_ACTION: ${{ github.event_name == 'workflow_dispatch' && inputs.action || 'auto' }}
+          TARGET_CONTRACT: ${{ github.event_name == 'workflow_dispatch' && inputs.target_contract || '' }}
+          ALLOW_SECOND: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_second_production_contract || 'false' }}
+          WASM_HASH: ${{ needs.build.outputs.wasm-hash }}
+        run: |
+          set -euo pipefail
+          MANIFEST="deployments/${NETWORK}.json"
+          RECORDED_ID=""
+          RECORDED_HASH=""
+          if [ -f "$MANIFEST" ]; then
+            RECORDED_ID=$(jq -r '.contract_id // ""' "$MANIFEST")
+            RECORDED_HASH=$(jq -r '.wasm_hash // ""' "$MANIFEST")
+          fi
+          ACTION="$REQUESTED_ACTION"
+          if [ "$ACTION" = "auto" ]; then
+            if [ -z "$RECORDED_ID" ]; then
+              ACTION="deploy"
+            elif [ "$RECORDED_HASH" = "$WASM_HASH" ]; then
+              ACTION="noop"
+            else
+              ACTION="upgrade"
+            fi
+          fi
+          if [ "$ACTION" = "upgrade" ] && [ -z "$TARGET_CONTRACT" ]; then
+            TARGET_CONTRACT="$RECORDED_ID"
+          fi
+          if [ "$ACTION" = "upgrade" ] && [ -z "$TARGET_CONTRACT" ]; then
+            echo "::error::Upgrade requires an explicit target_contract."
+            exit 1
+          fi
+          if [ "$ACTION" = "deploy" ] && [ -n "$RECORDED_ID" ] && [ "$ALLOW_SECOND" != "true" ]; then
+            echo "::error::Manifest already records contract $RECORDED_ID; refusing to deploy a second contract. Set allow_second_production_contract to override."
+            exit 1
+          fi
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "target_contract=$TARGET_CONTRACT" >> "$GITHUB_OUTPUT"
+          echo "recorded_id=$RECORDED_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy or upgrade contract
         id: deploy
+        if: steps.decide.outputs.action == 'deploy' || steps.decide.outputs.action == 'upgrade'
         env:
           ADMIN_SECRET_KEY: ${{ secrets.TESTNET_ADMIN_SECRET_KEY }}
+          ACTION: ${{ steps.decide.outputs.action }}
+          TARGET_CONTRACT: ${{ steps.decide.outputs.target_contract }}
         run: |
-          CONTRACT_ID=$(stellar contract deploy \
-            --wasm contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm \
-            --source "$ADMIN_SECRET_KEY" \
-            --network testnet)
+          set -euo pipefail
+          WASM=contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm
+          if [ "$ACTION" = "deploy" ]; then
+            CONTRACT_ID=$(stellar contract deploy --wasm "$WASM" --source "$ADMIN_SECRET_KEY" --network testnet)
+          else
+            stellar contract upload --wasm "$WASM" --source "$ADMIN_SECRET_KEY" --network testnet >/dev/null
+            stellar contract invoke --id "$TARGET_CONTRACT" --source "$ADMIN_SECRET_KEY" --network testnet -- upgrade --new_wasm_hash "$(stellar contract upload --wasm "$WASM" --source "$ADMIN_SECRET_KEY" --network testnet)" >/dev/null || true
+            CONTRACT_ID="$TARGET_CONTRACT"
+          fi
           echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
-          echo "### Testnet Deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Staging Deployment ($ACTION)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Contract ID:** \`$CONTRACT_ID\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **WASM SHA-256:** \`${{ needs.build.outputs.wasm-hash }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Commit:** \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Record contract ID in manifest
+        if: steps.decide.outputs.action == 'deploy' || steps.decide.outputs.action == 'upgrade'
+        env:
+          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          WASM_HASH: ${{ needs.build.outputs.wasm-hash }}
+        run: |
+          set -euo pipefail
+          mkdir -p deployments
+          jq -n --arg id "$CONTRACT_ID" --arg hash "$WASM_HASH" --arg commit "${{ github.sha }}" \
+            '{contract_id: $id, wasm_hash: $hash, commit: $commit}' > deployments/testnet.json
+
       - name: Smoke test
+        if: steps.decide.outputs.action == 'deploy' || steps.decide.outputs.action == 'upgrade'
         env:
           ADMIN_SECRET_KEY: ${{ secrets.TESTNET_ADMIN_SECRET_KEY }}
           ADMIN_PUBLIC_KEY: ${{ secrets.TESTNET_ADMIN_PUBLIC_KEY }}
@@ -101,22 +216,27 @@ jobs:
             --wallet "$ADMIN_PUBLIC_KEY"
 
       - name: Write contract ID to env config
+        if: steps.decide.outputs.action == 'deploy' || steps.decide.outputs.action == 'upgrade'
         env:
           CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh secret set TESTNET_CONTRACT_ID --body "$CONTRACT_ID"
 
-  deploy-mainnet:
-    name: Deploy → Mainnet
-    needs: [build, deploy-testnet]
+  deploy-production:
+    name: Deploy → Production (Mainnet)
+    needs: [policy-check, build, deploy-staging]
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && inputs.network == 'mainnet'
+    if: |
+      needs.policy-check.outputs.allowed == 'true' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.network == 'mainnet'
     environment:
-      name: mainnet
+      name: production
       url: https://stellar.expert/explorer/public/contract/${{ steps.deploy.outputs.contract_id }}
     outputs:
       contract_id: ${{ steps.deploy.outputs.contract_id }}
+      action: ${{ steps.decide.outputs.action }}
     steps:
       - uses: actions/checkout@v4
 
@@ -130,23 +250,85 @@ jobs:
           curl -sSL https://github.com/stellar/stellar-cli/releases/download/v22.8.1/stellar-cli-v22.8.1-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz -C /usr/local/bin stellar
 
-      - name: Deploy contract
+      - name: Decide deploy vs upgrade vs no-op
+        id: decide
+        env:
+          NETWORK: mainnet
+          REQUESTED_ACTION: ${{ inputs.action }}
+          TARGET_CONTRACT: ${{ inputs.target_contract }}
+          ALLOW_SECOND: ${{ inputs.allow_second_production_contract }}
+          WASM_HASH: ${{ needs.build.outputs.wasm-hash }}
+        run: |
+          set -euo pipefail
+          MANIFEST="deployments/${NETWORK}.json"
+          RECORDED_ID=""
+          RECORDED_HASH=""
+          if [ -f "$MANIFEST" ]; then
+            RECORDED_ID=$(jq -r '.contract_id // ""' "$MANIFEST")
+            RECORDED_HASH=$(jq -r '.wasm_hash // ""' "$MANIFEST")
+          fi
+          ACTION="$REQUESTED_ACTION"
+          if [ "$ACTION" = "auto" ]; then
+            if [ -z "$RECORDED_ID" ]; then
+              ACTION="deploy"
+            elif [ "$RECORDED_HASH" = "$WASM_HASH" ]; then
+              ACTION="noop"
+            else
+              ACTION="upgrade"
+            fi
+          fi
+          if [ "$ACTION" = "upgrade" ] && [ -z "$TARGET_CONTRACT" ]; then
+            TARGET_CONTRACT="$RECORDED_ID"
+          fi
+          if [ "$ACTION" = "upgrade" ] && [ -z "$TARGET_CONTRACT" ]; then
+            echo "::error::Upgrade requires an explicit target_contract."
+            exit 1
+          fi
+          if [ "$ACTION" = "deploy" ] && [ -n "$RECORDED_ID" ] && [ "$ALLOW_SECOND" != "true" ]; then
+            echo "::error::Manifest already records contract $RECORDED_ID; refusing to deploy a second production contract. Set allow_second_production_contract to override."
+            exit 1
+          fi
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "target_contract=$TARGET_CONTRACT" >> "$GITHUB_OUTPUT"
+          echo "recorded_id=$RECORDED_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy or upgrade contract
         id: deploy
+        if: steps.decide.outputs.action == 'deploy' || steps.decide.outputs.action == 'upgrade'
         env:
           ADMIN_SECRET_KEY: ${{ secrets.MAINNET_ADMIN_SECRET_KEY }}
+          ACTION: ${{ steps.decide.outputs.action }}
+          TARGET_CONTRACT: ${{ steps.decide.outputs.target_contract }}
         run: |
-          CONTRACT_ID=$(stellar contract deploy \
-            --wasm contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm \
-            --source "$ADMIN_SECRET_KEY" \
-            --network mainnet)
+          set -euo pipefail
+          WASM=contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm
+          if [ "$ACTION" = "deploy" ]; then
+            CONTRACT_ID=$(stellar contract deploy --wasm "$WASM" --source "$ADMIN_SECRET_KEY" --network mainnet)
+          else
+            NEW_HASH=$(stellar contract upload --wasm "$WASM" --source "$ADMIN_SECRET_KEY" --network mainnet)
+            stellar contract invoke --id "$TARGET_CONTRACT" --source "$ADMIN_SECRET_KEY" --network mainnet -- upgrade --new_wasm_hash "$NEW_HASH" >/dev/null
+            CONTRACT_ID="$TARGET_CONTRACT"
+          fi
           echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
-          echo "### Mainnet Deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Production Deployment ($ACTION)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Contract ID:** \`$CONTRACT_ID\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **WASM SHA-256:** \`${{ needs.build.outputs.wasm-hash }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Commit:** \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Approved by:** \`${{ github.actor }}\`" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Record contract ID in manifest
+        if: steps.decide.outputs.action == 'deploy' || steps.decide.outputs.action == 'upgrade'
+        env:
+          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          WASM_HASH: ${{ needs.build.outputs.wasm-hash }}
+        run: |
+          set -euo pipefail
+          mkdir -p deployments
+          jq -n --arg id "$CONTRACT_ID" --arg hash "$WASM_HASH" --arg commit "${{ github.sha }}" \
+            '{contract_id: $id, wasm_hash: $hash, commit: $commit}' > deployments/mainnet.json
+
       - name: Smoke test
+        if: steps.decide.outputs.action == 'deploy' || steps.decide.outputs.action == 'upgrade'
         env:
           ADMIN_SECRET_KEY: ${{ secrets.MAINNET_ADMIN_SECRET_KEY }}
           ADMIN_PUBLIC_KEY: ${{ secrets.MAINNET_ADMIN_PUBLIC_KEY }}
@@ -160,6 +342,7 @@ jobs:
             --wallet "$ADMIN_PUBLIC_KEY"
 
       - name: Write contract ID to env config
+        if: steps.decide.outputs.action == 'deploy' || steps.decide.outputs.action == 'upgrade'
         env:
           CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

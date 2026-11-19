@@ -50,6 +50,27 @@ terraform plan \
 terraform apply
 ```
 
+## CI: format, validate, and plan review
+
+Terraform changes are checked in CI before any deployment:
+
+1. **Format** — `terraform fmt -check -recursive` runs over `infra/` and fails on
+   any unformatted file.
+2. **Validate** — `terraform init -backend=false` followed by `terraform validate`
+   runs for every module (`modules/vpc`, `modules/ecs`, `modules/secrets`) and
+   every environment (`envs/staging`, `envs/production`).
+3. **Plan** — a `terraform plan` is generated for each environment and posted to
+   the pull request as a reviewable artifact.
+
+Plans run with **isolated, read-only credentials** (a dedicated CI IAM role with
+no apply permissions) so a plan can never mutate infrastructure. The plan job
+does not have access to the deployment role.
+
+**Apply requires manual approval.** The apply job is gated behind a protected
+GitHub Environment (`staging` / `production`) with required reviewers; it only
+runs after a reviewer approves the plan, and it uses the separate deployment
+role. Production additionally requires approval from a second reviewer.
+
 ## Secrets
 
 After `terraform apply`, populate secrets in AWS Secrets Manager:

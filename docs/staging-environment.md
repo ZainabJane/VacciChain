@@ -209,6 +209,28 @@ VacciChain maintains a production-equivalent staging environment for testing bef
 - **URL:** https://staging.vaccichain.example.com
 - **Infrastructure:** AWS ECS Fargate (same as production)
 - **Secrets:** AWS Secrets Manager (same as production)
+- **GitHub Environment:** `staging`
+
+## Environment Isolation
+
+Staging is bound to the GitHub environment `staging`. This environment has its own
+scoped secrets and variables; it does **not** inherit any production secrets.
+
+- All staging workflows must declare `environment: staging` so they resolve
+  staging-scoped secrets (e.g. `AWS_ROLE_ARN`, `STELLAR_NETWORK_PASSPHRASE`,
+  `ISSUER_SECRET_KEY`) from the `staging` environment only.
+- Production secrets live in the separate `production` environment and are never
+  exposed to staging jobs.
+- Staging is configured with the Stellar **testnet** passphrase
+  (`Test SDF Network ; September 2015`) and testnet RPC/Horizon endpoints. It has
+  no mainnet credentials, no mainnet contract IDs, and no mainnet network
+  passphrase, so a staging deployment cannot reach mainnet resources.
+- Production deploys require a deliberate approval: the `production` environment
+  has required reviewers, and production is deployed only via the separate
+  `deploy.yml` workflow (manual `workflow_dispatch` with `network=mainnet`), never
+  from the staging workflow.
+- Merges to `main` are gated by the `ci-required` aggregate status check, which
+  passes only when all required CI jobs succeed.
 
 ## Architecture
 
@@ -244,19 +266,24 @@ VacciChain maintains a production-equivalent staging environment for testing bef
 
 1. Code is pushed to `main` branch
 2. CI tests run (contract, backend, python, docker)
-3. On success, `deploy-staging.yml` workflow triggers
-4. Docker images are built and pushed to ECR
-5. ECS task definition is updated
-6. New containers are deployed to staging cluster
-7. Smoke tests verify deployment
-8. Deployment summary posted to GitHub
+3. The `ci-required` aggregate check reports success only when every required job passes; branch protection blocks merges until it is green
+4. On success, `deploy-staging.yml` workflow triggers with `environment: staging`
+5. Docker images are built and pushed to ECR
+6. ECS task definition is updated
+7. New containers are deployed to staging cluster
+8. Smoke tests verify deployment
+9. Deployment summary posted to GitHub
 
 ### Manual Deployment
 
 ```bash
-# Trigger deployment manually
+# Trigger deployment manually (staging environment only)
 gh workflow run deploy-staging.yml
 ```
+
+Staging deployments always run against the `staging` GitHub environment and can
+only target testnet resources. They cannot be promoted to production from this
+workflow.
 
 ## Testing in Staging
 
@@ -371,13 +398,24 @@ aws logs tail /ecs/vaccichain-staging --follow --since 10m
 
 ## Promoting to Production
 
+Staging and production are deliberately separated. A staging deployment never
+reaches mainnet resources, and production requires explicit approval.
+
 When staging is verified and ready:
 
 1. Update `CHANGELOG.md` with release notes for the new version.
 2. Create a release tag: `git tag v1.0.0`
 3. Push tag: `git push origin v1.0.0`
-4. Trigger production deployment: `gh workflow run deploy.yml -f network=mainnet`
-5. Monitor production deployment
+4. Trigger the separate production workflow: `gh workflow run deploy.yml -f network=mainnet`
+5. A required reviewer must approve the run in the `production` GitHub environment before any deployment step executes
+6. Monitor production deployment
+
+Production deploys are blocked unless all of the following hold:
+
+- The workflow is `deploy.yml` (the staging workflow cannot deploy to production)
+- The run is a deliberate `workflow_dispatch` on an approved branch (or an approved release tag) — pushes and pull request events are rejected
+- The `production` environment approval has been granted by a required reviewer
+- The `ci-required` aggregate check passed for the commit being deployed
 
 ## Cost Optimization
 
