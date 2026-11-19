@@ -19,12 +19,17 @@ All items must be ✅ before sending the contract to an external auditor.
 
 - [ ] Contract compiles cleanly (`cargo clippy` zero errors, zero warnings)
 - [ ] `cargo audit` run — no unresolved CVEs in dependencies
+- [ ] Declared toolchain matches `docs/security/toolchain-policy.md` and CI toolchain check passes
+- [ ] All dependency upgrades since last audit followed the upgrade review procedure
+      (tests, resource comparison, release notes)
 - [ ] Issuer storage key inconsistency fixed (F-02, F-03 in pre-audit notes)
 - [ ] Token ID scheme finalized — deterministic hash or counter, not both
 - [ ] `batch_verify` and record-limit panics replaced with `ContractError` returns
 - [ ] Persistent storage TTL policy implemented (`extend_ttl` on all persistent writes)
 - [ ] All existing tests pass
 - [ ] Test coverage added for issuer round-trip, batch oversized input, record limit error
+- [ ] Tests prove unauthorized issuance is rejected and public verification omits prohibited fields
+- [ ] Consent/allowlist state transitions documented for absent, granted, revoked, and changed consent
 - [ ] `contract-summary.md` reviewed and up to date
 - [ ] Testnet deployment of the fixed contract available for auditor reference
 
@@ -47,10 +52,19 @@ wallets. Any third party can verify vaccination status on-chain.
 **Lines of code:** ~500 (excluding tests)  
 **Source files:** 5 (`lib.rs`, `mint.rs`, `verify.rs`, `storage.rs`, `events.rs`)
 
+**Toolchain and dependency policy:** Supported Rust, Soroban SDK, and Stellar CLI versions,
+plus the dependency-upgrade review procedure, are defined in
+`docs/security/toolchain-policy.md`. CI verifies the declared toolchain and runs dependency
+advisory checks (`cargo audit`) on every change. Any dependency upgrade must pass the full
+test suite, include a resource-usage comparison (CPU instructions and memory) against the
+previous version, and update release notes before merge.
+
 Supporting documentation provided to auditor:
 - `docs/security/contract-summary.md` — architecture, data model, access control
 - `docs/security/pre-audit-notes.md` — internal findings (all resolved before engagement)
 - `docs/security/threat-model.md` — full system threat model
+- `docs/security/toolchain-policy.md` — supported toolchain versions and upgrade review procedure
+- `docs/contracts/consent-allowlist.md` — consent and allowlist semantics at the contract/API boundary
 
 ### Audit Objectives
 
@@ -65,6 +79,11 @@ Supporting documentation provided to auditor:
 9. Verify that persistent storage TTL is managed correctly to prevent record eviction.
 10. Verify that on-chain events are emitted correctly and completely for all state changes.
 11. Identify any Soroban-specific vulnerabilities (host function misuse, auth model gaps).
+12. Verify that consent and allowlist semantics are enforced correctly for issuance and
+    verification across all consent states (absent, granted, revoked, changed), and that
+    unauthorized issuance is rejected.
+13. Verify that public verification paths do not reveal prohibited fields, and that no
+    documentation or API behavior implies that public-chain data is private.
 
 ### Out of Scope
 
@@ -110,6 +129,7 @@ Supporting documentation provided to auditor:
 | Engagement period | |
 | Contract commit hash | |
 | Soroban SDK version | |
+| Rust / Stellar CLI version | |
 | Report version | |
 
 ---

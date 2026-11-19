@@ -15,7 +15,51 @@ updates:
     schedule:
       interval: "weekly"
 
+  # Contracts Cargo ecosystem.
+  # Dependency upgrade review policy (see contracts/DEPENDENCY_POLICY.md):
+  #  - Upgrades require passing tests, a resource comparison, and release-note updates.
+  #  - Soroban SDK and toolchain bumps are never auto-merged; they are grouped and
+  #    reviewed manually alongside the CI advisory checks (cargo-audit / cargo-deny).
   - package-ecosystem: "cargo"
     directory: "/contracts"
     schedule:
       interval: "daily"
+    open-pull-requests-limit: 10
+    labels:
+      - "contracts"
+      - "dependencies"
+    commit-message:
+      prefix: "chore(contracts)"
+      include: "scope"
+    groups:
+      # Group routine, low-risk dependency updates into a single PR.
+      contracts-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      # Soroban SDK and related toolchain crates are grouped separately so they
+      # are always reviewed as a unit and never auto-merged.
+      soroban-sdk:
+        patterns:
+          - "soroban-sdk"
+          - "soroban-env-*"
+          - "soroban-spec*"
+          - "stellar-*"
+        update-types:
+          - "major"
+          - "minor"
+          - "patch"
+    ignore:
+      # Pin the Soroban SDK major line; major upgrades require a dedicated
+      # migration PR with tests, resource comparison, and release notes.
+      - dependency-name: "soroban-sdk"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "soroban-env-host"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "soroban-env-common"
+        update-types:
+          - "version-update:semver-major"

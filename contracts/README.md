@@ -192,6 +192,35 @@ Transfer function that always panics to enforce soulbound nature.
 
 **Behavior:** Always panics with "soulbound: transfers are disabled"
 
+### Function Compatibility Contract
+
+The following guarantees apply to callers and are derived from `contracts/src`:
+
+- **Function names and argument order are stable.** New optional behavior must be added via new functions or new error codes, never by reordering existing arguments.
+- **Error codes are stable integers** (see [Error Codes](#error-codes)). Callers must branch on the numeric code, not the variant name, and must treat unknown codes as a generic failure.
+- **Authorization is part of the contract surface.** Changing which address must sign a function is a breaking change and requires a version bump plus release notes.
+- **Version-specific behavior** is recorded in the table below. `schema_version` on `VaccinationRecord` identifies the record layout; readers must tolerate records with a higher `schema_version` by ignoring unknown fields.
+
+| Contract version | Behavior notes |
+|------------------|----------------|
+| v1 (current) | `mint_vaccination` requires the patient to be allowlisted (`PatientNotRegistered` otherwise). `verify_vaccination` returns only non-revoked records. `transfer` always panics. |
+
+### Backend Error Mapping
+
+Backend API layers must map contract errors to stable HTTP responses. The mapping is verified by tests in the backend test suite.
+
+| Contract error | API status | Stable API code |
+|----------------|-----------|-----------------|
+| `Unauthorized` (3) | 403 | `FORBIDDEN` |
+| `RecordNotFound` (7) | 404 | `NOT_FOUND` |
+| `DuplicateRecord` (6) | 409 | `CONFLICT` |
+| `AlreadyRevoked` (8) | 409 | `CONFLICT` |
+| `InvalidInput*` (9–14) | 400 | `INVALID_INPUT` |
+| `PatientNotRegistered` (16) | 403 | `CONSENT_REQUIRED` |
+| `NotInitialized` (2), `AlreadyInitialized` (1) | 500 | `CONTRACT_STATE` |
+| Unknown code | 502 | `UPSTREAM_ERROR` |
+=======
+
 ## Storage Schema
 
 ### Data Structures
@@ -286,11 +315,66 @@ All string inputs are validated at the contract boundary with a maximum length o
 
 This prevents excessively long strings from being stored on ledger state and keeps ledger fees bounded.
 
+## Consent and Allowlist Semantics
+
+Patient allowlisting and consent gate **issuance**, not verification visibility. All data written to the contract is public on the Stellar ledger; allowlisting and consent must never be described as making on-chain data private.
+
+### State Transitions
+
+| State | Meaning | Effect on `mint_vaccination` | Effect on `verify_vaccination` |
+|-------|---------|------------------------------|-------------------------------|
+| **Absent** | Patient has not self-registered | Rejected with `PatientNotRegistered` (16) | Returns `(false, [])` |
+| **Granted** | Patient is allowlisted and has consented | Allowed for authorized issuers | Returns `(true, records)` for non-revoked records |
+| **Revoked** | Patient withdrew consent / was de-allowlisted | Rejected with `PatientNotRegistered` (16) | Existing records remain on-chain and are still returned; no new records can be minted |
+| **Changed** | Consent scope or issuer changed | New mints use the new scope; previously minted records are unchanged | Unchanged; records are immutable except for revocation |
+
+### Privacy Boundary
+
+- **On-chain data is public.** Vaccine name, date, issuer, patient address, and timestamps are readable by anyone querying the ledger.
+- **Off-chain data must not be placed on-chain.** No PII beyond the fields defined in `VaccinationRecord` may be stored.
+- **Verification responses** must not include fields beyond those in `VaccinationRecord`; the backend must not enrich verification responses with prohibited fields (e.g., national ID, contact details).
+- **Revocation does not delete data.** Revoked records remain queryable for audit; callers must treat `revoked: true` as "not currently valid" rather than "not present".
+
+### Required Tests
+
+- An issuance attempt for a patient in the **Absent** or **Revoked** state is rejected with `PatientNotRegistered`.
+- Public verification of a granted patient returns only the documented `VaccinationRecord` fields and no prohibited fields.
+- Revoking consent blocks new mints but leaves existing records verifiable.
+
+## Toolchain and Dependency Policy
+
+### Supported Versions
+
+The supported toolchain is pinned in `rust-toolchain.toml` and `Cargo.toml`; CI fails if the declared versions drift.
+
+| Component | Supported version | Source of truth |
+|-----------|-------------------|-----------------|
+| Rust | Pinned stable (see `rust-toolchain.toml`) | `rust-toolchain.toml` |
+| `wasm32-unknown-unknown` target | Required | `rust-toolchain.toml` |
+| `soroban-sdk` | Pinned in `Cargo.toml` | `Cargo.toml` |
+| Soroban CLI | Version matching the pinned SDK | `Makefile` / CI config |
+
+### CI Enforcement
+
+- CI verifies the declared toolchain by building with the pinned Rust version and target.
+- CI runs `cargo audit` (or equivalent advisory check) and fails on known advisories in contract dependencies.
+- CI builds the WASM artifact and records its hash for comparison against deployed artifacts.
+
+### Dependency Upgrade Procedure
+
+Any upgrade of Rust, `soroban-sdk`, or the Soroban CLI must:
+
+1. Open a dedicated PR that changes only the toolchain/dependency versions.
+2. Pass the full contract test suite (`make test`).
+3. Include a **resource comparison**: report CPU instructions and ledger read/write bytes for the standard mint/verify flows before and after the upgrade.
+4. Update release notes describing the version change and any behavioral impact.
+5. Be reviewed by at least one maintainer familiar with the contract.
+
 ## Build & Test Instructions
 
 ### Prerequisites
-- Rust toolchain with `wasm32-unknown-unknown` target
-- Soroban CLI tools
+- Rust toolchain with `wasm32-unknown-unknown` target (pinned version)
+- Soroban CLI tools (version matching the pinned SDK)
 
 ### Building the Contract
 
@@ -330,11 +414,27 @@ The contract includes comprehensive tests covering:
 
 ## Deployment Guide
 
+### Network Selection and Validation
+
+Deployment **requires an explicit network**. There is no default network; the deploy command must fail if the network is not specified.
+
+```bash
+# The network is mandatory and must be one of: local, testnet, mainnet
+make deploy NETWORK=testnet
+```
+
+Validation performed before any transaction is submitted:
+
+1. **Explicit network** — `NETWORK` must be set to a known value; unknown or empty values abort the deploy.
+2. **Network-specific configuration** — the RPC URL, network passphrase, and admin key must match the selected network. A mismatch (e.g., testnet passphrase with a mainnet RPC URL) aborts the deploy.
+3. **Contract ID format** — the contract ID must be a valid Stellar contract address (`C...`) for the selected network.
+4. **Artifact hash** — the locally built WASM hash must match the hash recorded for the release being deployed.
+
 ### Local Development
 
 1. Start a local Stellar network (e.g., using Stellar Quickstart)
 2. Build the contract: `make build`
-3. Deploy using Soroban CLI with your local network configuration
+3. Deploy with an explicit network: `make deploy NETWORK=local`
 
 ### Testnet Deployment
 
@@ -342,22 +442,32 @@ The contract includes comprehensive tests covering:
 # Set environment variables
 export ADMIN_SECRET_KEY="your_admin_secret_key"
 
-# Deploy to testnet
-make deploy
+# Deploy to testnet (network is mandatory)
+make deploy NETWORK=testnet
 ```
 
 ### Mainnet Deployment
 
 1. Ensure thorough testing on testnet
-2. Update network configuration to mainnet
+2. Deploy with an explicit network: `make deploy NETWORK=mainnet`
 3. Use production admin keys
 4. Deploy with appropriate resource limits
+
+### Post-Deployment Smoke Tests
+
+Smoke tests confirm the deployed contract belongs to the expected network and artifact:
+
+1. **Network check** — query the contract ID on the expected network and confirm it exists; confirm the same ID is absent on other networks.
+2. **Artifact hash check** — fetch the deployed WASM and confirm its hash matches the locally built artifact hash.
+3. **Initialization check** — confirm `initialize` has been called and the admin matches the expected address.
+4. **Functional check** — mint a test record with an authorized issuer and verify it via `verify_vaccination`.
+5. **Negative check** — confirm an unauthorized address cannot mint (`Unauthorized`).
 
 ### Post-Deployment Steps
 
 1. Initialize the contract with `initialize(admin_address)`
 2. Add authorized issuers using `add_issuer()`
-3. Test basic functionality with a test vaccination record
+3. Run the smoke tests above
 4. Set up monitoring for contract events
 
 ## Security Considerations

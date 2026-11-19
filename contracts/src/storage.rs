@@ -134,8 +134,46 @@ pub enum DataKey {
     /// Token IDs owned by a patient wallet.
     PatientTokens(Address),
     /// Patient allowlist flag for self-registration.
+    ///
+    /// # Consent / allowlist semantics
+    ///
+    /// This key holds the patient's explicit consent to participate in the
+    /// registry (i.e. to be allowlisted for self-registration and for
+    /// issuance of vaccination records to their wallet). It is *not* a
+    /// privacy guarantee: any data written to the public chain is public.
+    /// Consent only gates whether the contract will accept issuance for the
+    /// patient; it never makes on-chain data confidential.
+    ///
+    /// State transitions (keyed by patient `Address`):
+    ///
+    /// * **Absent** (no entry stored): consent has never been granted.
+    ///   Issuance to this patient MUST be rejected by the contract/API
+    ///   boundary (unauthorized issuance). Verification of any pre-existing
+    ///   token is unaffected, but no new token may be minted.
+    ///
+    /// * **Granted** (`true`): the patient has explicitly consented.
+    ///   Issuance is permitted (subject to issuer authorization and other
+    ///   checks). Public verification remains limited to non-prohibited
+    ///   fields; consent does not widen what verification reveals.
+    ///
+    /// * **Revoked** (`false`, entry retained): the patient has withdrawn
+    ///   consent. New issuance MUST be rejected. Already-minted tokens are
+    ///   not deleted (on-chain history is immutable); callers should rely on
+    ///   the separate `Revoked(token_id)` marker to invalidate records.
+    ///
+    /// * **Changed** (transition between `true` and `false`): each change is
+    ///   an explicit state transition. Re-granting after revocation restores
+    ///   issuance eligibility; revoking after grant blocks it. The contract
+    ///   records only the current boolean, so the API boundary must treat
+    ///   every write as authoritative for subsequent issuance decisions.
     PatientAllowlist(Address),
     /// Configurable per-patient record limit.
+    ///
+    /// Caps how many vaccination records a single patient may hold. This is
+    /// an operational limit, independent of consent: it applies only when
+    /// `PatientAllowlist(patient)` is `true`. When consent is absent or
+    /// revoked, issuance is rejected regardless of this limit. If unset,
+    /// implementations should fall back to a documented default.
     PatientRecordLimit,
     /// Stored vaccination record by token ID.
     Token(u64),

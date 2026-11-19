@@ -13,6 +13,33 @@ const router = express.Router();
 const verifyCache = new Map();
 const CACHE_TTL = 60 * 1000; // 60 seconds
 
+// Fields that must never be exposed by the public verification endpoint.
+// Public-chain data is not private, so we explicitly allowlist what is returned.
+const PUBLIC_RECORD_FIELDS = ['vaccine', 'date', 'verified'];
+
+/**
+ * Shape a record for the public endpoint, keeping only allowlisted fields.
+ * Any prohibited/private field is dropped.
+ */
+function toPublicRecord(record) {
+  if (!record || typeof record !== 'object') return {};
+  const shaped = {};
+  for (const field of PUBLIC_RECORD_FIELDS) {
+    if (record[field] !== undefined) {
+      shaped[field] = record[field];
+    }
+  }
+  return shaped;
+}
+
+/**
+ * Shape a list of records for the public endpoint.
+ */
+function toPublicRecords(records) {
+  if (!Array.isArray(records)) return [];
+  return records.map(toPublicRecord);
+}
+
 /**
  * Try JWT first; if no Authorization header, fall through to API key auth.
  * One of the two must succeed — otherwise 401.
@@ -42,6 +69,18 @@ function adaptiveLimiter(req, res, next) {
  *       Public endpoint for checking vaccination status. Used by verification pages
  *       and third-party integrators. No authentication required.
  *       Results are cached for 60 seconds to reduce RPC load.
+ *
+ *       Consent & allowlist semantics:
+ *       - Consent absent: no record is issued; verification reports verified=false.
+ *       - Consent granted: record is issued and publicly verifiable.
+ *       - Consent revoked: previously issued records are no longer verifiable;
+ *         verification reports verified=false.
+ *       - Consent changed: the latest consent state governs verification.
+ *
+ *       Privacy note: on-chain data is public. This endpoint therefore returns
+ *       only a minimal, allowlisted projection (wallet, verified, and a redacted
+ *       record summary). Prohibited/private fields (e.g. patient identifiers,
+ *       provider notes, raw consent metadata) are never returned here.
  *     tags:
  *       - Verification
  *     parameters:
@@ -53,7 +92,7 @@ function adaptiveLimiter(req, res, next) {
  *         description: Stellar wallet address to verify
  *     responses:
  *       200:
- *         description: Vaccination status retrieved
+ *         description: Vaccination status retrieved (redacted public projection)
  *         content:
  *           application/json:
  *             schema:
@@ -63,11 +102,19 @@ function adaptiveLimiter(req, res, next) {
  *                   type: string
  *                 verified:
  *                   type: boolean
- *                   description: Whether the wallet has vaccination records
+ *                   description: Whether the wallet has verifiable vaccination records
  *                 records:
  *                   type: array
+ *                   description: Redacted record summaries (no prohibited fields)
  *                   items:
- *                     $ref: '#/components/schemas/VaccinationRecord'
+ *                     type: object
+ *                     properties:
+ *                       vaccine:
+ *                         type: string
+ *                       date:
+ *                         type: string
+ *                       verified:
+ *                         type: boolean
  *       400:
  *         description: Invalid wallet format
  *       429:
@@ -96,7 +143,7 @@ router.get(
       return res.json({
         wallet,
         verified: cached.vaccinated,
-        records: cached.records
+        records: toPublicRecords(cached.records)
       });
     }
 
@@ -117,7 +164,7 @@ router.get(
         meta: { ip },
       });
 
-      res.json({ wallet, verified: vaccinated, records });
+      res.json({ wallet, verified: vaccinated, records: toPublicRecords(records) });
     } catch (err) {
       const errorMessage = resolveContractErrorMessage(err);
       audit({ actor: ip, action: 'verify.public_lookup', target: wallet, result: 'failure', meta: { error: errorMessage, ip } });
@@ -242,4 +289,6 @@ router.get(
 );
 
 router.verifyCache = verifyCache;
+router.toPublicRecord = toPublicRecord;
+router.toPublicRecords = toPublicRecords;
 module.exports = router;

@@ -98,6 +98,83 @@ describe('POST /v1/vaccination/issue', () => {
     expect(res.status).toBe(409);
     expect(res.body.error).toMatch(/identical|duplicate/i);
   });
+
+  it('rejects issuance when the issuer is not authorized on-chain', async () => {
+    const { isAuthorizedIssuer } = require('../src/stellar/issuerCache');
+    isAuthorizedIssuer.mockResolvedValueOnce(false);
+
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken}`)
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(403);
+    expect(mintVaccination).not.toHaveBeenCalled();
+  });
+
+  it('rejects issuance when the patient has not consented', async () => {
+    const { hasConsented } = require('../src/indexer/db');
+    hasConsented.mockReturnValueOnce(false);
+
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken}`)
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(403);
+    expect(mintVaccination).not.toHaveBeenCalled();
+  });
+
+  it('rejects issuance when the patient is not allowlisted', async () => {
+    const { hasConsented } = require('../src/indexer/db');
+    hasConsented.mockReturnValueOnce(false);
+
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken}`)
+      .send({ ...VALID_BODY, patient_address: PATIENT_WALLET });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toHaveProperty('error');
+    expect(mintVaccination).not.toHaveBeenCalled();
+  });
+
+  it('maps contract Unauthorized error (#3) to a stable 403 response', async () => {
+    mintVaccination.mockRejectedValue(new Error('Error(Contract, #3)'));
+
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken}`)
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(403);
+    expect(res.body).toHaveProperty('error');
+  });
+
+  it('maps contract InvalidInput error (#1) to a stable 400 response', async () => {
+    mintVaccination.mockRejectedValue(new Error('Error(Contract, #1)'));
+
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken}`)
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty('error');
+  });
+
+  it('maps unknown contract errors to a stable 500 response without leaking internals', async () => {
+    mintVaccination.mockRejectedValue(new Error('Error(Contract, #999)'));
+
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken}`)
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty('error');
+    expect(JSON.stringify(res.body)).not.toMatch(/Error\(Contract/);
+  });
 });
 
 describe('GET /v1/vaccination/:wallet', () => {

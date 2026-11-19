@@ -13,11 +13,30 @@ The backend validates its variables at startup via [Zod](https://zod.dev/). A mi
 ## Stellar / Soroban
 
 ### `STELLAR_NETWORK`
-- Required: no
-- Default: `testnet`
+- Required: yes for deployment and contract invocation tooling (`make deploy`, smoke tests); no for the backend runtime (defaults to `testnet`)
+- Default: `testnet` (backend only)
 - Allowed values: `testnet` | `mainnet`
 - Description: Selects the Stellar network. Controls which network passphrase is used when signing transactions. Must match `HORIZON_URL`, `SOROBAN_RPC_URL`, and `STELLAR_NETWORK_PASSPHRASE`.
+- Deployment rule: deployment commands must receive the network **explicitly** (e.g. `make deploy NETWORK=testnet` or `STELLAR_NETWORK=testnet make deploy`). There is no implicit fallback for deployment — omitting the network aborts the command before any transaction is built or signed.
 - Example: `STELLAR_NETWORK=testnet`
+
+#### Network-specific configuration validation
+
+Before deploying or invoking the contract, the tooling validates that every network-scoped variable is consistent with the explicitly selected `STELLAR_NETWORK`. A mismatch aborts the command with a non-zero exit code and no transaction is submitted.
+
+| `STELLAR_NETWORK` | Expected `HORIZON_URL` | Expected `SOROBAN_RPC_URL` | Expected `STELLAR_NETWORK_PASSPHRASE` |
+|---|---|---|---|
+| `testnet` | `https://horizon-testnet.stellar.org` | `https://soroban-testnet.stellar.org` | `Test SDF Network ; September 2015` |
+| `mainnet` | `https://horizon.stellar.org` | `https://mainnet.sorobanrpc.com` | `Public Global Stellar Network ; September 2015` |
+
+Validation performed by the deployment tooling:
+
+1. `STELLAR_NETWORK` is set and is one of the allowed values (no default is applied).
+2. `HORIZON_URL` and `SOROBAN_RPC_URL` are valid HTTPS URLs and match the selected network's expected host.
+3. `STELLAR_NETWORK_PASSPHRASE` exactly matches the selected network's passphrase.
+4. `VACCINATIONS_CONTRACT_ID` is a well-formed contract address (56 characters, starts with `C`) and is recorded against the selected network.
+5. The deployed contract's on-chain network identity (the network passphrase the contract was deployed under) matches the selected network.
+=======
 
 ### `HORIZON_URL`
 - Required: yes
@@ -47,8 +66,14 @@ The backend validates its variables at startup via [Zod](https://zod.dev/). A mi
 ### `VACCINATIONS_CONTRACT_ID`
 - Required: yes
 - Format: 56-character Stellar contract address (starts with `C`)
-- Description: Deployed address of the VacciChain Soroban contract. Obtained from `make deploy` in the `contracts/` directory.
+- Description: Deployed address of the VacciChain Soroban contract. Obtained from `make deploy` in the `contracts/` directory. The ID is network-specific — a contract deployed on `testnet` does not exist on `mainnet`. The tooling rejects a contract ID that does not belong to the explicitly selected `STELLAR_NETWORK`.
 - Example: `VACCINATIONS_CONTRACT_ID=CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA`
+
+### `CONTRACT_ARTIFACT_HASH`
+- Required: yes for deployment and smoke tests
+- Format: 64-character lowercase hex string (SHA-256 of the compiled Wasm artifact)
+- Description: Hash of the Wasm artifact that was deployed. `make deploy` records the hash of the uploaded artifact; smoke tests recompute the hash of the local build and compare it against this value to confirm the deployed contract matches the expected artifact. A mismatch fails the smoke test.
+- Example: `CONTRACT_ARTIFACT_HASH=9f2c1e7b4a6d8c0e5f3b1a2d4c6e8f0a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9d1e`
 
 ---
 
@@ -260,16 +285,36 @@ When an anomaly is detected the service POSTs a JSON payload to `ALERT_WEBHOOK_U
 
 ---
 
+## Deployment and smoke-test requirements
+
+Deployment tooling enforces the following before and after submitting a deployment:
+
+1. **Explicit network** — `STELLAR_NETWORK` must be supplied on the command line or environment; there is no implicit default for deployment commands.
+2. **Network-specific configuration** — `HORIZON_URL`, `SOROBAN_RPC_URL`, and `STELLAR_NETWORK_PASSPHRASE` must match the selected network (see the table above).
+3. **Contract ID ownership** — the smoke test queries the selected network's RPC for the contract instance and confirms `VACCINATIONS_CONTRACT_ID` exists on that network. A contract ID that resolves on a different network fails the check.
+4. **Artifact hash match** — the smoke test recomputes the SHA-256 of the locally built Wasm artifact and compares it with `CONTRACT_ARTIFACT_HASH` (and with the hash recorded at deploy time). Any mismatch fails the smoke test.
+
+Run the smoke test after every deployment:
+
+```bash
+make smoke-test NETWORK=testnet
+```
+
+The smoke test exits non-zero if the contract ID is not found on the expected network or if the artifact hash does not match.
+
+---
+
 ## Validation summary
 
 | Variable | Required | Validated by | Rule |
 |---|---|---|---|
-| `STELLAR_NETWORK` | no | Zod (backend) | enum: `testnet` \| `mainnet` |
+| `STELLAR_NETWORK` | yes (deployment) / no (backend) | Zod (backend) + deploy tooling | enum: `testnet` \| `mainnet`; must be explicit for deployment |
 | `HORIZON_URL` | yes | Zod (backend) | valid URL |
 | `SOROBAN_RPC_URL` | yes | Zod (backend) | valid URL |
 | `SOROBAN_RPC_MAX_RETRIES` | no | Zod (backend) | non-negative integer, default 3 |
 | `STELLAR_NETWORK_PASSPHRASE` | yes | Zod (backend) | non-empty string |
-| `VACCINATIONS_CONTRACT_ID` | yes | Zod (backend) | non-empty string |
+| `VACCINATIONS_CONTRACT_ID` | yes | Zod (backend) + deploy tooling | non-empty string; 56-char contract address; must belong to selected network |
+| `CONTRACT_ARTIFACT_HASH` | yes (deployment) | deploy tooling / smoke test | 64-char hex SHA-256 of deployed Wasm artifact |
 | `ADMIN_SECRET_KEY` | yes | Zod (backend) | non-empty string |
 | `ADMIN_PUBLIC_KEY` | yes | runtime | valid Stellar public key format |
 | `SEP10_SERVER_KEY` | yes | Zod (backend) | non-empty string |

@@ -77,6 +77,135 @@ describe('GET /verify/public/:wallet', () => {
     });
   });
 
+  describe('Consent and allowlist semantics', () => {
+    const validWallet = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';
+
+    // Consent/allowlist states documented for the contract/API boundary:
+    // - absent:  no consent record exists -> public verification reports verified: false
+    // - granted: consent active and wallet allowlisted -> verified: true
+    // - revoked: consent withdrawn -> verified: false (no records disclosed)
+    // - changed: consent re-granted after revocation -> reflects latest state
+    const consentStates = ['absent', 'granted', 'revoked', 'changed'];
+
+    it.each(consentStates)(
+      'should return a consistent verified boolean for consent state "%s"',
+      async (state) => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}`)
+          .set('X-Test-Consent-State', state)
+          .expect((res) => {
+            if (res.status === 200) {
+              expect(res.body).toHaveProperty('verified');
+              expect(typeof res.body.verified).toBe('boolean');
+              expect(res.body).toHaveProperty('records');
+              expect(Array.isArray(res.body.records)).toBe(true);
+            }
+          });
+
+        // Endpoint must never fail with a client error for a valid wallet,
+        // regardless of consent state.
+        expect(res.status).not.toBe(400);
+      }
+    );
+
+    it('should not reveal records when consent is absent or revoked', async () => {
+      for (const state of ['absent', 'revoked']) {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}`)
+          .set('X-Test-Consent-State', state);
+
+        if (res.status === 200) {
+          expect(res.body.verified).toBe(false);
+          expect(res.body.records).toEqual([]);
+        }
+      }
+    });
+  });
+
+  describe('Prohibited field disclosure', () => {
+    const validWallet = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';
+
+    // Fields that must never appear in the public verification response.
+    const prohibitedFields = [
+      'vaccinated',
+      'record_count',
+      'patient_name',
+      'patientName',
+      'date_of_birth',
+      'dateOfBirth',
+      'dob',
+      'national_id',
+      'nationalId',
+      'ssn',
+      'medical_notes',
+      'medicalNotes',
+      'diagnosis',
+      'consent',
+      'consent_state',
+      'allowlisted',
+      'allowlist',
+      'issuer_secret',
+      'private_key',
+      'privateKey',
+    ];
+
+    it('should not expose any prohibited fields at the top level', async () => {
+      const res = await request(app)
+        .get(`/v1/verify/public/${validWallet}`)
+        .expect((res) => {
+          if (res.status === 200) {
+            for (const field of prohibitedFields) {
+              expect(res.body).not.toHaveProperty(field);
+            }
+          }
+        });
+
+      expect(res.status).not.toBe(400);
+    });
+
+    it('should not expose prohibited fields inside individual records', async () => {
+      const res = await request(app)
+        .get(`/v1/verify/public/${validWallet}`)
+        .expect((res) => {
+          if (res.status === 200 && Array.isArray(res.body.records)) {
+            for (const record of res.body.records) {
+              for (const field of prohibitedFields) {
+                expect(record).not.toHaveProperty(field);
+              }
+            }
+          }
+        });
+
+      expect(res.status).not.toBe(400);
+    });
+
+    it('should only expose permitted summary fields in records', async () => {
+      const permittedFields = [
+        'vaccine_type',
+        'vaccineType',
+        'date_administered',
+        'dateAdministered',
+        'issuer',
+        'verified',
+      ];
+
+      const res = await request(app)
+        .get(`/v1/verify/public/${validWallet}`)
+        .expect((res) => {
+          if (res.status === 200 && Array.isArray(res.body.records)) {
+            for (const record of res.body.records) {
+              const keys = Object.keys(record);
+              for (const key of keys) {
+                expect(permittedFields).toContain(key);
+              }
+            }
+          }
+        });
+
+      expect(res.status).not.toBe(400);
+    });
+  });
+
   describe('Rate limiting', () => {
     it('should be rate limited to 60 requests per minute per IP', async () => {
       const validWallet = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';

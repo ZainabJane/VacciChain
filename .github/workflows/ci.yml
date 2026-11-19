@@ -20,6 +20,58 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Verify declared toolchain matches CI
+        working-directory: contracts
+        run: |
+          # The pinned toolchain lives in contracts/rust-toolchain.toml (channel).
+          # CI must install exactly that channel; fail otherwise.
+          if [[ ! -f rust-toolchain.toml ]]; then
+            echo "::error::contracts/rust-toolchain.toml is missing; the supported toolchain must be declared."
+            exit 1
+          fi
+          DECLARED_CHANNEL="$(grep -E '^[[:space:]]*channel[[:space:]]*=' rust-toolchain.toml | head -n1 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')"
+          if [[ -z "${DECLARED_CHANNEL}" ]]; then
+            echo "::error::Could not read 'channel' from contracts/rust-toolchain.toml."
+            exit 1
+          fi
+          ACTIVE_CHANNEL="$(rustc --version | awk '{print $2}')"
+          echo "Declared channel: ${DECLARED_CHANNEL}"
+          echo "Active rustc:     ${ACTIVE_CHANNEL}"
+          if [[ "${ACTIVE_CHANNEL}" != "${DECLARED_CHANNEL}"* ]]; then
+            echo "::error::Installed Rust (${ACTIVE_CHANNEL}) does not match declared toolchain (${DECLARED_CHANNEL})."
+            exit 1
+          fi
+          echo "Toolchain matches the declared channel."
+
+      - name: Verify declared Soroban SDK / CLI versions
+        working-directory: contracts
+        run: |
+          # Supported versions are declared in contracts/TOOLCHAIN.md and must
+          # match what is pinned in Cargo.toml / Cargo.lock.
+          if [[ ! -f TOOLCHAIN.md ]]; then
+            echo "::error::contracts/TOOLCHAIN.md is missing; supported Soroban SDK/CLI versions must be documented."
+            exit 1
+          fi
+          DECLARED_SDK="$(grep -E '^[[:space:]]*[-*]?[[:space:]]*Soroban SDK:' TOOLCHAIN.md | head -n1 | sed -E 's/.*Soroban SDK:[[:space:]]*`?([^`[:space:]]+)`?.*/\1/')"
+          DECLARED_CLI="$(grep -E '^[[:space:]]*[-*]?[[:space:]]*Soroban CLI:' TOOLCHAIN.md | head -n1 | sed -E 's/.*Soroban CLI:[[:space:]]*`?([^`[:space:]]+)`?.*/\1/')"
+          if [[ -z "${DECLARED_SDK}" || -z "${DECLARED_CLI}" ]]; then
+            echo "::error::Could not read 'Soroban SDK:' / 'Soroban CLI:' from contracts/TOOLCHAIN.md."
+            exit 1
+          fi
+          LOCKED_SDK="$(grep -A1 -E '^name = "soroban-sdk"$' Cargo.lock | grep -E '^version' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "Declared Soroban SDK: ${DECLARED_SDK} (locked: ${LOCKED_SDK})"
+          echo "Declared Soroban CLI: ${DECLARED_CLI}"
+          if [[ -z "${LOCKED_SDK}" ]]; then
+            echo "::error::soroban-sdk not found in contracts/Cargo.lock."
+            exit 1
+          fi
+          if [[ "${LOCKED_SDK}" != "${DECLARED_SDK}"* ]]; then
+            echo "::error::Locked soroban-sdk (${LOCKED_SDK}) does not match declared version (${DECLARED_SDK})."
+            exit 1
+          fi
+          echo "Soroban SDK version matches the declared policy."
+=======
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -50,12 +102,18 @@ jobs:
           flags: contracts
           token: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
 
-      - name: Dependency audit
+      - name: Dependency audit (cargo-audit)
         working-directory: contracts
         run: cargo audit | tee audit-report.txt
+
+      - name: Dependency advisories and policy (cargo-deny)
+        working-directory: contracts
+        run: cargo deny --all-features check advisories bans licenses sources | tee -a audit-report.txt
 
       - name: Upload audit report
         if: always()

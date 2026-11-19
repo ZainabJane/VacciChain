@@ -10,6 +10,154 @@ const {
   SOROBAN_RPC_TIMEOUT_MS,
 } = config;
 
+// Canonical network passphrases for the Stellar networks we support.
+const KNOWN_NETWORKS = Object.freeze({
+  public: 'Public Global Stellar Network ; September 2015',
+  testnet: 'Test SDF Network ; September 2015',
+  futurenet: 'Test SDF Future Network ; October 2022',
+  standalone: 'Standalone Network ; February 2017',
+});
+
+// Expected network for this deployment. Must be set explicitly (e.g. STELLAR_NETWORK=testnet)
+// so we never silently deploy or invoke against the wrong network.
+const EXPECTED_NETWORK = (process.env.STELLAR_NETWORK || '').trim().toLowerCase();
+
+// Expected WASM hash of the deployed contract artifact (hex, optional but checked when set).
+const EXPECTED_WASM_HASH = (process.env.VACCINATIONS_CONTRACT_WASM_HASH || '').trim().toLowerCase();
+
+class SorobanNetworkError extends SorobanError {
+  constructor(message, originalError) {
+    super(message, originalError);
+    this.name = 'SorobanNetworkError';
+  }
+}
+
+class SorobanContractIdError extends SorobanError {
+  constructor(message, originalError) {
+    super(message, originalError);
+    this.name = 'SorobanContractIdError';
+  }
+}
+
+/**
+ * Resolve the expected network passphrase from an explicit network name.
+ * Throws if the network is missing or unknown.
+ */
+function resolveNetworkPassphrase(network) {
+  const name = (network || '').trim().toLowerCase();
+  if (!name) {
+    throw new SorobanNetworkError(
+      'Explicit network is required (set STELLAR_NETWORK to one of: ' +
+        Object.keys(KNOWN_NETWORKS).join(', ') + ')'
+    );
+  }
+  const passphrase = KNOWN_NETWORKS[name];
+  if (!passphrase) {
+    throw new SorobanNetworkError(
+      `Unknown network "${name}". Expected one of: ${Object.keys(KNOWN_NETWORKS).join(', ')}`
+    );
+  }
+  return passphrase;
+}
+
+/**
+ * Validate that the configured network passphrase matches the expected network.
+ * @param {string} [network] - Explicit network name (defaults to STELLAR_NETWORK)
+ * @param {string} [passphrase] - Passphrase to validate (defaults to configured passphrase)
+ */
+function validateNetwork(network = EXPECTED_NETWORK, passphrase = NETWORK_PASSPHRASE) {
+  const expectedPassphrase = resolveNetworkPassphrase(network);
+  if (!passphrase) {
+    throw new SorobanNetworkError('STELLAR_NETWORK_PASSPHRASE is not configured');
+  }
+  if (passphrase !== expectedPassphrase) {
+    throw new SorobanNetworkError(
+      `Network passphrase mismatch: configured "${passphrase}" does not match ` +
+        `expected network "${network}" ("${expectedPassphrase}")`
+    );
+  }
+  return { network, passphrase };
+}
+
+/**
+ * Validate that a contract ID is a well-formed Stellar contract (strkey C...) address.
+ * @param {string} [contractId] - Contract ID to validate (defaults to configured contract ID)
+ */
+function validateContractId(contractId = CONTRACT_ID) {
+  if (!contractId) {
+    throw new SorobanContractIdError('VACCINATIONS_CONTRACT_ID is not configured');
+  }
+  let parsed;
+  try {
+    parsed = StellarSdk.Address.fromString(contractId);
+  } catch (error) {
+    throw new SorobanContractIdError(`Invalid contract ID "${contractId}"`, error);
+  }
+  if (parsed.type !== 'contract') {
+    throw new SorobanContractIdError(
+      `Contract ID "${contractId}" is not a contract address (type: ${parsed.type})`
+    );
+  }
+  return contractId;
+}
+
+/**
+ * Validate both network and contract ID configuration. Call before any deployment or invocation.
+ */
+function validateDeploymentConfig() {
+  const network = validateNetwork();
+  const contractId = validateContractId();
+  return { network: network.network, passphrase: network.passphrase, contractId };
+}
+
+/**
+ * Fetch the deployed contract instance and verify it belongs to the expected network
+ * and (optionally) matches the expected WASM hash.
+ * @param {Object} [options]
+ * @param {string} [options.contractId] - Contract ID to verify (defaults to configured)
+ * @param {string} [options.network] - Expected network name (defaults to STELLAR_NETWORK)
+ * @param {string} [options.wasmHash] - Expected WASM hash (defaults to VACCINATIONS_CONTRACT_WASM_HASH)
+ */
+async function verifyDeployedContract(options = {}) {
+  const network = options.network || EXPECTED_NETWORK;
+  const contractId = options.contractId || CONTRACT_ID;
+  const expectedWasmHash = (options.wasmHash || EXPECTED_WASM_HASH || '').toLowerCase();
+
+  // Validate local configuration first so we fail fast on mismatches.
+  validateNetwork(network);
+  validateContractId(contractId);
+
+  const rpc = getRpcServer();
+  const contract = new StellarSdk.Contract(contractId);
+
+  const dummyKeypair = StellarSdk.Keypair.random();
+  const account = new StellarSdk.Account(dummyKeypair.publicKey(), '0');
+  const tx = new StellarSdk.TransactionBuilder(account, {
+    fee: TX_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call('__verify_deployment__'))
+    .setTimeout(30)
+    .build();
+
+  const sim = await withRetry(() => rpc.simulateTransaction(tx), 'verifyDeployedContract');
+  const instance = sim.result?.result?.() ?? sim.result;
+  const wasmHash = instance?.wasmHash ? Buffer.from(instance.wasmHash).toString('hex') : null;
+
+  if (!wasmHash) {
+    throw new SorobanContractIdError(
+      `Unable to read WASM hash for contract "${contractId}" on network "${network}"`
+    );
+  }
+  if (expectedWasmHash && wasmHash !== expectedWasmHash) {
+    throw new SorobanContractIdError(
+      `WASM hash mismatch for contract "${contractId}": deployed ${wasmHash}, expected ${expectedWasmHash}`
+    );
+  }
+
+  return { network, contractId, wasmHash };
+}
+
 class SorobanError extends Error {
   constructor(message, originalError) {
     super(message);
@@ -137,6 +285,8 @@ async function withRetry(fn, context = '') {
  * @param {StellarSdk.xdr.ScVal[]} args - Method arguments
  */
 async function invokeContract(secretKey, method, args) {
+  // Guard against invoking against the wrong network or contract.
+  validateDeploymentConfig();
   const rpc = getRpcServer();
   const keypair = StellarSdk.Keypair.fromSecret(secretKey);
   const account = await withRetry(() => rpc.getAccount(keypair.publicKey()), 'getAccount');
@@ -254,6 +404,8 @@ async function verifyVaccination(wallet) {
  * Read-only contract call (no signing needed).
  */
 async function simulateContract(method, args) {
+  // Guard against simulating against the wrong network or contract.
+  validateDeploymentConfig();
   const rpc = getRpcServer();
   const contract = new StellarSdk.Contract(CONTRACT_ID);
 
@@ -295,11 +447,19 @@ module.exports = {
   addIssuer,
   revokeIssuer,
   sendRpcTimeout,
+  validateNetwork,
+  validateContractId,
+  validateDeploymentConfig,
+  verifyDeployedContract,
+  resolveNetworkPassphrase,
+  KNOWN_NETWORKS,
   SorobanError,
   SorobanRpcError,
   SorobanTransactionError,
   SorobanSimulationError,
   SorobanTimeoutError,
+  SorobanNetworkError,
+  SorobanContractIdError,
 };
 
 /**

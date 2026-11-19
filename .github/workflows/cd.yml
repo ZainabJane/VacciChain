@@ -6,6 +6,16 @@ on:
       - main
     paths:
       - "contracts/**"
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Stellar network to deploy to (explicitly required)"
+        type: choice
+        required: true
+        default: testnet
+        options:
+          - testnet
+          - mainnet
 
 jobs:
   deploy:
@@ -15,6 +25,22 @@ jobs:
         working-directory: contracts
 
     steps:
+      - name: Validate network input
+        run: |
+          NETWORK="${{ github.event.inputs.network }}"
+          if [ -z "$NETWORK" ]; then
+            echo "::error::An explicit network (testnet or mainnet) must be provided."
+            exit 1
+          fi
+          case "$NETWORK" in
+            testnet|mainnet) ;;
+            *)
+              echo "::error::Unsupported network '$NETWORK'. Expected testnet or mainnet."
+              exit 1
+              ;;
+          esac
+          echo "NETWORK=$NETWORK" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - name: Install Rust
@@ -39,16 +65,74 @@ jobs:
       - name: Build WASM
         run: make build
 
-      - name: Deploy to Stellar Testnet
+      - name: Validate network-specific configuration
+        env:
+          ADMIN_SECRET_KEY: ${{ secrets.ADMIN_SECRET_KEY }}
+          TESTNET_RPC_URL: ${{ secrets.TESTNET_RPC_URL }}
+          TESTNET_NETWORK_PASSPHRASE: ${{ secrets.TESTNET_NETWORK_PASSPHRASE }}
+          TESTNET_CONTRACT_ID: ${{ secrets.TESTNET_CONTRACT_ID }}
+          MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+          MAINNET_NETWORK_PASSPHRASE: ${{ secrets.MAINNET_NETWORK_PASSPHRASE }}
+          MAINNET_CONTRACT_ID: ${{ secrets.MAINNET_CONTRACT_ID }}
+        run: |
+          set -euo pipefail
+          NETWORK="$NETWORK"
+          if [ "$NETWORK" = "testnet" ]; then
+            RPC_URL="$TESTNET_RPC_URL"
+            PASSPHRASE="$TESTNET_NETWORK_PASSPHRASE"
+            CONTRACT_ID="$TESTNET_CONTRACT_ID"
+          else
+            RPC_URL="$MAINNET_RPC_URL"
+            PASSPHRASE="$MAINNET_NETWORK_PASSPHRASE"
+            CONTRACT_ID="$MAINNET_CONTRACT_ID"
+          fi
+          if [ -z "$ADMIN_SECRET_KEY" ]; then
+            echo "::error::ADMIN_SECRET_KEY is not configured for $NETWORK."
+            exit 1
+          fi
+          if [ -z "$RPC_URL" ]; then
+            echo "::error::RPC URL is not configured for $NETWORK."
+            exit 1
+          fi
+          if [ -z "$PASSPHRASE" ]; then
+            echo "::error::Network passphrase is not configured for $NETWORK."
+            exit 1
+          fi
+          if [ -z "$CONTRACT_ID" ]; then
+            echo "::error::Contract ID is not configured for $NETWORK."
+            exit 1
+          fi
+          {
+            echo "RPC_URL=$RPC_URL"
+            echo "NETWORK_PASSPHRASE=$PASSPHRASE"
+            echo "EXPECTED_CONTRACT_ID=$CONTRACT_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Deploy to Stellar ${{ github.event.inputs.network }}
         id: deploy
         env:
           ADMIN_SECRET_KEY: ${{ secrets.ADMIN_SECRET_KEY }}
         run: |
-          CONTRACT_ID=$(stellar contract deploy \
-            --wasm target/wasm32-unknown-unknown/release/vaccichain.wasm \
-            --source "$ADMIN_SECRET_KEY" \
-            --network testnet)
+          set -euo pipefail
+          make deploy NETWORK="$NETWORK"
+          CONTRACT_ID=$(cat target/deployed_contract_id.txt)
+          if [ -z "$CONTRACT_ID" ]; then
+            echo "::error::Deployment did not produce a contract ID."
+            exit 1
+          fi
           echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test deployed contract
+        env:
+          ADMIN_SECRET_KEY: ${{ secrets.ADMIN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          make smoke-test \
+            NETWORK="$NETWORK" \
+            CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}" \
+            EXPECTED_CONTRACT_ID="$EXPECTED_CONTRACT_ID" \
+            RPC_URL="$RPC_URL" \
+            NETWORK_PASSPHRASE="$NETWORK_PASSPHRASE"
 
       - name: Store contract ID as secret
         env:
@@ -59,4 +143,4 @@ jobs:
             --repo "${{ github.repository }}"
 
       - name: Print contract ID
-        run: echo "Deployed contract ID ${{ steps.deploy.outputs.contract_id }}"
+        run: echo "Deployed contract ID ${{ steps.deploy.outputs.contract_id }} on $NETWORK"

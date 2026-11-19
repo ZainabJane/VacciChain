@@ -211,7 +211,26 @@ def authenticate(keypair: Keypair) -> str:
 
 ## 3. Error Reference
 
-All errors return JSON with an `error` string field.
+All errors return JSON with an `error` string field. The `error` string is a **stable, machine-readable code** — integrators may branch on it. Human-readable detail, when present, is returned in a separate `message` field and may change without notice; never parse `message`.
+
+### 3.1 Contract error codes
+
+Contract-level failures are mapped by the backend to stable API responses. The mapping below is part of the public contract: a given contract error code always produces the same HTTP status and `error` code.
+
+| Contract error code | HTTP status | `error` code | Cause | Action |
+|---------------------|-------------|--------------|-------|--------|
+| `Unauthorized` | `403` | `unauthorized` | Caller is not the issuer/owner authorized for this operation | Authenticate as the correct issuer |
+| `ConsentRequired` | `403` | `consent_required` | Patient has not granted consent for this operation | Request consent from the patient |
+| `ConsentRevoked` | `403` | `consent_revoked` | Patient revoked consent; operation no longer permitted | Stop issuing/reading; re-request consent |
+| `NotAllowlisted` | `403` | `not_allowlisted` | Issuer is not on the patient's allowlist | Patient must allowlist the issuer |
+| `AlreadyIssued` | `409` | `already_issued` | A record for this vaccine/date already exists | Treat as idempotent success or surface to user |
+| `NotFound` | `404` | `not_found` | Referenced record or token does not exist | Verify the identifier |
+| `InvalidArgument` | `400` | `invalid_argument` | Contract argument failed validation | Fix the request payload |
+| `NotInitialized` | `503` | `contract_not_initialized` | Contract not yet initialized on this network | Retry later; contact support if persistent |
+
+> **Compatibility note:** new contract error codes may be added in future versions. Unknown codes are mapped to `500` with `error: "contract_error"` and the raw code in `contract_error_code`. Treat any unrecognized `error` value as a generic failure rather than crashing.
+
+### 3.2 API-level errors
 
 | Status | Error message | Cause | Action |
 |--------|--------------|-------|--------|
@@ -222,6 +241,7 @@ All errors return JSON with an `error` string field.
 | `401` | `Challenge transaction has expired` | More than 5 minutes elapsed since challenge was issued | Restart from Step 1 |
 | `401` | `Client signature missing or invalid` | Transaction was not signed with the correct private key | Re-sign with the matching keypair |
 | `401` | `Invalid server signature` | Transaction was tampered with | Do not modify the XDR before signing |
+| `403` | `unauthorized` / `consent_required` / `consent_revoked` / `not_allowlisted` | See §3.1 | See §3.1 |
 | `429` | `Too many requests` | Rate limit exceeded (10 req/min for `/auth/sep10`, 60 req/min for `/verify`) | Back off and retry after `retryAfter` seconds |
 | `500` | `<message>` | Unexpected server or contract error | Log and retry; contact support if persistent |
 
@@ -287,9 +307,43 @@ Content-Type: application/json
 
 ---
 
-## 5. Security Notes
+## 5. Consent and Allowlist Semantics
+
+Issuance and verification are gated by two independent controls: the patient's **allowlist** (which issuers may issue to them) and the patient's **consent** (whether a given issuer may act on their records). Both are enforced at the contract level and surfaced by the API.
+
+### 5.1 Consent states
+
+| Consent state | Issuance by issuer | Authenticated read | Public `/verify/:wallet` |
+|---------------|--------------------|--------------------|--------------------------|
+| **Absent** (never granted) | Rejected — `403 consent_required` | Rejected — `403 consent_required` | Returns `vaccinated: false` (no records) |
+| **Granted** | Allowed | Allowed | Returns status with permitted fields only |
+| **Revoked** | Rejected — `403 consent_revoked` | Rejected — `403 consent_revoked` | Returns `vaccinated: false` (no records) |
+| **Changed** (re-granted after revoke) | Allowed under the new grant | Allowed under the new grant | Returns status with permitted fields only |
+
+State transitions:
+
+- `absent → granted` when the patient grants consent to an issuer.
+- `granted → revoked` when the patient revokes consent; any in-flight issuance is rejected.
+- `revoked → granted` when the patient re-grants; the new grant supersedes the old one.
+
+### 5.2 Allowlist semantics
+
+- An issuer not on the patient's allowlist receives `403 not_allowlisted` on issuance.
+- Allowlisting is a prerequisite for consent: consent can only be granted to an allowlisted issuer.
+- Removing an issuer from the allowlist behaves like revocation for future operations; previously issued records remain on-chain.
+
+### 5.3 What public verification reveals
+
+Public verification is **not** a privacy guarantee for on-chain data. Records are soulbound and publicly readable on the Stellar ledger. The `/verify/:wallet` endpoint deliberately **omits prohibited fields** — it never returns patient identity data, consent state, allowlist membership, or issuer-private metadata. It returns only the fields documented in §1 (`wallet`, `vaccinated`, `record_count`, and permitted record fields).
+
+Integrators must not assume that the absence of a field in the API response means the underlying data is private on-chain.
+
+---
+
+## 6. Security Notes
 
 - Vaccination records are **soulbound on-chain** — they cannot be transferred or forged at the contract level. A positive `vaccinated: true` response is cryptographically guaranteed.
 - Always verify the wallet address belongs to the person presenting it through your own identity verification process. VacciChain confirms the record exists on-chain; it does not confirm identity.
+- Public-chain data is **not private**: on-chain records are readable by anyone. The API omits prohibited fields, but do not treat on-chain data as confidential.
 - JWTs are scoped by role (`patient` or `issuer`) and expire after 1 hour.
 - SEP-10 nonces are single-use. A replayed challenge will be rejected with `401`.

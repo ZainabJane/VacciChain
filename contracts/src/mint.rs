@@ -48,7 +48,19 @@ pub fn mint_vaccination(
         return Err(ContractError::Unauthorized);
     }
 
-    // Patient must have self-registered to receive vaccination records.
+    // Patient consent / allowlist gate.
+    //
+    // Consent semantics (see contract docs):
+    // * Absent   - no allowlist entry exists: issuance is rejected with
+    //              `PatientNotRegistered`.
+    // * Granted  - allowlist entry is `true`: issuance proceeds.
+    // * Revoked  - allowlist entry is `false`: issuance is rejected with
+    //              `PatientNotRegistered`.
+    // * Changed  - consent is re-evaluated on every call, so a patient that
+    //              revokes and later re-grants consent is honoured immediately.
+    //
+    // Note: allowlisting only gates issuance. It does not make on-chain data
+    // private; verification of an existing record remains public.
     let is_registered: bool = env
         .storage()
         .persistent()

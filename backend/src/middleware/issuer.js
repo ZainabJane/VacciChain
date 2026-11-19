@@ -24,24 +24,36 @@ const logger = require('../logger');
  */
 async function issuerMiddleware(req, res, next) {
   if (req.user?.role !== 'issuer') {
-    return res.status(403).json({ error: 'Issuer role required' });
+    return res.status(403).json({
+      error: 'Issuer role required',
+      code: 'ISSUER_ROLE_REQUIRED',
+    });
   }
 
   const wallet = req.user.wallet || req.user.publicKey;
   if (!wallet) {
-    return res.status(401).json({ error: 'Wallet address missing in token' });
+    return res.status(401).json({
+      error: 'Wallet address missing in token',
+      code: 'ISSUER_WALLET_MISSING',
+    });
   }
 
   try {
     const isAuthorized = await isAuthorizedIssuer(wallet);
     if (!isAuthorized) {
       logger.warn('Unauthorized issuer attempt', { wallet });
-      return res.status(403).json({ error: 'Issuer authorization revoked or not found on-chain' });
+      return res.status(403).json({
+        error: 'Issuer authorization revoked or not found on-chain',
+        code: 'ISSUER_NOT_AUTHORIZED',
+      });
     }
     next();
   } catch (error) {
     logger.error('Error verifying issuer allowlist', { wallet, error: error.message });
-    res.status(500).json({ error: 'Failed to verify issuer authorization' });
+    res.status(500).json({
+      error: 'Failed to verify issuer authorization',
+      code: 'ISSUER_AUTHORIZATION_CHECK_FAILED',
+    });
   }
 }
 

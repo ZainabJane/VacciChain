@@ -18,6 +18,10 @@
   "docker-compose": {
     "enabled": false
   },
+  "cargo": {
+    "enabled": true,
+    "rangeStrategy": "update-lockfile"
+  },
   "packageRules": [
     {
       "description": "Auto-merge Docker digest-only updates",
@@ -45,6 +49,44 @@
       "matchImages": ["nginx"],
       "matchUpdateTypes": ["minor", "major"],
       "automerge": false
+    },
+    {
+      "description": "Soroban SDK updates: never auto-merge; require tests, resource comparison, and release-note updates",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["soroban-sdk", "soroban-spec", "soroban-env-host", "soroban-env-common", "soroban-env-guest"],
+      "automerge": false,
+      "labels": ["contracts", "dependencies", "soroban-sdk"],
+      "prBodyNotes": [
+        "### Soroban SDK upgrade checklist",
+        "- [ ] All contract tests pass (`cargo test`)",
+        "- [ ] Resource usage comparison performed (CPU/memory/fees) and results attached",
+        "- [ ] Release notes updated to document the SDK version change"
+      ]
+    },
+    {
+      "description": "Rust toolchain updates: never auto-merge; require tests, resource comparison, and release-note updates",
+      "matchManagers": ["cargo", "rust-toolchain", "rust-toolchain-toml"],
+      "matchPackageNames": ["rust", "rustc", "rust-toolchain"],
+      "automerge": false,
+      "labels": ["contracts", "dependencies", "rust-toolchain"],
+      "prBodyNotes": [
+        "### Rust toolchain upgrade checklist",
+        "- [ ] All contract tests pass (`cargo test`)",
+        "- [ ] Resource usage comparison performed (CPU/memory/fees) and results attached",
+        "- [ ] Release notes updated to document the toolchain version change"
+      ]
+    },
+    {
+      "description": "Other Cargo dependency updates in contracts: require review, no auto-merge",
+      "matchManagers": ["cargo"],
+      "automerge": false,
+      "labels": ["contracts", "dependencies"],
+      "prBodyNotes": [
+        "### Contract dependency upgrade checklist",
+        "- [ ] All contract tests pass (`cargo test`)",
+        "- [ ] Resource usage comparison performed (CPU/memory/fees) and results attached",
+        "- [ ] Release notes updated to document the dependency change"
+      ]
     }
   ],
   "schedule": [

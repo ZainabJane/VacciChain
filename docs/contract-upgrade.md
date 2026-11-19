@@ -2,6 +2,41 @@
 
 VacciChain uses Soroban's native WASM upgrade mechanism. The contract's storage and address remain unchanged — only the executable code is replaced.
 
+## Supported toolchain policy
+
+The contract is built and tested against the following pinned versions. These are declared in `contracts/rust-toolchain.toml`, `contracts/Cargo.toml`, and the CI workflow; CI fails if the local toolchain does not match.
+
+| Component | Supported version | Declared in |
+|-----------|-------------------|-------------|
+| Rust | pinned stable channel (see `rust-toolchain.toml`) | `contracts/rust-toolchain.toml` |
+| `soroban-sdk` | version pinned in `contracts/Cargo.toml` | `contracts/Cargo.toml` |
+| Stellar CLI (`soroban`) | version pinned in CI workflow | `.github/workflows/` |
+
+CI verifies the declared toolchain on every push and runs `cargo audit` (or equivalent advisory check) against the locked dependency graph. A failing advisory check blocks merge.
+
+### Dependency upgrade procedure
+
+Any change to Rust, `soroban-sdk`, or the Stellar CLI version must go through a dedicated PR that:
+
+1. **Passes all tests** — unit tests, integration tests, and the full contract test suite must be green.
+2. **Compares resources** — record CPU instructions and memory usage for the key entry points (`verify_vaccination`, `mint`, `upgrade`) before and after the bump, and include the comparison in the PR description. Significant regressions must be justified.
+3. **Updates release notes** — add an entry to `CHANGELOG.md` describing the version change and any behavioral impact.
+4. **Updates this document** — keep the toolchain table above in sync with the pinned versions.
+
+Dependency upgrades are reviewed by at least one maintainer with contracts experience before merge.
+
+## Version-specific behavior and compatibility
+
+The contract exposes a stable public interface. Callers can rely on the following guarantees across upgrades:
+
+- **Function signatures** — public method names and argument types are treated as stable. Removing or renaming a public method, or changing an argument's type, is a breaking change and requires a major version bump plus a migration note in the release notes.
+- **Authorization** — the auth model (admin-gated `upgrade`, issuer-gated `mint`, public `verify_vaccination`) is part of the contract's contract. Changes to who may call a method are breaking changes.
+- **Error codes** — error variants are stable identifiers. New variants may be added, but existing variants must not be renumbered or repurposed. The backend maps each contract error to a stable API response; see the backend mapping tests for the authoritative mapping.
+- **Storage layout** — existing storage keys and value shapes are preserved across upgrades. Any layout change must include a migration path documented in the release notes.
+- **Events** — event topics and payload fields are additive-only; existing fields are not removed or reordered.
+
+Behavior that differs between contract versions is documented in `CHANGELOG.md` under the corresponding version heading.
+
 ## How it works
 
 The `upgrade(new_wasm_hash)` function:
@@ -81,3 +116,6 @@ Replace the RPC URL and network passphrase:
 - [ ] Admin key used from a hardware wallet or secure key management system
 - [ ] `upgraded` event confirmed on-chain after execution
 - [ ] Existing records spot-checked via `verify_vaccination` post-upgrade
+- [ ] Toolchain versions in the table above match the pinned files
+- [ ] Resource (CPU/memory) comparison recorded in the PR
+- [ ] Release notes updated in `CHANGELOG.md`

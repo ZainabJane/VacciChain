@@ -162,8 +162,8 @@ This endpoint is rate-limited to 60 requests per IP per minute on staging (same 
 | **Rate limits are enforced** | SEP-10 challenge requests are capped at 10 per IP per minute. If you hit this limit during automated testing, wait 60 seconds or use a different IP. |
 | **No SLA** | Staging has no uptime guarantee. It may be unavailable during deployments or maintenance. |
 | **Audit log is ephemeral** | The audit log is wiped on each weekly reset. Do not rely on it for long-running test evidence. |
-| **Contract ID changes weekly** | After each reset the contract is redeployed to a new address. Any hardcoded contract IDs in test scripts must be updated after a reset. |
-| **No mainnet passphrase** | The staging network passphrase is `Test SDF Network ; September 2015`. Transactions signed with the mainnet passphrase will be rejected. |
+| **Contract ID changes weekly** | After each reset the contract is redeployed to a new address. Any hardcoded contract IDs in test scripts must be updated after a reset. The post-deploy smoke test compares the deployed contract ID and artifact hash against the expected values for the current deployment and fails on a mismatch. |
+| **No mainnet passphrase** | The staging network passphrase is `Test SDF Network ; September 2015`. Transactions signed with the mainnet passphrase will be rejected. Deployments require an explicit `network=testnet` and the smoke test verifies the passphrase, contract ID, and artifact hash. |
 
 ---
 
@@ -253,9 +253,35 @@ VacciChain maintains a production-equivalent staging environment for testing bef
 
 ### Manual Deployment
 
+Deployments **require an explicit network**. The workflow refuses to run without `network` set to `testnet` for staging, and validates the network-specific configuration (RPC URL, Horizon URL, network passphrase, and expected contract ID) before any container is updated.
+
 ```bash
-# Trigger deployment manually
-gh workflow run deploy-staging.yml
+# Trigger deployment manually — network is mandatory
+gh workflow run deploy-staging.yml -f network=testnet
+```
+
+If `network` is omitted or set to anything other than `testnet`, the workflow fails fast with a validation error. This prevents accidentally deploying staging configuration against mainnet.
+
+### Post-Deploy Smoke Test: Network and Contract ID Validation
+
+After the new containers are healthy, the `deploy-staging.yml` workflow runs a smoke test that confirms the deployment targets the expected network and contract:
+
+1. **Network passphrase check** — the backend reports its configured network passphrase; it must equal `Test SDF Network ; September 2015`. Any other passphrase (including the mainnet passphrase) fails the smoke test.
+2. **RPC/Horizon check** — the configured Soroban RPC and Horizon URLs must be the testnet endpoints listed in this guide.
+3. **Contract ID check** — the deployed contract ID is read from the backend configuration and compared against the expected contract ID recorded for the current staging deployment. A mismatch fails the smoke test.
+4. **Artifact hash check** — the deployed contract WASM hash is compared against the artifact hash produced by the CI build for the deployed commit. A mismatch means the running contract does not match the tested artifact and fails the smoke test.
+
+The smoke test fails the workflow (and the deployment is marked failed) if any check does not match. To verify manually:
+
+```bash
+# Confirm the network passphrase reported by the backend
+curl -s https://staging.vaccichain.example.com/health | jq '.network_passphrase'
+# Expected: "Test SDF Network ; September 2015"
+
+# Confirm the deployed contract ID and artifact hash
+curl -s https://staging.vaccichain.example.com/health | jq '{contract_id, wasm_hash}'
+# Compare contract_id against the expected staging contract ID and
+# wasm_hash against the artifact hash from the CI build for this commit
 ```
 
 ## Testing in Staging

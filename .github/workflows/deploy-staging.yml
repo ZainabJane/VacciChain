@@ -85,6 +85,60 @@ jobs:
           cluster: vaccichain-staging
           wait-for-service-stability: true
 
+      - name: Validate network-specific contract configuration
+        env:
+          STELLAR_NETWORK: testnet
+          STELLAR_RPC_URL: ${{ secrets.STELLAR_TESTNET_RPC_URL }}
+          STELLAR_NETWORK_PASSPHRASE: ${{ secrets.STELLAR_TESTNET_NETWORK_PASSPHRASE }}
+          CONTRACT_ID: ${{ secrets.STELLAR_TESTNET_CONTRACT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STELLAR_NETWORK:-}" ]; then
+            echo "::error::Explicit STELLAR_NETWORK must be set (expected: testnet)"
+            exit 1
+          fi
+          if [ "$STELLAR_NETWORK" != "testnet" ]; then
+            echo "::error::Staging deployment requires STELLAR_NETWORK=testnet, got '$STELLAR_NETWORK'"
+            exit 1
+          fi
+          for var in STELLAR_RPC_URL STELLAR_NETWORK_PASSPHRASE CONTRACT_ID; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::Missing required network-specific configuration: $var"
+              exit 1
+            fi
+          done
+          echo "Network configuration validated for $STELLAR_NETWORK"
+
+      - name: Smoke test deployed contract ID and artifact hash
+        env:
+          STELLAR_NETWORK: testnet
+          STELLAR_RPC_URL: ${{ secrets.STELLAR_TESTNET_RPC_URL }}
+          STELLAR_NETWORK_PASSPHRASE: ${{ secrets.STELLAR_TESTNET_NETWORK_PASSPHRASE }}
+          CONTRACT_ID: ${{ secrets.STELLAR_TESTNET_CONTRACT_ID }}
+          EXPECTED_ARTIFACT_HASH: ${{ secrets.STELLAR_TESTNET_ARTIFACT_HASH }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EXPECTED_ARTIFACT_HASH:-}" ]; then
+            echo "::error::Missing expected artifact hash (STELLAR_TESTNET_ARTIFACT_HASH)"
+            exit 1
+          fi
+          # Confirm the contract ID is deployed on the expected network
+          if ! stellar contract inspect --id "$CONTRACT_ID" --network "$STELLAR_NETWORK" --rpc-url "$STELLAR_RPC_URL" --network-passphrase "$STELLAR_NETWORK_PASSPHRASE" > /tmp/contract-inspect.json; then
+            echo "::error::Contract $CONTRACT_ID not found on network $STELLAR_NETWORK"
+            exit 1
+          fi
+          # Confirm the deployed artifact hash matches the expected build artifact
+          ACTUAL_HASH=$(jq -r '.wasm_hash // .wasmHash // empty' /tmp/contract-inspect.json)
+          if [ -z "$ACTUAL_HASH" ]; then
+            echo "::error::Could not determine deployed artifact hash for $CONTRACT_ID"
+            exit 1
+          fi
+          if [ "$ACTUAL_HASH" != "$EXPECTED_ARTIFACT_HASH" ]; then
+            echo "::error::Artifact hash mismatch for $CONTRACT_ID: expected $EXPECTED_ARTIFACT_HASH, got $ACTUAL_HASH"
+            exit 1
+          fi
+          echo "Smoke test passed: contract $CONTRACT_ID on $STELLAR_NETWORK matches artifact hash $ACTUAL_HASH"
+
       - name: Post deployment summary
         run: |
           echo "### Staging Deployment" >> $GITHUB_STEP_SUMMARY

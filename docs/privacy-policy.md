@@ -25,6 +25,8 @@ VacciChain issues vaccination records as soulbound NFTs on the Stellar blockchai
 
 **Compliance note:** Because on-chain data cannot be erased, VacciChain minimises personal data written to the chain. Patient identity is represented only by a Stellar public key (pseudonymous). No names, dates of birth, or contact details are stored on-chain. Issuers must not include additional PII in the `vaccine_name` or other fields.
 
+**Public-chain data is not private.** Everything written to the Stellar/Soroban ledger — including the pseudonymous patient address, `vaccine_name`, `date_administered`, issuer key, and all contract events — is publicly readable by anyone, forever. Pseudonymity is not anonymity: a public key can be correlated with other on-chain activity and, once linked to a person, all associated records become linkable. Patients and issuers must treat on-chain records as public disclosures and must not rely on the chain to keep any data confidential.
+
 **Data subject requests:** Deletion of on-chain records is technically impossible. Issuers may *revoke* a vaccination record (setting its status to revoked), which removes its clinical validity while the pseudonymous record remains on-chain. Patients should be informed of this limitation at enrolment.
 
 ---
@@ -80,11 +82,42 @@ The backend indexer caches on-chain events in a local SQLite database to serve f
 
 ---
 
-### 2.5 Consent Records
+### 2.5 Consent & Allowlist Records
 
-VacciChain does not currently maintain a separate consent database. Patient consent is implicit in the act of providing a Stellar wallet address to an authorized issuer. Issuers are responsible for obtaining and recording informed consent in accordance with applicable law before minting a vaccination record.
+VacciChain does not maintain a separate consent database. Consent is expressed on-chain through the patient **allowlist** and is enforced by the contract at the issuance boundary. Issuers remain responsible for obtaining and recording informed consent in accordance with applicable law before requesting an issuance.
 
-**Recommendation:** Issuers should maintain their own consent records for a minimum of 6 years (HIPAA) or as required by local law.
+#### 2.5.1 Allowlist / consent state machine
+
+Each patient address has a consent state that the contract tracks. The table below describes the state transitions and the resulting contract/API behaviour.
+
+| State | How it is reached | Issuance behaviour | Verification behaviour |
+|---|---|---|---|
+| **Absent** (no entry) | Default for any address that has never been allowlisted | Issuance **rejected** (`Unauthorized` / not allowlisted). No record is written. | No record exists; verification returns "not found". |
+| **Granted** | Patient (or their authorised representative) calls the allowlist/consent grant entry point | Issuance **permitted** by an authorised issuer for the allowlisted patient | Record is verifiable by anyone via public verification |
+| **Revoked** | Patient calls the revoke/withdraw-consent entry point | Further issuance **rejected**; existing records are not deleted | Existing records remain publicly verifiable (on-chain data is immutable) |
+| **Changed** | Consent is re-granted after revocation, or allowlist metadata (e.g. scope/issuer restrictions) is updated | Issuance permitted again under the new terms; previously issued records are unaffected | Previously issued records remain verifiable; new records reflect the new terms |
+
+**Important:** Revoking consent stops *future* issuance only. It does **not** erase or hide records already written to the public chain. Patients must be told this before granting consent.
+
+#### 2.5.2 API behaviour
+
+- `POST /vaccinations` (issuance) returns `403 Forbidden` (or the contract's `Unauthorized` error mapped to HTTP 403) when the patient is **absent** or **revoked** from the allowlist. No transaction is submitted.
+- Issuance by a caller that is not a registered/authorised issuer is rejected regardless of allowlist state.
+- `GET /verify/:id` (public verification) is unauthenticated and returns only the public, non-prohibited fields (see §2.5.3). It does not reveal allowlist/consent state.
+- Consent grant/revoke operations are state-changing and are recorded in the audit log (§2.2).
+
+#### 2.5.3 Fields omitted from public verification
+
+Public verification deliberately omits fields that are not required to prove a vaccination record's validity. The following are **never** returned by the public verification endpoint:
+
+- Patient name, date of birth, contact details, or any other PII (never stored on-chain).
+- Caller IP addresses and audit-log metadata.
+- Consent/allowlist state and consent history.
+- Internal database identifiers and indexer bookkeeping fields.
+
+Only the pseudonymous patient address, `vaccine_name`, `date_administered`, issuer key, and record status (valid/revoked) are exposed.
+
+**Recommendation:** Issuers should maintain their own consent records for a minimum of 6 years (HIPAA) or as required by local law, in addition to the on-chain allowlist state.
 
 ---
 
@@ -148,8 +181,11 @@ All purge operations must be logged in a separate compliance audit trail (outsid
 | Processing activity | Legal basis |
 |---|---|
 | Issuing vaccination records | Vital interests (Art. 9(2)(c)) or explicit consent (Art. 9(2)(a)) |
+| Patient allowlisting / consent grant & revoke | Explicit consent (Art. 9(2)(a)) |
 | Audit logging | Legitimate interests — security and fraud prevention (Art. 6(1)(f)) |
 | On-chain verification | Public interest / official authority (Art. 6(1)(e)) |
+
+**Note on public-chain disclosure:** Because on-chain records are public and permanent, processing that writes to the chain must be covered by explicit consent that specifically discloses the public, immutable nature of the disclosure. Consent obtained without this disclosure is not sufficient for on-chain issuance.
 
 ---
 
