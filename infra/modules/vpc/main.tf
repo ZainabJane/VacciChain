@@ -76,6 +76,48 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private[count.index].id
 }
 
+resource "aws_service_discovery_private_dns_namespace" "this" {
+  name        = "${var.name}.local"
+  description = "Private service discovery namespace for ${var.name}"
+  vpc         = aws_vpc.this.id
+  tags        = { Name = "${var.name}-sd-namespace" }
+}
+
+resource "aws_security_group" "service_discovery" {
+  name        = "${var.name}-sd-endpoint"
+  description = "Allow internal DNS/service discovery traffic within the VPC"
+  vpc_id      = aws_vpc.this.id
+
+  ingress {
+    description = "DNS TCP from VPC"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "tcp"
+    cidr_blocks = [var.cidr]
+  }
+
+  ingress {
+    description = "DNS UDP from VPC"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "udp"
+    cidr_blocks = [var.cidr]
+  }
+
+  egress {
+    description = "DNS responses within VPC"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "udp"
+    cidr_blocks = [var.cidr]
+  }
+
+  tags = { Name = "${var.name}-sd-endpoint" }
+}
+
 output "vpc_id"          { value = aws_vpc.this.id }
 output "public_subnets"  { value = aws_subnet.public[*].id }
 output "private_subnets" { value = aws_subnet.private[*].id }
+output "service_discovery_namespace_id"   { value = aws_service_discovery_private_dns_namespace.this.id }
+output "service_discovery_namespace_name" { value = aws_service_discovery_private_dns_namespace.this.name }
+output "service_discovery_security_group_id" { value = aws_security_group.service_discovery.id }

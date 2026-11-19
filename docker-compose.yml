@@ -122,6 +122,11 @@ services:
     build: ./python-service
     # No host port — only reachable via nginx on the internal network
     env_file: .env
+    environment:
+      # Resolve the backend via private service discovery (compose network DNS),
+      # never loopback, so this matches the ECS private endpoint pattern.
+      - BACKEND_URL=${BACKEND_URL:-http://backend:4000}
+      - ANALYTICS_BACKEND_URL=${ANALYTICS_BACKEND_URL:-http://backend:4000}
     networks:
       - vaccichain
     healthcheck:

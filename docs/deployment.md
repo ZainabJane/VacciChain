@@ -318,7 +318,7 @@ These are safe to set directly in the ECS task definition (not in Secrets Manage
 | `ALLOWED_ORIGINS` | `https://app.yourdomain.com` | Your production frontend URL |
 | `AUDIT_LOG_PATH` | `/data/audit.log` | Persistent EFS mount |
 | `DATABASE_PATH` | `/data/vaccichain.db` | Persistent EFS mount |
-| `BACKEND_URL` | `http://backend:4000` | Internal service URL |
+| `BACKEND_URL` | `http://backend.vaccichain-prod.local:4000` | Private service discovery endpoint (see §7.4) |
 | `ANALYTICS_API_KEY` | *(set in Secrets Manager)* | Generate with `openssl rand -hex 32` |
 | `RATE_LIMIT_SEP10` | `10` | Adjust based on expected traffic |
 | `RATE_LIMIT_VERIFY` | `60` | Adjust based on expected traffic |
@@ -441,22 +441,92 @@ ECS_SERVICE_PROD          — vaccichain-backend
 
 The GitHub Actions workflow at `.github/workflows/cd.yml` handles image builds and service updates on pushes to `main`.
 
+### 7.4 Private Service Discovery for the Analytics Service
+
+The analytics (Python) task must reach the backend over the private network — **never** via `localhost`/`127.0.0.1`, which resolves to the task's own loopback inside ECS. Terraform provisions an AWS Cloud Map private DNS namespace (`vaccichain-prod.local`) and registers the backend service as `backend.vaccichain-prod.local`.
+
+```bash
+# Confirm the private namespace and backend service registration
+aws servicediscovery list-namespaces \
+  --query "Namespaces[?Name=='vaccichain-prod.local']"
+
+aws servicediscovery list-services \
+  --query "Services[?Name=='backend']"
+
+# Confirm a backend task instance is registered
+aws servicediscovery list-instances \
+  --service-id <BACKEND_SERVICE_ID> \
+  --query 'Instances[].Attributes'
+```
+
+The analytics task definition must set:
+
+- `BACKEND_URL=http://backend.vaccichain-prod.local:4000` (environment-specific; staging uses `backend.vaccichain-staging.local`)
+- `AWS_CLOUD_MAP_NAMESPACE=vaccichain-prod.local`
+
+Do not use `http://backend:4000` or `http://localhost:4000` in production task definitions — the former only resolves via Docker Compose, and the latter resolves to the analytics task itself.
+
+### 7.5 Analytics-to-Backend Smoke Test
+
+After deploying, verify the analytics task can reach the backend from an isolated task on the same private subnets:
+
+```bash
+# Run a one-off task in the analytics task definition's network config
+TASK_ARN=$(aws ecs run-task \
+  --cluster vaccichain-prod \
+  --task-definition vaccichain-python:<TAG> \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={
+    subnets=[$SUBNET_IDS],
+    securityGroups=[$SG_ID],
+    assignPublicIp=DISABLED
+  }" \
+  --overrides '{"containerOverrides":[{
+    "name":"python-service",
+    "command":["python","-c","import os,urllib.request;u=os.environ[\"BACKEND_URL\"]+\"/health\";print(u);print(urllib.request.urlopen(u,timeout=5).read().decode())"]
+  }]}' \
+  --query 'tasks[0].taskArn' --output text)
+
+# Wait for completion and inspect the result
+aws ecs wait tasks-stopped --cluster vaccichain-prod --tasks $TASK_ARN
+aws ecs describe-tasks --cluster vaccichain-prod --tasks $TASK_ARN \
+  --query 'tasks[0].containers[0].{exit:exitCode,reason:reason}'
+# Expected: exit code 0 and {"status":"ok"} in the logs
+```
+
+If the check fails, confirm the Cloud Map registration, the security group allows ingress on port 4000 from the analytics security group, and `BACKEND_URL` is set to the private DNS name.
+
 ---
 
 ## 8. TLS and Domain Configuration
 
-### 8.1 Request an ACM Certificate
+Public HTTP traffic is terminated at the ALB with a managed ACM certificate. Plaintext application traffic is never served: port 80 issues an explicit `301` redirect to HTTPS, and the HTTPS listener uses a modern TLS policy (TLS 1.2+ with TLS 1.3 preferred).
+
+### 8.1 Provision the ACM Certificate
+
+Terraform manages the certificate (`infra/modules/alb`), including DNS validation records and automatic renewal. If provisioning manually:
 
 ```bash
 aws acm request-certificate \
   --domain-name app.yourdomain.com \
   --validation-method DNS \
   --region us-east-1
+
+# Retrieve the DNS validation record and add it to your hosted zone
+CERT_ARN=$(aws acm list-certificates --query \
+  "CertificateSummaryList[?DomainName=='app.yourdomain.com'].CertificateArn" \
+  --output text)
+
+aws acm describe-certificate --certificate-arn $CERT_ARN \
+  --query 'Certificate.DomainValidationOptions[0].ResourceRecord'
+
+# Wait until status is ISSUED
+aws acm wait certificate-validated --certificate-arn $CERT_ARN
 ```
 
-Follow the DNS validation instructions in the AWS Console to confirm domain ownership.
+ACM renews the certificate automatically as long as the validation record remains in place. Do not delete the validation CNAME.
 
-### 8.2 Configure the ALB Listener
+### 8.2 Configure the ALB Listeners
 
 ```bash
 # Get the certificate ARN from ACM
@@ -467,7 +537,7 @@ CERT_ARN=$(aws acm list-certificates --query \
 ALB_ARN=$(cd infra/envs/production && terraform output -raw alb_arn)
 TG_ARN=$(cd infra/envs/production && terraform output -raw target_group_arn)
 
-# HTTPS listener (port 443)
+# HTTPS listener (port 443) with a modern TLS policy
 aws elbv2 create-listener \
   --load-balancer-arn $ALB_ARN \
   --protocol HTTPS \
@@ -476,7 +546,7 @@ aws elbv2 create-listener \
   --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06 \
   --default-actions Type=forward,TargetGroupArn=$TG_ARN
 
-# HTTP → HTTPS redirect (port 80)
+# HTTP → HTTPS redirect (port 80) — plaintext is never forwarded
 aws elbv2 create-listener \
   --load-balancer-arn $ALB_ARN \
   --protocol HTTP \
@@ -491,6 +561,14 @@ aws elbv2 create-listener \
   }]'
 ```
 
+Verify the listeners:
+
+```bash
+aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN \
+  --query 'Listeners[].{Port:Port,Protocol:Protocol,Policy:SslPolicy}'
+# Expected: 443/HTTPS with ELBSecurityPolicy-TLS13-1-2-2021-06, 80/HTTP redirect
+```
+
 ### 8.3 Update DNS
 
 Point your domain's A record (or CNAME) to the ALB DNS name:
@@ -500,6 +578,32 @@ aws elbv2 describe-load-balancers \
   --names vaccichain-prod-alb \
   --query 'LoadBalancers[0].DNSName' \
   --output text
+```
+
+### 8.4 External Certificate Validity Check
+
+The deployment workflow (`.github/workflows/cd.yml`) runs an external TLS check after the service update. Run it manually to reproduce:
+
+```bash
+# Certificate chain, expiry, and hostname must all validate
+openssl s_client -connect app.yourdomain.com:443 \
+  -servername app.yourdomain.com -verify_return_error </dev/null 2>&1 | \
+  grep -E "Verify return code|subject=|issuer="
+# Expected: "Verify return code: 0 (ok)"
+
+# Fail if the certificate expires within 30 days
+echo | openssl s_client -connect app.yourdomain.com:443 \
+  -servername app.yourdomain.com 2>/dev/null | \
+  openssl x509 -noout -checkend 2592000
+# Expected: "Certificate will not expire"
+
+# Plaintext must redirect to HTTPS
+curl -sI http://app.yourdomain.com/health | grep -iE "^HTTP/|^location:"
+# Expected: 301 and Location: https://app.yourdomain.com/health
+
+# HTTPS must serve the application
+curl -sf https://app.yourdomain.com/health
+# Expected: {"status":"ok"}
 ```
 
 For full TLS configuration details, see [`docs/tls-setup.md`](./tls-setup.md).
@@ -571,7 +675,17 @@ aws logs filter-log-events \
   --start-time $(date -d '10 minutes ago' +%s000)
 ```
 
-### 9.6 End-to-End Smoke Test
+### 9.6 Analytics-to-Backend Smoke Test
+
+Confirm the analytics task resolves and calls the backend over private service discovery (see §7.5):
+
+```bash
+aws logs tail /ecs/vaccichain-production/python-service --since 10m \
+  --filter-pattern "backend.vaccichain-prod.local"
+# Expected: successful /health response, no connection refused or loopback errors
+```
+
+### 9.7 End-to-End Smoke Test
 
 1. Connect a Freighter wallet (mainnet) to `https://app.yourdomain.com`
 2. Authenticate via SEP-10 — you should receive a JWT
