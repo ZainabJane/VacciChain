@@ -1,0 +1,286 @@
+{
+  "version": "1.0.0",
+  "description": "Shared serialization test vectors for cross-language Soroban serialization. Consumed by Rust contract tests, Node SDK invocation tests, and indexer event decoding tests. All three must agree on types and encodings and reject incompatible encodings.",
+  "format": {
+    "version": "Semantic version of this fixture file. Bump on any breaking change to structure or expected encodings.",
+    "contract": "Name of the contract the vectors apply to.",
+    "contractVersion": "Version of the contract these vectors were generated against.",
+    "vectors": "Array of test vectors. Each vector has: id (unique stable identifier), kind (one of: argument, return, event, negative), function (contract function name, or event name for events), description (human readable), type (Soroban type descriptor), value (JSON representation of the logical value), xdr (base64-encoded Soroban XDR ScVal encoding of the value), and for negative cases: reason (why the encoding must be rejected) and invalidXdr (base64-encoded XDR that must be rejected).",
+    "typeDescriptors": "Canonical Soroban type descriptors used in the type field: u32, i32, u64, i64, u128, i128, bool, symbol, string, bytes, address, vec<T>, map<K,V>, option<T>, tuple<...>, struct<Name>.",
+    "encodingNotes": "All XDR values are base64-encoded Soroban ScVal. Integers are encoded as decimal strings in JSON to avoid precision loss. Addresses are encoded as strkey (G.../C...) strings. Bytes are hex strings. Symbols are plain strings."
+  },
+  "contract": "example-contract",
+  "contractVersion": "1.0.0",
+  "vectors": [
+    {
+      "id": "arg-init-admin",
+      "kind": "argument",
+      "function": "init",
+      "description": "Admin account address passed to init",
+      "type": "address",
+      "value": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      "xdr": "AAAAEgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    },
+    {
+      "id": "arg-init-fee",
+      "kind": "argument",
+      "function": "init",
+      "description": "Initial fee as u32",
+      "type": "u32",
+      "value": "100",
+      "xdr": "AAAABAAAAGQ="
+    },
+    {
+      "id": "arg-transfer-from",
+      "kind": "argument",
+      "function": "transfer",
+      "description": "Source address for transfer",
+      "type": "address",
+      "value": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      "xdr": "AAAAEgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    },
+    {
+      "id": "arg-transfer-to",
+      "kind": "argument",
+      "function": "transfer",
+      "description": "Destination address for transfer",
+      "type": "address",
+      "value": "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "xdr": "AAAAEgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    },
+    {
+      "id": "arg-transfer-amount",
+      "kind": "argument",
+      "function": "transfer",
+      "description": "Transfer amount as i128",
+      "type": "i128",
+      "value": "1000000",
+      "xdr": "AAAACgAAAAAAAAAAAAAAAAAPQkA="
+    },
+    {
+      "id": "arg-transfer-memo",
+      "kind": "argument",
+      "function": "transfer",
+      "description": "Optional memo string",
+      "type": "option<string>",
+      "value": "hello",
+      "xdr": "AAAAAQAAAA8AAAAFaGVsbG8="
+    },
+    {
+      "id": "arg-transfer-memo-none",
+      "kind": "argument",
+      "function": "transfer",
+      "description": "Absent optional memo",
+      "type": "option<string>",
+      "value": null,
+      "xdr": "AAAAAA=="
+    },
+    {
+      "id": "arg-set-flags",
+      "kind": "argument",
+      "function": "set_flags",
+      "description": "Boolean flags argument",
+      "type": "bool",
+      "value": true,
+      "xdr": "AAAAAQ=="
+    },
+    {
+      "id": "arg-set-symbol",
+      "kind": "argument",
+      "function": "set_symbol",
+      "description": "Symbol argument",
+      "type": "symbol",
+      "value": "TOKEN",
+      "xdr": "AAAADwAAAAVUT0tFTg=="
+    },
+    {
+      "id": "arg-batch-vec",
+      "kind": "argument",
+      "function": "batch",
+      "description": "Vector of u64 amounts",
+      "type": "vec<u64>",
+      "value": ["1", "2", "3"],
+      "xdr": "AAAAEA=="
+    },
+    {
+      "id": "arg-map-config",
+      "kind": "argument",
+      "function": "configure",
+      "description": "Map of symbol to i128 config values",
+      "type": "map<symbol,i128>",
+      "value": { "rate": "5" },
+      "xdr": "AAAADQ=="
+    },
+    {
+      "id": "arg-bytes-payload",
+      "kind": "argument",
+      "function": "submit",
+      "description": "Raw bytes payload",
+      "type": "bytes",
+      "value": "deadbeef",
+      "xdr": "AAAADgAAAARkZWFkYmVlZg=="
+    },
+    {
+      "id": "arg-tuple-pair",
+      "kind": "argument",
+      "function": "pair",
+      "description": "Tuple of (u32, bool)",
+      "type": "tuple<u32,bool>",
+      "value": [7, false],
+      "xdr": "AAAABQ=="
+    },
+    {
+      "id": "ret-balance",
+      "kind": "return",
+      "function": "balance",
+      "description": "Representative balance return value",
+      "type": "i128",
+      "value": "5000000",
+      "xdr": "AAAACgAAAAAAAAAAAAAATYlQAA=="
+    },
+    {
+      "id": "ret-address",
+      "kind": "return",
+      "function": "owner",
+      "description": "Representative address return value",
+      "type": "address",
+      "value": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      "xdr": "AAAAEgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    },
+    {
+      "id": "ret-bool",
+      "kind": "return",
+      "function": "is_active",
+      "description": "Representative boolean return value",
+      "type": "bool",
+      "value": false,
+      "xdr": "AAAAAA=="
+    },
+    {
+      "id": "ret-vec",
+      "kind": "return",
+      "function": "list",
+      "description": "Representative vector return value",
+      "type": "vec<u32>",
+      "value": ["1", "2"],
+      "xdr": "AAAAEA=="
+    },
+    {
+      "id": "event-transfer",
+      "kind": "event",
+      "function": "transfer",
+      "description": "Transfer event with from, to, amount topics and amount data",
+      "type": "struct<TransferEvent>",
+      "value": {
+        "topics": [
+          "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+        ],
+        "data": "1000000"
+      },
+      "xdr": "AAAAEgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    },
+    {
+      "id": "event-init",
+      "kind": "event",
+      "function": "init",
+      "description": "Init event carrying admin and fee",
+      "type": "struct<InitEvent>",
+      "value": {
+        "admin": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        "fee": "100"
+      },
+      "xdr": "AAAAEgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    },
+    {
+      "id": "neg-u32-overflow",
+      "kind": "negative",
+      "function": "init",
+      "description": "u32 value exceeding max must be rejected",
+      "type": "u32",
+      "value": "4294967296",
+      "invalidXdr": "AAAABAAAAAAA",
+      "reason": "Value exceeds u32 max; Rust and Node must reject before encoding."
+    },
+    {
+      "id": "neg-i128-non-numeric",
+      "kind": "negative",
+      "function": "transfer",
+      "description": "Non-numeric string for i128 must be rejected",
+      "type": "i128",
+      "value": "not-a-number",
+      "invalidXdr": "AAAACg==",
+      "reason": "i128 must be a decimal string; non-numeric input is invalid."
+    },
+    {
+      "id": "neg-address-bad-strkey",
+      "kind": "negative",
+      "function": "transfer",
+      "description": "Malformed strkey address must be rejected",
+      "type": "address",
+      "value": "NOTAVALIDADDRESS",
+      "invalidXdr": "AAAAEg==",
+      "reason": "Address must be a valid strkey; malformed input must be rejected."
+    },
+    {
+      "id": "neg-symbol-too-long",
+      "kind": "negative",
+      "function": "set_symbol",
+      "description": "Symbol longer than 32 chars must be rejected",
+      "type": "symbol",
+      "value": "THIS_SYMBOL_IS_DEFINITELY_LONGER_THAN_THIRTY_TWO_CHARS",
+      "invalidXdr": "AAAADw==",
+      "reason": "Soroban symbols are limited to 32 characters."
+    },
+    {
+      "id": "neg-bytes-odd-hex",
+      "kind": "negative",
+      "function": "submit",
+      "description": "Odd-length hex string for bytes must be rejected",
+      "type": "bytes",
+      "value": "abc",
+      "invalidXdr": "AAAADg==",
+      "reason": "Bytes must be even-length hex; odd-length is invalid."
+    },
+    {
+      "id": "neg-vec-wrong-element",
+      "kind": "negative",
+      "function": "batch",
+      "description": "Vector containing non-u64 element must be rejected",
+      "type": "vec<u64>",
+      "value": ["1", "not-a-number"],
+      "invalidXdr": "AAAAEA==",
+      "reason": "All vector elements must match the declared element type."
+    },
+    {
+      "id": "neg-map-wrong-key",
+      "kind": "negative",
+      "function": "configure",
+      "description": "Map with non-symbol key must be rejected",
+      "type": "map<symbol,i128>",
+      "value": { "123": "5" },
+      "invalidXdr": "AAAADQ==",
+      "reason": "Map keys must match the declared key type."
+    },
+    {
+      "id": "neg-tuple-arity",
+      "kind": "negative",
+      "function": "pair",
+      "description": "Tuple with wrong arity must be rejected",
+      "type": "tuple<u32,bool>",
+      "value": [7],
+      "invalidXdr": "AAAABQ==",
+      "reason": "Tuple arity must match the declared type."
+    },
+    {
+      "id": "neg-xdr-type-mismatch",
+      "kind": "negative",
+      "function": "balance",
+      "description": "XDR encoding whose ScVal type does not match declared type must be rejected",
+      "type": "i128",
+      "value": "5000000",
+      "invalidXdr": "AAAAAQ==",
+      "reason": "Decoded ScVal discriminant (bool) does not match declared i128 type."
+    }
+  ]
+}

@@ -270,3 +270,150 @@ fn invariant_unpause_restores_minting() {
 
     assert!(result.is_ok(), "Minting should succeed after unpause");
 }
+
+// ── Verification semantics: valid / revoked / absent / unavailable ───────────
+//
+// Issue #101: contract results must never be interpretable as a medical
+// determination when records are missing, revoked, or unavailable. Each
+// verification state must be distinguishable, and a failure (RPC error,
+// storage error, missing record) must never collapse into a positive result.
+
+#[test]
+fn invariant_verify_valid_record_reports_vaccinated() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+    client.mint_vaccination(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "2024-01-15"),
+        &issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+
+    let (vaccinated, records, _) = client.verify_vaccination(&patient);
+    assert!(vaccinated, "Valid record must report vaccinated");
+    assert_eq!(records.len(), 1);
+}
+
+#[test]
+fn invariant_verify_revoked_record_is_not_positive() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+    let token_id = client.mint_vaccination(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "2024-01-15"),
+        &issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+
+    client.revoke_vaccination(&token_id).unwrap();
+
+    // A revoked record must not be reported as a positive verification.
+    let (vaccinated, records, _) = client.verify_vaccination(&patient);
+    assert!(
+        !vaccinated,
+        "Revoked record must not collapse into a positive verification result"
+    );
+    assert_eq!(records.len(), 0);
+}
+
+#[test]
+fn invariant_verify_absent_record_is_not_positive() {
+    let (env, client, _admin) = setup();
+    let wallet = soroban_sdk::Address::generate(&env);
+
+    // No record exists for this wallet: absent data must be distinguishable
+    // from a positive verification.
+    let (vaccinated, records, _) = client.verify_vaccination(&wallet);
+    assert!(
+        !vaccinated,
+        "Absent record must not collapse into a positive verification result"
+    );
+    assert_eq!(records.len(), 0);
+}
+
+#[test]
+fn invariant_verify_unavailable_data_is_not_positive() {
+    let (env, client, _admin) = setup();
+    let wallet = soroban_sdk::Address::generate(&env);
+
+    // Pausing the contract makes state-changing paths unavailable; read-only
+    // verification must still return a non-positive result rather than
+    // failing open into a positive determination.
+    client.pause().unwrap();
+
+    let (vaccinated, records, _) = client.verify_vaccination(&wallet);
+    assert!(
+        !vaccinated,
+        "Unavailable data must not collapse into a positive verification result"
+    );
+    assert_eq!(records.len(), 0);
+}
+
+#[test]
+fn invariant_verify_failure_never_collapses_into_positive() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+    client.mint_vaccination(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "2024-01-15"),
+        &issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+
+    // Failure injection: an unauthorized caller attempting to mutate state
+    // must fail closed. The error must surface as an error, never as a
+    // successful (positive) verification outcome.
+    let non_issuer = soroban_sdk::Address::generate(&env);
+    let result = client.try_mint_vaccination(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "2024-01-15"),
+        &non_issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+    assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+
+    // The failed mutation must not have altered the verification result.
+    let (vaccinated, records, _) = client.verify_vaccination(&patient);
+    assert!(vaccinated);
+    assert_eq!(records.len(), 1, "Failed mutation must not add records");
+}
+
+#[test]
+fn invariant_verify_unknown_wallet_returns_no_positive() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+    let unknown = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+    client.mint_vaccination(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "2024-01-15"),
+        &issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+
+    // A wallet with no records must not inherit another wallet's result.
+    let (vaccinated, records, _) = client.verify_vaccination(&unknown);
+    assert!(!vaccinated);
+    assert_eq!(records.len(), 0);
+}

@@ -20,9 +20,13 @@ mod property_tests;
 #[cfg(test)]
 mod security_invariant_tests;
 
+#[cfg(test)]
+mod serialization_tests;
+
 use soroban_sdk::{contract, contractimpl, contracterror, Address, BytesN, Env, String, Vec, IntoVal};
 use storage::{DataKey, IssuerRecord, VaccinationRecord, hash_address, compute_token_id};
 use verify::DoseStatus;
+pub use verify::VerificationStatus;
 
 /// Contract errors.
 ///
@@ -107,6 +111,27 @@ pub(crate) fn require_not_paused(env: &Env) -> Result<(), ContractError> {
     Ok(())
 }
 
+/// Validates the initial admin configuration.
+///
+/// Rejects the zero/default address (the all-zero ed25519 public key) so that
+/// a deployment cannot be initialized with an unusable or attacker-controlled
+/// default administrator.
+pub(crate) fn is_valid_admin(env: &Env, admin: &Address) -> bool {
+    let zero = BytesN::from_array(env, &[0u8; 32]);
+    admin.to_string() != Address::from_string(&String::from_str(env, "")).to_string()
+        && admin.clone().to_string().len() > 0
+        && !address_is_zero(env, admin, &zero)
+}
+
+/// Returns true when the address encodes the all-zero public key.
+fn address_is_zero(env: &Env, admin: &Address, zero: &BytesN<32>) -> bool {
+    // Compare the address's raw bytes against the zero key by round-tripping
+    // through its string representation of the zero address.
+    let zero_addr = Address::from_string(&String::from_str(env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"));
+    let _ = zero;
+    admin == &zero_addr
+}
+
 #[contract]
 pub struct VacciChainContract;
 
@@ -131,10 +156,18 @@ impl VacciChainContract {
     /// # Authorization
     /// Requires the `admin` address to authorize the transaction via `require_auth()`.
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
+        // One-time guard: reject any repeat or competing initialization before
+        // touching trusted administration state.
         if env.storage().persistent().has(&DataKey::Initialized) {
             return Err(ContractError::AlreadyInitialized);
         }
+        // Validate the initial admin configuration before writing any state.
+        if !is_valid_admin(&env, &admin) {
+            return Err(ContractError::InvalidInput);
+        }
         admin.require_auth();
+        // Set the guard and admin together; the guard is written first so a
+        // partially-completed setup can never be re-initialized.
         env.storage().persistent().set(&DataKey::Initialized, &true);
         env.storage().persistent().set(&DataKey::Admin, &admin);
         Ok(())
@@ -486,6 +519,19 @@ impl VacciChainContract {
         verify::verify_vaccination(&env, wallet)
     }
 
+    /// Verify vaccination status with an explicit, non-collapsing status.
+    ///
+    /// Unlike [`Self::verify_vaccination`], this entrypoint distinguishes
+    /// `Valid`, `Revoked`, `Absent`, and `Unavailable` outcomes so that a
+    /// missing, revoked, or unavailable record can never be interpreted as a
+    /// positive medical determination.
+    ///
+    /// # Authorization
+    /// This is a public read-only function; no authorization required.
+    pub fn verify_vaccination_status(env: Env, wallet: Address) -> VerificationStatus {
+        verify::verify_vaccination_status(&env, wallet)
+    }
+
     /// Batch verify vaccination status for multiple wallets.
     ///
     /// Efficiently verifies vaccination status for up to 100 wallets in a single call.
@@ -697,6 +743,20 @@ mod tests {
         let (_env, client, admin) = setup_env();
         let result = client.try_initialize(&admin);
         assert_eq!(result, Err(Ok(ContractError::AlreadyInitialized)));
+    }
+
+    #[test]
+    fn test_initialize_rejects_invalid_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(VacciChainContract, ());
+        let client = VacciChainContractClient::new(&env, &contract_id);
+        let zero_admin = Address::from_string(&String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        let result = client.try_initialize(&zero_admin);
+        assert_eq!(result, Err(Ok(ContractError::InvalidInput)));
     }
 
     #[test]
