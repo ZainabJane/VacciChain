@@ -44,6 +44,8 @@ use verify::DoseStatus;
 /// | 14   | InvalidInputCountry          | issuer country exceeds maximum length            |
 /// | 15   | SoulboundToken               | Transfers are disabled for soulbound records     |
 /// | 16   | PatientNotRegistered          | Patient has not self-registered                  |
+/// | 17   | ContractPaused                | Contract is paused                               |
+/// | 18   | BatchTooLarge                 | Batch verification exceeds maximum batch size    |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
@@ -64,6 +66,7 @@ pub enum ContractError {
     SoulboundToken = 15,
     PatientNotRegistered = 16,
     ContractPaused = 17,
+    BatchTooLarge = 18,
 }
 
 const MAX_STRING_LENGTH: u32 = 100;
@@ -488,21 +491,29 @@ impl VacciChainContract {
 
     /// Batch verify vaccination status for multiple wallets.
     ///
-    /// Efficiently verifies vaccination status for up to 100 wallets in a single call.
+    /// Efficiently verifies vaccination status for up to `MAX_BATCH_SIZE` (100) wallets
+    /// in a single call. The batch size is validated before any storage access so that
+    /// over-limit invocations are rejected cheaply.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `wallets` - A vector of wallet addresses to verify (max 100)
     ///
     /// # Returns
-    /// * `Vec<(Address, bool, Vec<VaccinationRecord>)>` - A vector of tuples, one per wallet:
+    /// * `Ok(Vec<(Address, bool, Vec<VaccinationRecord>)>)` - A vector of tuples, one per wallet:
     ///   - `Address`: The wallet address
     ///   - `bool`: `true` if the wallet has at least one valid record
     ///   - `Vec<VaccinationRecord>`: All valid records for the wallet
     ///
+    /// # Errors
+    /// * `BatchTooLarge` - `wallets.len()` exceeds `MAX_BATCH_SIZE`
+    ///
     /// # Authorization
     /// This is a public read-only function; no authorization required.
-    pub fn batch_verify(env: Env, wallets: Vec<Address>) -> Vec<(Address, bool, Vec<VaccinationRecord>)> {
+    pub fn batch_verify(
+        env: Env,
+        wallets: Vec<Address>,
+    ) -> Result<Vec<(Address, bool, Vec<VaccinationRecord>)>, ContractError> {
         verify::batch_verify(&env, wallets)
     }
 
@@ -912,6 +923,93 @@ mod tests {
             let (_, vaccinated, _) = results.get(i).unwrap();
             assert!(vaccinated);
         }
+    }
+
+    #[test]
+    fn test_batch_verify_max_size() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+        client.add_issuer(
+            &issuer,
+            &String::from_str(&env, "Hospital"),
+            &String::from_str(&env, "LIC"),
+            &String::from_str(&env, "USA"),
+        ).unwrap();
+
+        let mut wallets = Vec::new(&env);
+        for _ in 0..verify::MAX_BATCH_SIZE {
+            let patient = Address::generate(&env);
+            client.mint_vaccination(
+                &patient,
+                &String::from_str(&env, "Vax"),
+                &String::from_str(&env, "2024"),
+                &issuer,
+                &None::<u32>,
+                &None::<u32>,
+            );
+            wallets.push_back(patient);
+        }
+
+        let results = client.batch_verify(&wallets).unwrap();
+        assert_eq!(results.len(), verify::MAX_BATCH_SIZE);
+        for i in 0..results.len() {
+            let (_, vaccinated, _) = results.get(i).unwrap();
+            assert!(vaccinated);
+        }
+    }
+
+    #[test]
+    fn test_batch_verify_mixed_results() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+        client.add_issuer(
+            &issuer,
+            &String::from_str(&env, "Hospital"),
+            &String::from_str(&env, "LIC"),
+            &String::from_str(&env, "USA"),
+        ).unwrap();
+
+        let vaccinated_patient = Address::generate(&env);
+        client.mint_vaccination(
+            &vaccinated_patient,
+            &String::from_str(&env, "Vax"),
+            &String::from_str(&env, "2024"),
+            &issuer,
+            &None::<u32>,
+            &None::<u32>,
+        );
+
+        let unvaccinated_patient = Address::generate(&env);
+
+        let mut wallets = Vec::new(&env);
+        wallets.push_back(vaccinated_patient.clone());
+        wallets.push_back(unvaccinated_patient.clone());
+
+        let results = client.batch_verify(&wallets).unwrap();
+        assert_eq!(results.len(), 2);
+
+        let (addr0, vaccinated0, records0) = results.get(0).unwrap();
+        assert_eq!(addr0, vaccinated_patient);
+        assert!(vaccinated0);
+        assert_eq!(records0.len(), 1);
+
+        let (addr1, vaccinated1, records1) = results.get(1).unwrap();
+        assert_eq!(addr1, unvaccinated_patient);
+        assert!(!vaccinated1);
+        assert_eq!(records1.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_verify_over_limit_rejected() {
+        let (env, client, _admin) = setup_env();
+
+        let mut wallets = Vec::new(&env);
+        for _ in 0..(verify::MAX_BATCH_SIZE + 1) {
+            wallets.push_back(Address::generate(&env));
+        }
+
+        let result = client.try_batch_verify(&wallets);
+        assert_eq!(result, Err(Ok(ContractError::BatchTooLarge)));
     }
 
     #[test]

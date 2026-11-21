@@ -1,7 +1,21 @@
+//! Vaccination verification logic.
+//!
+//! # Batch verification limits
+//!
+//! `batch_verify` accepts at most [`MAX_BATCH_SIZE`] wallets per invocation.
+//! The limit is validated up front, before any storage access, so an over-limit
+//! request is rejected cheaply without consuming storage read resources.
+//! Requests exceeding the limit return [`ContractError::BatchTooLarge`].
+
 use soroban_sdk::{Env, Address, Vec, contracttype, String};
 use crate::storage::{DataKey, VaccinationRecord};
+use crate::errors::ContractError;
 
-const MAX_BATCH_SIZE: u32 = 100;
+/// Maximum number of wallets accepted by a single `batch_verify` invocation.
+///
+/// This bound keeps per-invocation resource usage (storage reads, CPU and
+/// memory) predictable. It is validated before any storage access occurs.
+pub const MAX_BATCH_SIZE: u32 = 100;
 
 /// Per-vaccine dose completion summary returned by verify_vaccination.
 #[contracttype]
@@ -28,9 +42,17 @@ pub struct DoseStatus {
 /// * `wallets` - Vector of wallet addresses to verify.
 ///
 /// # Returns
-/// * `Vec<(Address, bool, Vec<VaccinationRecord>)>` where the bool indicates whether the wallet has any active vaccination records.
-pub fn batch_verify(env: &Env, wallets: Vec<Address>) -> Vec<(Address, bool, Vec<VaccinationRecord>)> {
-    assert!(wallets.len() <= MAX_BATCH_SIZE, "batch size exceeds maximum of 100");
+/// * `Ok(Vec<(Address, bool, Vec<VaccinationRecord>)>)` where the bool indicates whether the wallet has any active vaccination records.
+/// * `Err(ContractError::BatchTooLarge)` when `wallets.len() > MAX_BATCH_SIZE`.
+///
+/// The batch size is validated before any storage access is performed.
+pub fn batch_verify(
+    env: &Env,
+    wallets: Vec<Address>,
+) -> Result<Vec<(Address, bool, Vec<VaccinationRecord>)>, ContractError> {
+    if wallets.len() > MAX_BATCH_SIZE {
+        return Err(ContractError::BatchTooLarge);
+    }
 
     let mut results: Vec<(Address, bool, Vec<VaccinationRecord>)> = Vec::new(env);
     for i in 0..wallets.len() {
@@ -38,7 +60,7 @@ pub fn batch_verify(env: &Env, wallets: Vec<Address>) -> Vec<(Address, bool, Vec
         let (vaccinated, records, _) = verify_vaccination(env, wallet.clone());
         results.push_back((wallet, vaccinated, records));
     }
-    results
+    Ok(results)
 }
 
 /// Verify vaccination status for a single wallet.
@@ -127,4 +149,61 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (bool, Vec<VaccinationR
     }
 
     (has_active, records, dose_statuses)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn make_wallets(env: &Env, count: u32) -> Vec<Address> {
+        let mut wallets: Vec<Address> = Vec::new(env);
+        for _ in 0..count {
+            wallets.push_back(Address::generate(env));
+        }
+        wallets
+    }
+
+    #[test]
+    fn batch_verify_accepts_exactly_max_batch_size() {
+        let env = Env::default();
+        let wallets = make_wallets(&env, MAX_BATCH_SIZE);
+        let result = batch_verify(&env, wallets);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), MAX_BATCH_SIZE);
+    }
+
+    #[test]
+    fn batch_verify_rejects_over_limit_before_storage_access() {
+        let env = Env::default();
+        let wallets = make_wallets(&env, MAX_BATCH_SIZE + 1);
+        let result = batch_verify(&env, wallets);
+        assert_eq!(result, Err(ContractError::BatchTooLarge));
+    }
+
+    #[test]
+    fn batch_verify_handles_mixed_results() {
+        let env = Env::default();
+        let mut wallets: Vec<Address> = Vec::new(&env);
+        // Wallets without records should report not vaccinated.
+        for _ in 0..3 {
+            wallets.push_back(Address::generate(&env));
+        }
+        let result = batch_verify(&env, wallets).unwrap();
+        assert_eq!(result.len(), 3);
+        for i in 0..result.len() {
+            let (_, vaccinated, records) = result.get(i).unwrap();
+            assert!(!vaccinated);
+            assert_eq!(records.len(), 0);
+        }
+    }
+
+    #[test]
+    fn batch_verify_empty_batch_is_ok() {
+        let env = Env::default();
+        let wallets: Vec<Address> = Vec::new(&env);
+        let result = batch_verify(&env, wallets);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+    }
 }

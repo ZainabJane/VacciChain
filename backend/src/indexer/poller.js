@@ -12,12 +12,29 @@ const { invalidateCache } = require('../stellar/issuerCache');
 const SOROBAN_RPC_URL = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
 const CONTRACT_ID = process.env.VACCINATIONS_CONTRACT_ID;
 
-// Map Soroban symbol_short event topic names to our internal event_type strings
+// Map Soroban symbol_short event topic names to our internal event_type strings.
+// Versioned symbols (e.g. minted_v1, minted_v2) map to the same internal
+// event_type; the version is preserved in the payload as `schema_version`.
 const TOPIC_MAP = {
-  minted:  'VaccinationMinted',
-  iss_add: 'IssuerAdded',
-  iss_rev: 'IssuerRevoked',
+  minted:     'VaccinationMinted',
+  minted_v1:  'VaccinationMinted',
+  minted_v2:  'VaccinationMinted',
+  iss_add:    'IssuerAdded',
+  iss_add_v1: 'IssuerAdded',
+  iss_add_v2: 'IssuerAdded',
+  iss_rev:    'IssuerRevoked',
+  iss_rev_v1: 'IssuerRevoked',
+  iss_rev_v2: 'IssuerRevoked',
 };
+
+// Default schema version for unversioned (legacy) topic symbols.
+const DEFAULT_SCHEMA_VERSION = 1;
+
+/** Extract the schema version encoded in a topic symbol, or the default. */
+function extractSchemaVersion(topicStr) {
+  const match = /_v(\d+)$/.exec(topicStr ?? '');
+  return match ? Number(match[1]) : DEFAULT_SCHEMA_VERSION;
+}
 
 let timer = null;
 
@@ -46,6 +63,10 @@ function parseEvent(raw) {
       contract_id: raw.contractId ?? CONTRACT_ID,
       payload: raw.value ?? {},
     };
+
+    // Preserve the event schema version so indexers can distinguish payloads
+    // emitted before and after contract upgrades.
+    parsed.payload.schema_version = extractSchemaVersion(topicStr);
 
     // Extract issuer address from topics for IssuerAdded/Revoked events
     if (parsed.event_type === 'IssuerAdded' || parsed.event_type === 'IssuerRevoked') {
@@ -126,4 +147,4 @@ function stopPoller() {
   }
 }
 
-module.exports = { startPoller, stopPoller, poll, parseEvent };
+module.exports = { startPoller, stopPoller, poll, parseEvent, TOPIC_MAP, extractSchemaVersion };

@@ -137,6 +137,68 @@ describe('poller — parseEvent', () => {
   });
 });
 
+describe('versioned event schemas', () => {
+  const v1Raw = {
+    id: 'raw-v1-001',
+    topic: [{ value: { toString: () => 'minted' } }],
+    ledger: 300,
+    ledgerClosedAt: '2024-02-01T00:00:00Z',
+    contractId: 'CABC',
+    value: { vaccine_name: 'Flu', issuer: 'GISSUER1' },
+  };
+
+  const v2Raw = {
+    id: 'raw-v2-001',
+    topic: [{ value: { toString: () => 'minted' } }],
+    ledger: 301,
+    ledgerClosedAt: '2024-02-01T00:01:00Z',
+    contractId: 'CABC',
+    value: {
+      schema_version: 2,
+      vaccine_name: 'Flu',
+      issuer: 'GISSUER1',
+      dose_number: 2,
+      metadata: { lot: 'LOT-42' },
+    },
+  };
+
+  it('maps v1 payloads to VaccinationMinted with schema_version 1', () => {
+    const parsed = parseEvent(v1Raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed.event_type).toBe('VaccinationMinted');
+    expect(parsed.payload.schema_version).toBe(1);
+    expect(parsed.payload.vaccine_name).toBe('Flu');
+  });
+
+  it('maps v2 payloads to VaccinationMinted preserving schema_version 2', () => {
+    const parsed = parseEvent(v2Raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed.event_type).toBe('VaccinationMinted');
+    expect(parsed.payload.schema_version).toBe(2);
+    expect(parsed.payload.dose_number).toBe(2);
+    expect(parsed.payload.metadata.lot).toBe('LOT-42');
+  });
+
+  it('does not misclassify v1 and v2 payloads as different event types', () => {
+    expect(parseEvent(v1Raw).event_type).toBe(parseEvent(v2Raw).event_type);
+  });
+
+  it('stores and retrieves versioned payloads without misclassification', () => {
+    const parsedV1 = parseEvent(v1Raw);
+    const parsedV2 = parseEvent(v2Raw);
+    upsertEvents([parsedV1, parsedV2]);
+
+    const stored = queryEvents({ event_type: 'VaccinationMinted' });
+    const byId = new Map(stored.map((e) => [e.id, e]));
+
+    expect(byId.get('raw-v1-001').payload.schema_version).toBe(1);
+    expect(byId.get('raw-v2-001').payload.schema_version).toBe(2);
+    expect(byId.get('raw-v2-001').payload.dose_number).toBe(2);
+    expect(byId.get('raw-v1-001').event_type).toBe('VaccinationMinted');
+    expect(byId.get('raw-v2-001').event_type).toBe('VaccinationMinted');
+  });
+});
+
 describe('GET /events route', () => {
   const request = require('supertest');
   const app = require('../src/app');

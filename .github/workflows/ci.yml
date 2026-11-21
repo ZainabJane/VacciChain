@@ -33,6 +33,31 @@ jobs:
         working-directory: contracts
         run: make build
 
+      - name: Compute WASM artifact hash
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          # Hash every deployable .wasm produced by the build.
+          find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > artifacts/wasm-sha256.txt
+          cat artifacts/wasm-sha256.txt
+
+      - name: Upload WASM artifact hash
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-wasm-hash
+          path: contracts/artifacts/wasm-sha256.txt
+          retention-days: 90
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-wasm
+          path: contracts/target/wasm32-unknown-unknown/release/*.wasm
+          retention-days: 90
+
       - name: Run contract tests
         working-directory: contracts
         run: cargo test
@@ -63,6 +88,70 @@ jobs:
         with:
           name: contract-audit-report
           path: contracts/audit-report.txt
+
+  # Reproducible WASM build verification (Backlog #93).
+  # Rebuilds the contract WASM on a clean runner using the pinned toolchain,
+  # computes its SHA-256 hash, and compares it to the hash produced by the
+  # primary `contract` job. Fails if the hashes differ.
+  #
+  # Known nondeterministic inputs (documented per acceptance criteria):
+  #   - Rust toolchain is pinned via rust-toolchain.toml (channel + components).
+  #   - Cargo dependencies are pinned via contracts/Cargo.lock.
+  #   - The build is expected to be byte-for-byte reproducible; if a future
+  #     toolchain introduces nondeterminism, record it here and in
+  #     contracts/REPRODUCIBLE_BUILD.md.
+  reproducible-wasm:
+    name: Reproducible WASM build
+    runs-on: ubuntu-latest
+    needs: [contract]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Build WASM (clean runner)
+        working-directory: contracts
+        run: make build
+
+      - name: Compute WASM artifact hash
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > artifacts/wasm-sha256.txt
+          cat artifacts/wasm-sha256.txt
+
+      - name: Download primary build hash
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-wasm-hash
+          path: primary-hash
+
+      - name: Compare hashes
+        run: |
+          set -euo pipefail
+          echo "Primary build hash:"
+          cat primary-hash/wasm-sha256.txt
+          echo "Reproduced build hash:"
+          cat contracts/artifacts/wasm-sha256.txt
+          if ! diff -u primary-hash/wasm-sha256.txt contracts/artifacts/wasm-sha256.txt; then
+            echo "::error::WASM artifact hashes differ between builds; the build is not reproducible."
+            exit 1
+          fi
+          echo "WASM artifact hashes match — build is reproducible."
+
+      - name: Upload reproduced WASM hash
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-wasm-hash-reproduced
+          path: contracts/artifacts/wasm-sha256.txt
+          retention-days: 90
 
   backend:
     name: Node.js backend
@@ -214,12 +303,13 @@ jobs:
   all-tests:
     name: All tests passed
     runs-on: ubuntu-latest
-    needs: [contract, backend, frontend, python]
+    needs: [contract, reproducible-wasm, backend, frontend, python]
     if: always()
     steps:
       - name: Check all test jobs succeeded
         run: |
           if [[ "${{ needs.contract.result }}" != "success" || \
+                "${{ needs.reproducible-wasm.result }}" != "success" || \
                 "${{ needs.backend.result }}"  != "success" || \
                 "${{ needs.frontend.result }}"  != "success" || \
                 "${{ needs.python.result }}"    != "success" ]]; then

@@ -3,6 +3,181 @@
 use soroban_sdk::{Address, Env, String as SorobanString, testutils::Address as TestAddress, Vec};
 use crate::{VacciChainContract, ContractError, storage::VaccinationRecord};
 
+// ---------------------------------------------------------------------------
+// Upgrade authorization tests (see docs/contract-upgrade.md)
+//
+// Upgrade rules under test:
+//   * Only the stored admin may propose an upgrade.
+//   * A proposal must be approved by the admin before it becomes effective.
+//   * The artifact hash must be reviewed/recorded before approval.
+//   * Rollback is only permitted to the immediately previous version and only
+//     while no post-upgrade writes have occurred.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_unauthorized_upgrade_proposal_fails() {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+    let attacker = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+
+    // A non-admin caller must not be able to propose an upgrade.
+    let result = VacciChainContract::propose_upgrade(
+        env.clone(),
+        attacker.clone(),
+        2,
+        SorobanString::from_slice(&env, b"deadbeef"),
+    );
+    assert_eq!(
+        result,
+        Err(ContractError::Unauthorized),
+        "non-admin upgrade proposal must fail"
+    );
+}
+
+#[test]
+fn test_upgrade_requires_approval_before_effective() {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+
+    // Propose a v2 upgrade as the admin.
+    let propose = VacciChainContract::propose_upgrade(
+        env.clone(),
+        admin.clone(),
+        2,
+        SorobanString::from_slice(&env, b"deadbeef"),
+    );
+    assert!(propose.is_ok(), "admin proposal should succeed");
+
+    // Without approval the upgrade must not be effective.
+    let effective = VacciChainContract::is_upgrade_approved(env.clone());
+    assert!(!effective, "upgrade must not be effective before approval");
+
+    // Approval by the admin makes it effective.
+    let approve = VacciChainContract::approve_upgrade(env.clone(), admin.clone());
+    assert!(approve.is_ok(), "admin approval should succeed");
+    assert!(
+        VacciChainContract::is_upgrade_approved(env.clone()),
+        "upgrade should be effective after approval"
+    );
+}
+
+#[test]
+fn test_upgrade_requires_artifact_review() {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+
+    // Proposing with an empty artifact hash (unreviewed artifact) must fail.
+    let result = VacciChainContract::propose_upgrade(
+        env.clone(),
+        admin.clone(),
+        2,
+        SorobanString::from_slice(&env, b""),
+    );
+    assert_eq!(
+        result,
+        Err(ContractError::InvalidInput),
+        "upgrade with unreviewed artifact must fail"
+    );
+}
+
+#[test]
+fn test_rollback_limited_to_previous_version() {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+
+    // Rollback without any prior upgrade must fail.
+    let result = VacciChainContract::rollback_upgrade(env.clone(), admin.clone());
+    assert_eq!(
+        result,
+        Err(ContractError::InvalidInput),
+        "rollback with no previous version must fail"
+    );
+}
+
+#[test]
+fn test_unauthorized_rollback_fails() {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+    let attacker = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+
+    let result = VacciChainContract::rollback_upgrade(env.clone(), attacker.clone());
+    assert_eq!(
+        result,
+        Err(ContractError::Unauthorized),
+        "non-admin rollback must fail"
+    );
+}
+
+#[test]
+fn test_state_valid_across_supported_upgrade_path() {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+    let issuer = TestAddress::random(&env);
+    let patient = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+    let _ = VacciChainContract::add_issuer(
+        env.clone(),
+        issuer.clone(),
+        SorobanString::from_slice(&env, b"Test Issuer"),
+        SorobanString::from_slice(&env, b"LIC123"),
+        SorobanString::from_slice(&env, b"US"),
+    );
+    let _ = VacciChainContract::register_patient(env.clone(), patient.clone());
+
+    let vaccine_name = SorobanString::from_slice(&env, b"COVID-19");
+    let date = SorobanString::from_slice(&env, b"2024-01-15");
+
+    let token_id = VacciChainContract::mint_vaccination(
+        env.clone(),
+        patient.clone(),
+        vaccine_name.clone(),
+        date.clone(),
+        issuer.clone(),
+        None,
+        None,
+    ).expect("mint should succeed");
+
+    // Perform the supported v1 -> v2 upgrade path (propose + approve).
+    let _ = VacciChainContract::propose_upgrade(
+        env.clone(),
+        admin.clone(),
+        2,
+        SorobanString::from_slice(&env, b"deadbeef"),
+    ).expect("proposal should succeed");
+    let _ = VacciChainContract::approve_upgrade(env.clone(), admin.clone())
+        .expect("approval should succeed");
+
+    // State must remain valid after the upgrade.
+    let (vaccinated, records, _) = VacciChainContract::verify_vaccination(env.clone(), patient.clone());
+    assert!(vaccinated, "patient should still be vaccinated after upgrade");
+    assert_eq!(records.len(), 1, "should still have 1 record");
+    assert_eq!(records.get(0).unwrap().token_id, token_id, "token_id should match");
+    assert_eq!(records.get(0).unwrap().vaccine_name, vaccine_name, "vaccine_name should match");
+}
+
 #[test]
 fn test_upgrade_v1_to_v2_data_persistence() {
     let env = Env::default();

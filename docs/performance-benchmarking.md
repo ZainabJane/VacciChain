@@ -81,6 +81,47 @@ mint_vaccination: 12,345 instructions
 verify_vaccination: 5,678 instructions
 ```
 
+### Batch Verification Resource Tests
+
+Batch verification is bounded by an explicit per-invocation limit. The maximum
+batch size is **`MAX_BATCH_SIZE`** (defined in the contract source). This limit
+is documented in the contract and validated **before** any expensive storage
+access, so over-limit requests are rejected cheaply without touching persistent
+state.
+
+The resource tests cover:
+
+- **Maximum batch size**: a batch of exactly `MAX_BATCH_SIZE` entries is
+  accepted and completes within the per-invocation resource budget.
+- **Mixed results**: a batch containing a mix of valid and invalid entries
+  returns per-entry results without aborting the whole batch.
+- **Over-limit rejection**: a batch of `MAX_BATCH_SIZE + 1` entries is rejected
+  before storage access, keeping resource usage bounded.
+
+Run the batch verification resource tests with:
+
+```bash
+# From the contracts directory
+cargo test batch_verification
+```
+
+To see instruction/resource counts for the batch tests:
+
+```bash
+cargo test batch_verification -- --nocapture
+```
+
+#### Interpreting Batch Results
+
+- **Accepted at max size**: the maximum-size batch should pass; if it fails,
+  either the limit or the resource budget needs review.
+- **Mixed batch**: each entry should report its own result; a single invalid
+  entry must not fail the entire batch.
+- **Over-limit rejection**: an over-limit batch must be rejected up front. If
+  it reaches storage access, the pre-validation guard is missing or misplaced.
+- **Resource usage**: compare reported instruction counts against the baseline;
+  a large increase at the maximum batch size signals a regression.
+
 ## Regression Thresholds
 
 - **Response time**: Alert if >20% slower than baseline

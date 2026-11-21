@@ -18,8 +18,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.84.0"
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
@@ -34,16 +35,46 @@ jobs:
 
       - name: Install Stellar CLI
         run: |
-          cargo install --locked stellar-cli --features opt
+          cargo install --locked stellar-cli --version 22.0.1 --features opt
 
       - name: Build WASM
         run: make build
+
+      - name: Generate and record WASM artifact hash
+        id: wasm_hash
+        run: |
+          WASM=target/wasm32-unknown-unknown/release/vaccichain.wasm
+          SHA256=$(sha256sum "$WASM" | awk '{print $1}')
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "WASM SHA-256: $SHA256"
+          echo "$SHA256  vaccichain.wasm" > vaccichain.wasm.sha256
+          echo "### WASM artifact hash" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$SHA256  vaccichain.wasm" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload WASM artifact and hash
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaccichain-wasm-${{ github.sha }}
+          path: |
+            contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm
+            contracts/vaccichain.wasm.sha256
+          if-no-files-found: error
 
       - name: Deploy to Stellar Testnet
         id: deploy
         env:
           ADMIN_SECRET_KEY: ${{ secrets.ADMIN_SECRET_KEY }}
+          EXPECTED_WASM_SHA256: ${{ steps.wasm_hash.outputs.sha256 }}
         run: |
+          WASM=target/wasm32-unknown-unknown/release/vaccichain.wasm
+          ACTUAL_SHA256=$(sha256sum "$WASM" | awk '{print $1}')
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_WASM_SHA256" ]; then
+            echo "WASM hash mismatch: expected $EXPECTED_WASM_SHA256, got $ACTUAL_SHA256" >&2
+            exit 1
+          fi
+          echo "Verified WASM SHA-256: $ACTUAL_SHA256"
           CONTRACT_ID=$(stellar contract deploy \
             --wasm target/wasm32-unknown-unknown/release/vaccichain.wasm \
             --source "$ADMIN_SECRET_KEY" \

@@ -64,7 +64,7 @@ and border agencies can verify vaccination status on-chain without a central dat
 | `add_issuer(issuer, name, license, country)` | Authorizes a healthcare provider. Stores `IssuerRecord`. Emits `iss_add`. |
 | `revoke_issuer(issuer)` | Sets `IssuerRecord.authorized = false`. Record preserved for audit. |
 | `propose_admin(new_admin)` | Two-step admin transfer. Sets pending admin with 24-hour expiry. |
-| `upgrade(new_wasm_hash)` | Replaces contract WASM. Emits `upgraded`. |
+| `upgrade(new_wasm_hash)` | Replaces contract WASM. Requires current admin `require_auth()`; the new WASM hash must be reviewed and approved per the upgrade policy (see §7.1). Emits `upgraded` (schema v1). |
 
 ### Issuer functions (require issuer `require_auth()` + issuer allowlist check)
 
@@ -84,7 +84,7 @@ and border agencies can verify vaccination status on-chain without a central dat
 | Function | Description |
 |---|---|
 | `verify_vaccination(wallet)` | Returns `(bool, Vec<VaccinationRecord>)` — active (non-revoked) records only. |
-| `batch_verify(wallets)` | Batch version, max 100 wallets. |
+| `batch_verify(wallets)` | Batch version. Maximum batch size is `MAX_BATCH_SIZE = 100` wallets, documented in `src/verify.rs` and validated against `wallets.len()` before any storage access. Over-limit input is rejected with a structured `BatchTooLarge` error (no panic, no partial reads). |
 | `is_issuer(address)` | Returns `true` if address is an authorized issuer. |
 | `get_all_issuers(start, limit)` | Paginated list of authorized issuers. |
 | `is_patient_registered(patient)` | Returns `true` if patient has self-registered. |
@@ -185,6 +185,26 @@ named address has signed the invocation. There is no off-chain bypass.
 6. **No reentrancy risk.** Soroban's single-entry invocation model prevents reentrancy.
    Cross-contract calls are not used.
 
+### 7.1 Upgrade Authorization and Compatibility
+
+Contract upgrades are a privileged, admin-only operation. The process is:
+
+1. **Proposal.** A release candidate WASM is built reproducibly (see §11) and its
+   SHA-256 hash is published alongside the reviewed source tag.
+2. **Approval.** At least one reviewer independent of the author must approve the
+   artifact hash and the diff against the previous release. The approval record is
+   stored off-chain in the release notes.
+3. **Execution.** The current admin calls `upgrade(new_wasm_hash)` with the approved
+   hash. The host enforces `require_auth()` on the admin address; any other caller
+   fails with an auth error and no state change.
+4. **Rollback.** Soroban does not support reverting to a previous WASM in place.
+   Rollback requires a new `upgrade` call to the prior approved hash, which must
+   itself go through steps 1–3. There is no time-limited rollback window.
+
+Client compatibility: storage layout and event schemas are versioned (see §9). A
+new WASM must remain backward compatible with the previous schema version for at
+least one release cycle, or ship a migration path documented in the release notes.
+
 ---
 
 ## 8. Known Limitations (Pre-Audit)
@@ -196,31 +216,65 @@ These are documented issues that must be resolved before the audit. See
 |---|---|
 | Contract does not compile (15 errors) | No deployable artifact from current source |
 | `is_issuer` always returns false (key mismatch) | Minting is permanently broken |
-| `batch_verify` panics on oversized input | Opaque error, no structured response |
+| `batch_verify` panics on oversized input | Opaque error, no structured response (target: structured `BatchTooLarge`, see §4) |
 | Record limit exceeded panics | Opaque error, no structured response |
 | Persistent storage TTL never extended | Records may be evicted from ledger |
+| Event schemas not versioned in emitted topics | Indexers cannot distinguish payload versions after upgrade (see §9) |
+| No reproducible build pipeline | Release WASM hash cannot be independently verified (see §11) |
 
 ---
 
 ## 9. Events
 
-| Event topic | Payload | Emitted by |
+Event schemas are versioned. Every emitted event carries a `schema_version: u32`
+field as the final element of its payload, and the topic tuple includes the
+version so indexers can route payloads without decoding them first. The current
+schema version is **1**; new fields are appended (never reordered or removed)
+and a version bump is required for any breaking change.
+
+| Event topic | Payload (schema v1) | Emitted by |
 |---|---|---|
-| `(minted, token_id)` | `(patient, vaccine_name, issuer, timestamp)` | `mint_vaccination` |
-| `(revoked, token_id)` | `(revoker, timestamp)` | `revoke_vaccination` |
-| `(iss_add,)` | `(issuer, admin, timestamp)` | `add_issuer` |
-| `(iss_rev,)` | `(issuer, admin, timestamp)` | `emit_issuer_revoked` (not called) |
-| `(adm_prop,)` | `(current_admin, new_admin, expires_at)` | `propose_admin` |
-| `(adm_acc,)` | `(new_admin, timestamp)` | `accept_admin` |
-| `(upgraded,)` | `(new_wasm_hash, admin, timestamp)` | `upgrade` |
-| `(pat_reg,)` | `(patient, timestamp)` | `register_patient` |
+| `(minted, token_id, v1)` | `(patient, vaccine_name, issuer, timestamp, schema_version)` | `mint_vaccination` |
+| `(revoked, token_id, v1)` | `(revoker, timestamp, schema_version)` | `revoke_vaccination` |
+| `(iss_add, v1)` | `(issuer, admin, timestamp, schema_version)` | `add_issuer` |
+| `(iss_rev, v1)` | `(issuer, admin, timestamp, schema_version)` | `emit_issuer_revoked` (not called) |
+| `(adm_prop, v1)` | `(current_admin, new_admin, expires_at, schema_version)` | `propose_admin` |
+| `(adm_acc, v1)` | `(new_admin, timestamp, schema_version)` | `accept_admin` |
+| `(upgraded, v1)` | `(new_wasm_hash, admin, timestamp, schema_version)` | `upgrade` |
+| `(pat_reg, v1)` | `(patient, timestamp, schema_version)` | `register_patient` |
+
+Compatibility rules:
+
+- Indexers must key on the version element in the topic and ignore unknown
+  trailing payload fields (forward compatibility).
+- A payload with an unknown version must be recorded but not interpreted.
+- Contract tests assert the exact topic tuple and payload shape for each event,
+  and indexer fixtures in the backend test suite validate the same shapes.
 
 > **Note:** `emit_issuer_revoked` is defined in `events.rs` but never called by
 > `revoke_issuer`. Revocation events are not emitted.
 
 ---
 
-## 10. Audit Scope
+## 10. Reproducible Builds
+
+Release WASM artifacts must be independently reproducible from the reviewed
+source tag:
+
+- **Toolchain pinning.** The Rust toolchain is pinned via `rust-toolchain.toml`
+  and the Soroban SDK version is pinned in `Cargo.toml`; `Cargo.lock` is
+  committed and must not be regenerated for a release build.
+- **Build command.** `cargo build --release --target wasm32-unknown-unknown`
+  with `SOURCE_DATE_EPOCH` set from the release tag commit time.
+- **Artifact hash.** The SHA-256 of the resulting `.wasm` is published in the
+  release notes and compared against the hash passed to `upgrade`.
+- **Clean runner.** A CI job on a clean runner rebuilds the artifact and fails
+  the release if the hash differs. Any nondeterministic input (e.g. absolute
+  paths, build timestamps) must be documented in the release notes.
+
+---
+
+## 11. Audit Scope
 
 The following are **in scope** for the external audit:
 
@@ -230,9 +284,10 @@ The following are **in scope** for the external audit:
 - Duplicate detection and record limit enforcement
 - Soulbound enforcement (`transfer` always reverts)
 - Admin transfer two-step flow and expiry
-- Contract upgrade authorization
-- Input validation completeness
-- Event emission correctness and completeness
+- Contract upgrade authorization and rollback limitations (§7.1)
+- Input validation completeness, including batch size limits (§4)
+- Event emission correctness, completeness, and schema versioning (§9)
+- Reproducible build process and artifact hash verification (§10)
 - Soroban-specific concerns: storage TTL, auth model, host function usage
 
 The following are **out of scope** for the contract audit (covered separately):

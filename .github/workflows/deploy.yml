@@ -23,8 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Toolchain is pinned via contracts/rust-toolchain.toml so the build is reproducible.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ vars.RUST_TOOLCHAIN || '1.84.0' }}
           targets: wasm32-unknown-unknown
 
       - uses: actions/cache@v4
@@ -33,7 +35,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             contracts/target
-          key: cargo-${{ hashFiles('contracts/Cargo.lock') }}
+          key: cargo-${{ hashFiles('contracts/Cargo.lock', 'contracts/rust-toolchain.toml') }}
 
       - name: Build WASM
         working-directory: contracts
@@ -43,17 +45,47 @@ jobs:
         id: hash
         run: echo "hash=$(sha256sum contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
+      - name: Verify reproducible build hash
+        id: verify
+        env:
+          WASM_HASH: ${{ steps.hash.outputs.hash }}
+        run: |
+          set -euo pipefail
+          EXPECTED_FILE=contracts/release-hashes.txt
+          if [ ! -f "$EXPECTED_FILE" ]; then
+            echo "::error::Missing $EXPECTED_FILE with reviewed release hashes"
+            exit 1
+          fi
+          EXPECTED=$(grep -E "^${GITHUB_SHA}[[:space:]]" "$EXPECTED_FILE" | awk '{print $2}' || true)
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::No reviewed hash recorded for commit $GITHUB_SHA in $EXPECTED_FILE"
+            exit 1
+          fi
+          if [ "$EXPECTED" != "$WASM_HASH" ]; then
+            echo "::error::WASM hash mismatch: expected $EXPECTED, got $WASM_HASH"
+            exit 1
+          fi
+          echo "WASM hash verified against reviewed release: $WASM_HASH"
+          echo "verified=true" >> "$GITHUB_OUTPUT"
+
       - uses: actions/upload-artifact@v4
         with:
           name: vaccichain-wasm
           path: contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm
           retention-days: 7
 
+      - name: Write build hash to summary
+        run: |
+          echo "### Reproducible Build" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **WASM SHA-256:** \`${{ steps.hash.outputs.hash }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Toolchain:** \`${{ vars.RUST_TOOLCHAIN || '1.84.0' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commit:** \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+
   deploy-testnet:
     name: Deploy → Testnet
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.network == 'testnet')
+    if: needs.build.outputs.wasm-hash != '' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.network == 'testnet'))
     environment:
       name: testnet
       url: https://stellar.expert/explorer/testnet/contract/${{ steps.deploy.outputs.contract_id }}
@@ -111,7 +143,7 @@ jobs:
     name: Deploy → Mainnet
     needs: [build, deploy-testnet]
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && inputs.network == 'mainnet'
+    if: needs.build.outputs.wasm-hash != '' && github.event_name == 'workflow_dispatch' && inputs.network == 'mainnet'
     environment:
       name: mainnet
       url: https://stellar.expert/explorer/public/contract/${{ steps.deploy.outputs.contract_id }}
