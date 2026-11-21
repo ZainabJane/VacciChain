@@ -75,43 +75,112 @@ pub fn compute_token_id(
 }
 
 
+/// Maximum number of vaccination records a single patient wallet may hold.
+///
+/// Enforced when minting records and when appending to `DataKey::PatientTokens`.
+/// Bounds the stored collection size to keep reads/writes within Soroban
+/// resource limits.
+pub const MAX_PATIENT_RECORDS: u32 = 100;
+
+/// Maximum number of authorized issuers that may be stored in
+/// `DataKey::IssuerList`.
+///
+/// Enforced when registering issuers. Bounds the stored collection size to keep
+/// reads/writes within Soroban resource limits.
+pub const MAX_ISSUER_LIST: u32 = 100;
+
+/// On-chain field policy for `VaccinationRecord`.
+///
+/// Classification of each field:
+/// * **Pseudonymous** — `patient`, `issuer`: wallet addresses only; they are
+///   pseudonymous identifiers and must never be linked to real-world identity
+///   on-chain.
+/// * **Public-safe** — `token_id`, `timestamp`, `schema_version`, `revoked`,
+///   `dose_number`, `dose_series`: non-identifying protocol/administrative data.
+/// * **Public-safe (bounded)** — `vaccine_name`, `date_administered`: minimal
+///   clinical detail required for verifiability; both are length-bounded.
+///
+/// **Prohibited fields.** Patient names, contact data (email, phone, postal
+/// address), national/insurance identifiers, and unnecessary clinical details
+/// (diagnoses, allergies, provider notes, free-form metadata) MUST NOT be
+/// embedded in this immutable public contract state.
+///
+/// **Residual linkability risks.** Even with the minimized schema above:
+/// * Wallet-to-record correlation: all records for a patient share the same
+///   `patient` address, so an observer can correlate a wallet's full history.
+/// * Timing correlation: `timestamp` (and the ledger sequence mixed into
+///   `token_id`) can correlate a record with the minting transaction.
+/// * Token ID derivation: `token_id` is deterministic over patient, vaccine,
+///   date, issuer, and ledger sequence, so equal inputs yield equal IDs and
+///   can be used to confirm guesses about a record.
+/// These risks are documented and accepted by the privacy review; they must be
+/// re-evaluated before any schema change.
 #[contracttype]
 #[derive(Clone)]
 pub struct VaccinationRecord {
     /// Unique token identifier for the vaccination record.
+    /// Classification: public-safe (see residual linkability notes above).
     pub token_id: u64,
     /// The patient wallet address owning this record.
+    /// Classification: pseudonymous — never store identity data here.
     pub patient: Address,
     /// Vaccine name, stored as a Soroban string.
+    /// Classification: public-safe (bounded); no free-form clinical notes.
     pub vaccine_name: String,
     /// Date when the vaccine was administered.
+    /// Classification: public-safe (bounded); date only, no location data.
     pub date_administered: String,
     /// Issuer address that minted the record.
+    /// Classification: pseudonymous — wallet address only.
     pub issuer: Address,
     /// Ledger timestamp at mint time.
+    /// Classification: public-safe; subject to timing correlation.
     pub timestamp: u64,
     /// Schema version for backwards compatibility.
+    /// Classification: public-safe.
     pub schema_version: u32,
     /// Revocation flag; true when this record has been revoked.
+    /// Classification: public-safe.
     pub revoked: bool,
     /// Which dose in the series this record represents (e.g. 1, 2, 3).
     /// `None` indicates a single-dose or legacy record.
+    /// Classification: public-safe.
     pub dose_number: Option<u32>,
     /// Total doses required for the series (e.g. 3 for a primary series).
     /// `None` indicates a single-dose or legacy record.
+    /// Classification: public-safe.
     pub dose_series: Option<u32>,
 }
 
+/// On-chain field policy for `IssuerRecord`.
+///
+/// Classification of each field:
+/// * **Public-safe** — `name`, `license`, `country`, `authorized`: issuer
+///   organizational metadata required for verification and authorization.
+///
+/// **Prohibited fields.** Personal contact data for individual staff
+/// (names of natural persons, email, phone, postal address) and any clinical
+/// or patient-linked details MUST NOT be embedded in this immutable public
+/// contract state. Only organizational identifiers are permitted.
+///
+/// **Residual linkability risks.** Issuer metadata is public and immutable, so
+/// an issuer's `license`/`country` can be correlated with the `issuer` address
+/// appearing in `VaccinationRecord` entries, revealing issuance volume and
+/// timing patterns. This is accepted by the privacy review.
 #[contracttype]
 #[derive(Clone)]
 pub struct IssuerRecord {
     /// Human-friendly issuer name.
+    /// Classification: public-safe (organizational only).
     pub name: String,
     /// Issuer license or registration identifier.
+    /// Classification: public-safe (organizational only).
     pub license: String,
     /// Issuer country of operation.
+    /// Classification: public-safe.
     pub country: String,
     /// Authorization status for minting vaccination records.
+    /// Classification: public-safe.
     pub authorized: bool,
 }
 
@@ -130,8 +199,10 @@ pub enum DataKey {
     /// Hashed issuer metadata index.
     IssuerMeta(BytesN<32>),
     /// List of authorized issuers.
+    /// Bounded by `MAX_ISSUER_LIST`.
     IssuerList,
     /// Token IDs owned by a patient wallet.
+    /// Bounded by `MAX_PATIENT_RECORDS`.
     PatientTokens(Address),
     /// Patient allowlist flag for self-registration.
     PatientAllowlist(Address),

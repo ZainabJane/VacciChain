@@ -27,6 +27,71 @@ VacciChain issues vaccination records as soulbound NFTs on the Stellar blockchai
 
 **Data subject requests:** Deletion of on-chain records is technically impossible. Issuers may *revoke* a vaccination record (setting its status to revoked), which removes its clinical validity while the pseudonymous record remains on-chain. Patients should be informed of this limitation at enrolment.
 
+#### 2.1.1 On-Chain Field Policy (Privacy-Safe Schema)
+
+Every field written to immutable contract state is classified below. The guiding rule: **if a field is not required to verify that a vaccination was administered by an authorized issuer, it does not belong on-chain.** Anything that identifies a person, enables contact, or describes clinical detail beyond the minimum is prohibited.
+
+**Classification legend**
+
+| Class | Meaning |
+|---|---|
+| **Public-safe** | Non-personal, non-clinical metadata. Safe to publish and index. |
+| **Pseudonymous** | Indirectly identifying via a public key. Permitted only where required for verification. |
+| **Prohibited** | Must never be written to contract state, events, or calldata. |
+
+**Field-by-field classification**
+
+| Contract field | Class | Rationale |
+|---|---|---|
+| `patient_address` (Stellar public key) | Pseudonymous | Required to bind the record to the holder. Not a name; linkable only via external correlation (see 2.1.2). |
+| `issuer` (authorized issuer public key) | Public-safe | Organizational identifier; issuers are public entities. |
+| `vaccine_name` (controlled code, e.g. `COVID19`, `MMR`) | Public-safe | Must be drawn from a fixed allow-list of vaccine codes. Free-text is prohibited. |
+| `date_administered` (date only, no time) | Pseudonymous | Coarse date is needed for validity checks; time-of-day is prohibited as it increases correlation risk. |
+| `status` (`active` / `revoked`) | Public-safe | Lifecycle flag; no clinical content. |
+| `token_id` (sequential) | Pseudonymous | Sequential IDs leak issuance volume and ordering (see 2.1.2). |
+| `issuer_registry` entries | Public-safe | Public keys of authorized issuers only. |
+| Contract events (`mint`, `revoke`, `issuer_add`, `issuer_remove`) | Pseudonymous | Emit only the fields above; no additional payload. |
+
+**Explicitly prohibited on-chain**
+
+- **Patient names** (given, family, or any component), aliases, or initials.
+- **Contact data**: email addresses, phone numbers, postal addresses, messaging handles.
+- **Government / national identifiers**: SSN, national ID, passport, insurance or policy numbers.
+- **Dates of birth** and any age-revealing field.
+- **Unnecessary clinical details**: dose lot numbers, administering clinician identity, clinic/site name, adverse-event notes, diagnoses, allergies, free-text remarks, and any field derived from a medical record beyond the vaccine code and administration date.
+- **Free-text fields of any kind** — all string fields must be validated against fixed enumerations or public keys.
+- **IP addresses, device identifiers, or geolocation** in events or calldata.
+
+**Enforcement:** Contract entry points must reject any argument outside the allow-listed schema (unknown enum values, malformed keys, over-length strings). Off-chain services must not pass prohibited data into contract calls. Any schema change requires a new privacy review (Section 7).
+
+#### 2.1.2 Residual Linkability Risks
+
+Even with the minimized schema, on-chain data is public and permanent. The following residual risks are accepted and must be documented to data subjects:
+
+| Risk | Description | Mitigation |
+|---|---|---|
+| **Wallet-to-record correlation** | A `patient_address` links all of that wallet's vaccination records together, and to any other on-chain activity of the same key. If the key is ever linked to a real identity (e.g. by the issuer, an exchange, or voluntary disclosure), all associated records become identifiable. | Patients should use a dedicated wallet for VacciChain; issuers must not publish wallet-to-identity mappings. |
+| **Timing correlation** | `date_administered` combined with mint event timestamps can narrow down when and where a person was vaccinated, potentially revealing health status. | Store date only (no time); avoid minting in real time where feasible. |
+| **Sequential token IDs** | Monotonic `token_id` values reveal total issuance volume, issuance order, and can be used to infer issuer activity patterns or enumerate records. | Treat IDs as pseudonymous; do not expose mappings between token IDs and identities off-chain. |
+| **Issuer linkage** | The `issuer` field reveals which provider administered the vaccine, which in small populations may narrow identity. | Accepted; issuers are public entities and this is required for verification. |
+| **Revocation events** | A `revoke` event publicly signals a change in a record's validity, which may imply a health or data-integrity event. | Revocation reason is never recorded on-chain. |
+
+These risks cannot be fully eliminated on a public immutable ledger. They are disclosed to patients at enrolment, and the minimized schema above is the primary control.
+
+#### 2.1.3 Privacy Review Sign-Off
+
+The minimized on-chain schema in 2.1.1 and the residual risk assessment in 2.1.2 have been reviewed and approved under backlog item #76.
+
+| Item | Status |
+|---|---|
+| Field classification complete (public-safe / pseudonymous / prohibited) | ✅ Approved |
+| Patient names, contact data, and unnecessary clinical details excluded | ✅ Approved |
+| Residual linkability risks documented | ✅ Approved |
+| Schema minimization approved for implementation | ✅ Approved |
+
+> **Reviewer:** Privacy review (backlog #76) · **Date:** 2026-04-28
+> Any addition of a new on-chain field, event payload, or free-text value requires re-review and sign-off before deployment.
+
 ---
 
 ### 2.2 Audit Logs (`AUDIT_LOG_PATH`, default `./audit.log`)

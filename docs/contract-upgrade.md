@@ -17,11 +17,25 @@ All existing storage (patient records, issuers, admin) is preserved across upgra
 
 ### 1. Build the new WASM
 
+The WASM must be built from the audited, pinned source revision recorded in the security audit (see [security-audit.md](./security-audit.md)). Do not upgrade from an unreviewed branch or working tree.
+
 ```bash
 cd contracts
+git checkout <AUDITED_COMMIT_SHA>   # pinned, audited revision
 make build
 # outputs: target/wasm32-unknown-unknown/release/vacci_chain.wasm
 ```
+
+Record the SHA-256 hash of the built artifact and confirm it matches the audited WASM hash:
+
+```bash
+sha256sum target/wasm32-unknown-unknown/release/vacci_chain.wasm
+# compare against the audited WASM hash in docs/security-audit.md
+```
+
+If the hash does not match the audited artifact, stop — the build is not the audited code.
+
+> **Re-audit required:** Any upgrade that changes contract code after the audit must trigger a re-audit of the changed code (authorization, storage, lifecycle, upgrade, and privacy properties) before mainnet deployment. Record the new findings and pinned revision in [security-audit.md](./security-audit.md).
 
 ### 2. Upload the WASM to the network (testnet first)
 
@@ -76,7 +90,9 @@ Replace the RPC URL and network passphrase:
 
 ## Security checklist
 
-- [ ] New WASM built from a tagged, reviewed commit
+- [ ] New WASM built from the audited, pinned commit (recorded in `docs/security-audit.md`)
+- [ ] Built WASM SHA-256 hash matches the audited WASM hash
+- [ ] Any post-audit code change has been re-audited and findings recorded
 - [ ] Upgrade tested end-to-end on testnet
 - [ ] Admin key used from a hardware wallet or secure key management system
 - [ ] `upgraded` event confirmed on-chain after execution

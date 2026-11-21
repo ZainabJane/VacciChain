@@ -13,14 +13,22 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 
 | Item | Owner | Status | Notes |
 |------|-------|--------|-------|
+| Record audit scope | Security Lead | ⬜ | Document in-scope contracts, modules, and out-of-scope items (auth, storage, lifecycle, upgrade, privacy) |
+| Pin audited source revision | Dev Lead | ⬜ | Record the exact git commit SHA reviewed by the auditor |
+| Record audited WASM hash | Dev Lead | ⬜ | Record SHA-256 of the built WASM; must match the deployed artifact |
 | Contract code review by external auditor | Security Lead | ⬜ | Engage third-party auditor; allow 2-3 weeks |
+| Record audit findings | Security Lead | ⬜ | Log all findings with severity, status, and remediation links |
 | Audit report remediation | Dev Lead | ⬜ | Address all critical and high findings |
+| Independent verification of critical/high fixes | Security Lead | ⬜ | Auditor re-verifies each critical/high fix before mainnet approval |
 | Audit sign-off | Security Lead | ⬜ | Obtain written approval from auditor |
+| Privacy review sign-off | Security Lead | ⬜ | Approve minimized on-chain schema; document residual linkability risks |
+| Soulbound enforcement review | Security Lead | ⬜ | Threat model covers every ownership-changing operation; tests prove prohibited actions fail without storage mutation or misleading events |
+| Input-bound boundary tests | QA Lead | ⬜ | Zero, maximum valid, and one-over-limit tests for every public argument and stored collection |
 | Internal security review | Tech Lead | ⬜ | Review auth, key management, rate limiting |
 | Dependency vulnerability scan | DevOps | ⬜ | Run `npm audit`, `cargo audit`, `pip audit` |
 | Penetration testing (optional) | Security Lead | ⬜ | Consider for high-value deployments |
 
-**Go/No-Go Criteria**: All critical findings resolved; audit report approved.
+**Go/No-Go Criteria**: Audit scope, pinned source revision, WASM hash, and findings are recorded; all critical and high findings are fixed and independently verified; privacy review and soulbound enforcement review signed off; input-bound boundary tests pass; audit report approved.
 
 ---
 
@@ -156,9 +164,12 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 | Verify CORS is properly configured | Security Lead | ⬜ | Only allow trusted origins |
 | Verify rate limits are active | Security Lead | ⬜ | Test with excessive requests |
 | Verify contract is immutable | Security Lead | ⬜ | Confirm no upgrade path exists |
-| Verify soulbound enforcement | Security Lead | ⬜ | Attempt transfer; should fail |
+| Verify deployed WASM hash matches audited hash | Security Lead | ⬜ | Compare on-chain WASM hash to the hash recorded in the audit |
+| Verify soulbound enforcement | Security Lead | ⬜ | Attempt transfer, approval, clawback, and alternate entry points; all should fail without storage mutation or misleading events |
+| Verify input bounds are enforced | Security Lead | ⬜ | Confirm one-over-limit inputs are rejected for every public argument and stored collection |
+| Verify privacy-safe on-chain fields | Security Lead | ⬜ | Confirm no patient names, contact data, or unnecessary clinical details are stored on-chain |
 
-**Go/No-Go Criteria**: All security checks pass; no vulnerabilities found.
+**Go/No-Go Criteria**: All security checks pass; no vulnerabilities found; deployed WASM matches the audited revision; privacy review and soulbound enforcement verification complete.
 
 ---
 

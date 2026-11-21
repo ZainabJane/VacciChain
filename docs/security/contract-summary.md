@@ -1,13 +1,22 @@
 # VacciChain Contract — Audit-Ready Summary
 
-**Version:** 0.1.0  
-**Date:** 2026-04-28  
+**Version:** 0.2.0  
+**Date:** 2026-05-12  
 **Language:** Rust (Soroban SDK 22.0.0)  
 **Network:** Stellar (Soroban smart contracts)  
 **Lines of code:** ~500 (excluding tests and comments)
 
-> Prepared for external auditors. See `docs/security/pre-audit-notes.md` for known
-> issues that must be resolved before the audit engagement begins.
+**Pinned source revision (audit target):** `git rev-parse HEAD` at engagement start —
+recorded in `docs/security/audit-scope.md` together with the reproducible build command.
+**WASM hash (audit target):** SHA-256 of the release build artifact, recorded in
+`docs/security/audit-scope.md` and re-verified against the deployed contract before
+mainnet approval.
+
+> Prepared for external auditors. All pre-audit findings have been resolved; see
+> `docs/security/pre-audit-notes.md` for the resolution record and
+> `docs/security/audit-scope.md` for scope, pinned revision, WASM hash, and findings.
+> Critical and high findings must be fixed and independently verified before mainnet
+> approval.
 
 ---
 
@@ -70,7 +79,7 @@ and border agencies can verify vaccination status on-chain without a central dat
 
 | Function | Description |
 |---|---|
-| `mint_vaccination(patient, vaccine_name, date_administered, issuer)` | Mints soulbound NFT. Checks patient allowlist, issuer authorization, duplicate detection, per-patient record limit (50). Returns `token_id`. |
+| `mint_vaccination(patient, vaccine_name, date_administered, issuer)` | Mints soulbound NFT. Checks patient allowlist, issuer authorization, duplicate detection, per-patient record limit (50), and input length bounds (see §5.1). Returns `token_id`. |
 | `revoke_vaccination(token_id, revoker)` | Marks record revoked. Original issuer or admin only. Record never deleted. |
 
 ### Patient functions (require patient `require_auth()`)
@@ -84,7 +93,7 @@ and border agencies can verify vaccination status on-chain without a central dat
 | Function | Description |
 |---|---|
 | `verify_vaccination(wallet)` | Returns `(bool, Vec<VaccinationRecord>)` — active (non-revoked) records only. |
-| `batch_verify(wallets)` | Batch version, max 100 wallets. |
+| `batch_verify(wallets)` | Batch version, max 100 wallets. Oversized input returns a structured error instead of panicking. |
 | `is_issuer(address)` | Returns `true` if address is an authorized issuer. |
 | `get_all_issuers(start, limit)` | Paginated list of authorized issuers. |
 | `is_patient_registered(patient)` | Returns `true` if patient has self-registered. |
@@ -119,6 +128,45 @@ pub struct IssuerRecord {
 }
 ```
 
+### 5.1 Input and Collection Bound Policy
+
+All variable-length inputs and collections are bounded on-chain. Exceeding a bound
+returns a structured contract error; no path panics on user-controlled input.
+
+| Input / collection | Bound | Enforcement |
+|---|---|---|
+| `vaccine_name` | 100 chars | `mint_vaccination` rejects oversized input |
+| `date_administered` | 100 chars | `mint_vaccination` rejects oversized input |
+| `IssuerRecord.name` / `.license` / `.country` | 100 chars each | `add_issuer` rejects oversized input |
+| Records per patient (`PatientTokens`) | 50 | `mint_vaccination` returns structured error |
+| `batch_verify` wallet list | 100 wallets | `batch_verify` returns structured error |
+| `get_all_issuers` page size | caller-supplied `limit` | paginated read, no unbounded iteration |
+
+### 5.2 Privacy-Safe Field Classification
+
+On-chain state is immutable and publicly readable. Every field is classified below;
+personally identifying and clinically sensitive data are excluded by policy. See
+`docs/security/privacy-review.md` for the privacy review sign-off and residual
+linkability analysis.
+
+| Field | Classification | Rationale |
+|---|---|---|
+| `token_id` | Public identifier | Opaque sequential ID; no personal meaning |
+| `patient` (Address) | Pseudonymous identifier | Wallet address only; no name or contact data |
+| `vaccine_name` | Sensitive-but-required | Minimum clinical detail needed for verification |
+| `date_administered` | Sensitive-but-required | Minimum clinical detail needed for verification |
+| `issuer` (Address) | Public identifier | Provider wallet address |
+| `timestamp` | Public metadata | Ledger time of mint |
+| `schema_version` | Public metadata | Schema evolution |
+| `revoked` | Public metadata | Verification status |
+| `IssuerRecord.name` / `.license` / `.country` | Public provider metadata | Organizational, not patient, data |
+
+**Excluded by policy (must never be written on-chain):** patient names, dates of birth,
+contact details (email, phone, address), national ID numbers, insurance identifiers,
+free-text clinical notes, and any field not listed above. Residual linkability risk
+(wallet addresses are persistent pseudonyms and can be correlated across records) is
+documented and accepted in the privacy review.
+
 ### Storage Keys (`DataKey` enum)
 ```
 Admin                        → Address (current admin)
@@ -130,10 +178,14 @@ PatientTokens(Address)       → Vec<u64> (token IDs owned by patient)
 Token(u64)                   → VaccinationRecord
 Revoked(u64)                 → bool (redundant with record.revoked)
 PatientAllowlist(Address)    → bool
+IssuerMeta(Address)          → IssuerRecord
+IssuerList                   → Vec<Address>
+NextTokenId                  → u64
+PatientRecordLimit           → u32
 ```
 
-> **Note:** `IssuerMeta`, `IssuerList`, `NextTokenId`, and `PatientRecordLimit` are used
-> in the source but missing from the `DataKey` enum — compile errors. See pre-audit notes.
+> **Note:** All keys used in the source are present in the `DataKey` enum. Persistent
+> storage TTL is extended on every write path.
 
 ---
 
@@ -158,6 +210,15 @@ Anyone      │ No auth required                   │ verify_vaccination, batch
 All privileged operations use Soroban's `require_auth()` — the host enforces that the
 named address has signed the invocation. There is no off-chain bypass.
 
+### 6.1 Soulbound Enforcement Matrix
+
+| Path | Transfer allowed? | Enforcement |
+|---|---|---|
+| `transfer(from, to, token_id)` | No | Always returns `SoulboundToken` error |
+| Record reassignment via `mint_vaccination` | No | `PatientTokens` is append-only per patient; records are never moved |
+| `revoke_vaccination` | N/A | Marks `revoked = true`; record and ownership are never deleted or reassigned |
+| Direct storage write | No | No public function mutates `Token`/`PatientTokens` ownership |
+
 ---
 
 ## 7. Trust Assumptions
@@ -173,11 +234,13 @@ named address has signed the invocation. There is no off-chain bypass.
 
 3. **Patient self-registration.** The patient allowlist prevents unsolicited minting, but
    requires the patient to sign a `register_patient` transaction before receiving records.
-   The backend currently signs this with `ADMIN_SECRET_KEY` as a placeholder — this must
-   be fixed before mainnet (see threat model).
+   The backend signs this with the patient's own key; the earlier `ADMIN_SECRET_KEY`
+   placeholder has been removed.
 
 4. **On-chain data is public.** All vaccination records, issuer lists, and patient wallet
-   addresses are readable by anyone. There is no privacy layer.
+   addresses are readable by anyone. There is no privacy layer; the on-chain schema is
+   minimized per the field classification in §5.2 and residual linkability risk is
+   documented in the privacy review.
 
 5. **Date format not validated.** `date_administered` is a free-form string (max 100 chars).
    The contract does not validate ISO 8601 format or reject future dates.
@@ -187,18 +250,19 @@ named address has signed the invocation. There is no off-chain bypass.
 
 ---
 
-## 8. Known Limitations (Pre-Audit)
+## 8. Resolved Pre-Audit Findings
 
-These are documented issues that must be resolved before the audit. See
-`docs/security/pre-audit-notes.md` for full details.
+All previously documented pre-audit issues have been fixed and covered by tests. See
+`docs/security/pre-audit-notes.md` for the resolution record.
 
-| Issue | Impact |
+| Issue | Resolution |
 |---|---|
-| Contract does not compile (15 errors) | No deployable artifact from current source |
-| `is_issuer` always returns false (key mismatch) | Minting is permanently broken |
-| `batch_verify` panics on oversized input | Opaque error, no structured response |
-| Record limit exceeded panics | Opaque error, no structured response |
-| Persistent storage TTL never extended | Records may be evicted from ledger |
+| Contract did not compile (15 errors) | `DataKey` enum completed; contract builds cleanly |
+| `is_issuer` always returned false (key mismatch) | Storage key usage aligned; covered by tests |
+| `batch_verify` panicked on oversized input | Returns structured error; bound documented in §5.1 |
+| Record limit exceeded panicked | Returns structured error; bound documented in §5.1 |
+| Persistent storage TTL never extended | TTL extended on every write path |
+| `emit_issuer_revoked` never called | `revoke_issuer` now emits `iss_rev` |
 
 ---
 
@@ -209,14 +273,13 @@ These are documented issues that must be resolved before the audit. See
 | `(minted, token_id)` | `(patient, vaccine_name, issuer, timestamp)` | `mint_vaccination` |
 | `(revoked, token_id)` | `(revoker, timestamp)` | `revoke_vaccination` |
 | `(iss_add,)` | `(issuer, admin, timestamp)` | `add_issuer` |
-| `(iss_rev,)` | `(issuer, admin, timestamp)` | `emit_issuer_revoked` (not called) |
+| `(iss_rev,)` | `(issuer, admin, timestamp)` | `revoke_issuer` |
 | `(adm_prop,)` | `(current_admin, new_admin, expires_at)` | `propose_admin` |
 | `(adm_acc,)` | `(new_admin, timestamp)` | `accept_admin` |
 | `(upgraded,)` | `(new_wasm_hash, admin, timestamp)` | `upgrade` |
 | `(pat_reg,)` | `(patient, timestamp)` | `register_patient` |
 
-> **Note:** `emit_issuer_revoked` is defined in `events.rs` but never called by
-> `revoke_issuer`. Revocation events are not emitted.
+> **Note:** `revoke_issuer` emits `iss_rev` via `emit_issuer_revoked`.
 
 ---
 
@@ -231,9 +294,16 @@ The following are **in scope** for the external audit:
 - Soulbound enforcement (`transfer` always reverts)
 - Admin transfer two-step flow and expiry
 - Contract upgrade authorization
-- Input validation completeness
+- Input validation completeness and the input/collection bound policy (§5.1)
+- Privacy-safe field classification and on-chain schema minimization (§5.2)
+- Soulbound enforcement across all paths (§6.1)
 - Event emission correctness and completeness
 - Soroban-specific concerns: storage TTL, auth model, host function usage
+- Contract lifecycle and upgrade authorization
+
+The pinned source revision and WASM hash under audit are recorded in
+`docs/security/audit-scope.md`. Critical and high findings must be fixed and
+independently verified before mainnet approval.
 
 The following are **out of scope** for the contract audit (covered separately):
 

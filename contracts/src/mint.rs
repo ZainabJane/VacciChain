@@ -4,6 +4,10 @@ use crate::events;
 use crate::ContractError;
 use crate::validate_input_length;
 
+/// Maximum number of vaccination records a single patient may hold.
+/// Documented bound for the `PatientTokens` collection (see field policy).
+pub const MAX_RECORDS_PER_PATIENT: u32 = 50;
+
 /// Mint a new vaccination record NFT for a patient.
 ///
 /// This function validates input length, enforces issuer authorization,
@@ -31,6 +35,8 @@ pub fn mint_vaccination(
     dose_number: Option<u32>,
     dose_series: Option<u32>,
 ) -> Result<u64, ContractError> {
+    // Enforce documented maximum lengths before any storage access so that
+    // oversized inputs fail fast without mutating state or emitting events.
     validate_input_length(&vaccine_name, "vaccine_name")?;
     validate_input_length(&date_administered, "date_administered")?;
 
@@ -98,16 +104,24 @@ pub fn mint_vaccination(
     }
 
     // Enforce a per-patient record cap to prevent unbounded storage growth.
+    // This check occurs before any persistent write; exceeding the cap is a
+    // recoverable error rather than a panic so no state is mutated and no
+    // events are emitted on the failure path.
     let limit: u32 = env
         .storage()
         .persistent()
         .get(&DataKey::PatientRecordLimit)
-        .unwrap_or(50u32);
+        .unwrap_or(MAX_RECORDS_PER_PATIENT);
     if tokens.len() >= limit {
-        panic!("record limit exceeded");
+        return Err(ContractError::RecordLimitExceeded);
     }
 
     // Build the vaccination record and persist it under DataKey::Token(token_id).
+    //
+    // Field policy (privacy-safe on-chain schema): only the fields below are
+    // stored. No patient name, contact data, or unnecessary clinical details
+    // are persisted; the patient is referenced solely by wallet address and
+    // the vaccine is referenced by a bounded identifier string.
     let record = VaccinationRecord {
         token_id,
         patient: patient.clone(),

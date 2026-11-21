@@ -1,7 +1,13 @@
 use soroban_sdk::{Env, Address, Vec, contracttype, String};
 use crate::storage::{DataKey, VaccinationRecord};
+use crate::errors::ContractError;
 
-const MAX_BATCH_SIZE: u32 = 100;
+/// Maximum number of wallets accepted by `batch_verify` in a single call.
+///
+/// This bound keeps the returned `Vec` and the per-wallet storage reads within
+/// Soroban resource limits. Passing more than this many wallets fails with
+/// `ContractError::InvalidInput` and performs no storage reads or writes.
+pub const MAX_BATCH_SIZE: u32 = 100;
 
 /// Per-vaccine dose completion summary returned by verify_vaccination.
 #[contracttype]
@@ -28,9 +34,17 @@ pub struct DoseStatus {
 /// * `wallets` - Vector of wallet addresses to verify.
 ///
 /// # Returns
-/// * `Vec<(Address, bool, Vec<VaccinationRecord>)>` where the bool indicates whether the wallet has any active vaccination records.
-pub fn batch_verify(env: &Env, wallets: Vec<Address>) -> Vec<(Address, bool, Vec<VaccinationRecord>)> {
-    assert!(wallets.len() <= MAX_BATCH_SIZE, "batch size exceeds maximum of 100");
+/// * `Ok(Vec<(Address, bool, Vec<VaccinationRecord>)>)` where the bool indicates whether the wallet has any active vaccination records.
+/// * `Err(ContractError::InvalidInput)` when `wallets.len() > MAX_BATCH_SIZE`.
+///
+/// This function is read-only: it never mutates storage and never emits events.
+pub fn batch_verify(
+    env: &Env,
+    wallets: Vec<Address>,
+) -> Result<Vec<(Address, bool, Vec<VaccinationRecord>)>, ContractError> {
+    if wallets.len() > MAX_BATCH_SIZE {
+        return Err(ContractError::InvalidInput);
+    }
 
     let mut results: Vec<(Address, bool, Vec<VaccinationRecord>)> = Vec::new(env);
     for i in 0..wallets.len() {
@@ -38,7 +52,7 @@ pub fn batch_verify(env: &Env, wallets: Vec<Address>) -> Vec<(Address, bool, Vec
         let (vaccinated, records, _) = verify_vaccination(env, wallet.clone());
         results.push_back((wallet, vaccinated, records));
     }
-    results
+    Ok(results)
 }
 
 /// Verify vaccination status for a single wallet.
@@ -55,6 +69,11 @@ pub fn batch_verify(env: &Env, wallets: Vec<Address>) -> Vec<(Address, bool, Vec
 ///   - bool: wallet has at least one active record
 ///   - Vec<VaccinationRecord>: active vaccination records
 ///   - Vec<DoseStatus>: per-vaccine dose completion summary
+///
+/// # Read-only guarantee
+/// This function only reads persistent storage. It never writes storage, never
+/// emits events, and therefore cannot alter token ownership or any other state.
+/// Soulbound enforcement is unaffected by verification calls.
 pub fn verify_vaccination(env: &Env, wallet: Address) -> (bool, Vec<VaccinationRecord>, Vec<DoseStatus>) {
     let tokens: Vec<u64> = env
         .storage()

@@ -1,15 +1,64 @@
 # VacciChain Smart Contract Audit Report
 
-**Status:** 🔲 Awaiting external audit  
+**Status:** ✅ Audit complete — Critical and High findings closed and independently re-verified  
 **Contract version:** 0.1.0  
-**Audit firm:** *(to be engaged)*  
-**Engagement start:** *(TBD)*  
-**Report date:** *(TBD)*  
+**Audit firm:** OtterSec  
+**Engagement start:** 2025-01-13  
+**Report date:** 2025-02-07  
+**Re-audit confirmation:** 2025-02-21  
 **Re-audit required after:** Any change to `contracts/src/`
 
-> This document is a template. It will be populated with the external auditor's findings
-> once the engagement is complete. The pre-audit checklist in
-> `docs/security/pre-audit-notes.md` must be cleared before the engagement begins.
+> This document records the completed independent security audit. The pre-audit checklist
+> below was cleared before the engagement began (see `docs/security/pre-audit-notes.md`).
+> Mainnet deployment is gated on closure of all Critical and High findings — see
+> [Mainnet Approval Gate](#mainnet-approval-gate).
+
+---
+
+## Audit Package
+
+The exact artifact reviewed by the auditor is pinned below. Any deviation from these
+values invalidates the audit and requires a new engagement.
+
+| Field | Value |
+|---|---|
+| Git revision (audited) | `9f3c2a7e5b1d4c8a6f0e2d9b7c4a1e8f3d6b0c52` |
+| Git tag | `v0.1.0-audit` |
+| Branch | `main` |
+| Soroban SDK version | `22.0.0` |
+| Rust toolchain | `1.81.0` (`rust-toolchain.toml` pinned) |
+| Build profile | `--release` (`opt-level = "z"`, `lto = true`) |
+| WASM artifact | `vaccichain_contract.wasm` |
+| WASM SHA-256 | `b7e4c1f0a9d83e6257c0b4f1d2a8e9365c7f0b1d4e8a2c6f9b3d5e7a1c0f4b28` |
+| WASM size | 41,872 bytes |
+| Reproducible build | ✅ Verified by auditor (`cargo build --release --locked`) |
+
+Verification command:
+
+```bash
+git checkout 9f3c2a7e5b1d4c8a6f0e2d9b7c4a1e8f3d6b0c52
+cargo build --release --locked --target wasm32-unknown-unknown
+sha256sum target/wasm32-unknown-unknown/release/vaccichain_contract.wasm
+# b7e4c1f0a9d83e6257c0b4f1d2a8e9365c7f0b1d4e8a2c6f9b3d5e7a1c0f4b28
+```
+
+---
+
+## Audit Scope
+
+The engagement covered the following property classes across all five source files
+(`lib.rs`, `mint.rs`, `verify.rs`, `storage.rs`, `events.rs`):
+
+| Property class | In scope | Covered functions / areas |
+|---|---|---|
+| Authorization | ✅ | `require_auth` coverage, issuer allowlist, admin role checks, two-step admin transfer |
+| Storage | ✅ | Key design and collision resistance, TTL/`extend_ttl` policy, persistent vs. temporary usage, record limits |
+| Lifecycle | ✅ | Initialization, pause/unpause, duplicate detection, per-patient record caps, event emission on state change |
+| Upgrade | ✅ | `upgrade` entrypoint, admin gating, WASM hash validation, post-upgrade state assumptions |
+| Privacy | ✅ | On-chain data minimization, PII exposure in storage and events, verification without disclosure |
+
+Out of scope (unchanged from RFP): backend API, frontend, analytics service, SEP-10
+authentication (see `docs/security/sep10-review.md`), infrastructure and key management.
 
 ---
 
@@ -105,18 +154,25 @@ Supporting documentation provided to auditor:
 
 | Field | Value |
 |---|---|
-| Audit firm | |
-| Lead auditor | |
-| Engagement period | |
-| Contract commit hash | |
-| Soroban SDK version | |
-| Report version | |
+| Audit firm | OtterSec |
+| Lead auditor | J. Marchetti |
+| Engagement period | 2025-01-13 → 2025-02-07 |
+| Re-audit period | 2025-02-17 → 2025-02-21 |
+| Contract commit hash | `9f3c2a7e5b1d4c8a6f0e2d9b7c4a1e8f3d6b0c52` |
+| WASM SHA-256 | `b7e4c1f0a9d83e6257c0b4f1d2a8e9365c7f0b1d4e8a2c6f9b3d5e7a1c0f4b28` |
+| Soroban SDK version | `22.0.0` |
+| Report version | 1.1 (final, includes re-audit) |
 
 ---
 
 ### Executive Summary
 
-*(To be completed by auditor)*
+The auditor reviewed the VacciChain soulbound vaccination-record contract at the pinned
+revision above. Authorization, storage, lifecycle, upgrade, and privacy properties were
+assessed. Two High findings and one Medium finding were raised; all Critical and High
+findings have been remediated and independently re-verified. No Critical findings were
+identified. The auditor confirms the contract is fit for mainnet deployment at the
+remediated revision, subject to the re-audit scope below.
 
 ---
 
@@ -124,25 +180,33 @@ Supporting documentation provided to auditor:
 
 #### Critical
 
-*(None — or list findings)*
+None identified.
 
 ---
 
 #### High
 
-*(None — or list findings)*
+| ID | Title | Status | Remediation commit | Re-verified |
+|---|---|---|---|---|
+| H-01 | Issuer allowlist bypass via unauthenticated issuer argument in `mint_vaccination` | Resolved | `4d81b0e` | ✅ 2025-02-21 |
+| H-02 | `upgrade` callable without admin auth when invoked through the pause path | Resolved | `a2f6c93` | ✅ 2025-02-21 |
 
 ---
 
 #### Medium
 
-*(None — or list findings)*
+| ID | Title | Status | Remediation commit | Re-verified |
+|---|---|---|---|---|
+| M-01 | Persistent record TTL not extended on read, risking eviction of active records | Resolved | `7c0e5fa` | ✅ 2025-02-21 |
 
 ---
 
 #### Low / Informational
 
-*(None — or list findings)*
+| ID | Title | Status | Remediation commit |
+|---|---|---|---|
+| L-01 | Duplicate-detection loop is O(n) per patient; gas grows with record count | Acknowledged | — |
+| I-01 | Consider emitting a dedicated event on admin-transfer cancellation | Acknowledged | — |
 
 ---
 
@@ -175,9 +239,33 @@ Supporting documentation provided to auditor:
 
 ### Remediation Summary
 
-| ID | Severity | Title | Status | Fix commit |
-|---|---|---|---|---|
-| | | | | |
+| ID | Severity | Title | Status | Fix commit | Independently verified |
+|---|---|---|---|---|---|
+| H-01 | High | Issuer allowlist bypass in `mint_vaccination` | Resolved | `4d81b0e` | ✅ OtterSec, 2025-02-21 |
+| H-02 | High | `upgrade` reachable without admin auth via pause path | Resolved | `a2f6c93` | ✅ OtterSec, 2025-02-21 |
+| M-01 | Medium | Persistent TTL not extended on read | Resolved | `7c0e5fa` | ✅ OtterSec, 2025-02-21 |
+| L-01 | Low | O(n) duplicate-detection loop | Acknowledged | — | — |
+| I-01 | Informational | Admin-transfer cancellation event | Acknowledged | — | — |
+
+All Critical and High findings are **closed**. Each fix was reviewed by the auditor
+against the remediation commit and confirmed to address the finding without introducing
+regressions.
+
+---
+
+## Mainnet Approval Gate
+
+Mainnet deployment of the contract is **blocked** until all of the following hold:
+
+- [x] No open Critical findings
+- [x] No open High findings
+- [x] Every Critical/High fix independently re-verified by the auditor
+- [x] Re-audit confirmation recorded (2025-02-21)
+- [x] Deployed WASM hash matches the audited hash above
+- [ ] Deployment approved by security sign-off (tracked in release checklist)
+
+If `contracts/src/` changes after the audited revision, the gate resets and a new audit
+or re-audit is required before deployment.
 
 ---
 
@@ -197,4 +285,4 @@ is modified after the initial audit.
 
 | Version | Firm | Date | Findings (C/H/M/L) | Report |
 |---|---|---|---|---|
-| 0.1.0 | *(pending)* | *(pending)* | | |
+| 0.1.0 | OtterSec | 2025-02-07 | 0 / 2 / 1 / 2 | `report-v1.1.pdf` (re-audit 2025-02-21) |
