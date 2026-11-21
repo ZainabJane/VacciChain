@@ -37,6 +37,17 @@ jobs:
         working-directory: contracts
         run: cargo test
 
+      # Issue #85: deterministic fuzz smoke corpus for public contract entry
+      # points and serialization boundaries. Uses a fixed seed so CI is
+      # reproducible; longer sessions run on the schedule below.
+      - name: Fuzz smoke corpus (deterministic)
+        working-directory: contracts
+        env:
+          PROPTEST_CASES: "256"
+          PROPTEST_MAX_SHRINK_ITERS: "1024"
+          FUZZ_SEED: "0x5eed85"
+        run: cargo test --features fuzz --test fuzz_smoke -- --nocapture
+
       - name: Run contract tests with coverage
         working-directory: contracts
         run: |
@@ -322,6 +333,47 @@ jobs:
             echo "One or more container images contain HIGH or CRITICAL vulnerabilities."
             exit 1
           fi
+
+  # Issue #85: longer fuzz sessions on the weekly schedule (and on demand).
+  fuzz-scheduled:
+    name: Scheduled long fuzz session
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: cargo-fuzz-${{ hashFiles('contracts/Cargo.lock') }}
+
+      - name: Long fuzz session (extended case counts)
+        working-directory: contracts
+        env:
+          PROPTEST_CASES: "100000"
+          PROPTEST_MAX_SHRINK_ITERS: "10000"
+          FUZZ_SEED: "0x5eed85"
+        run: cargo test --features fuzz --test fuzz_smoke -- --nocapture
+
+      - name: Upload fuzz artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-session-artifacts
+          path: |
+            contracts/fuzz/artifacts
+            contracts/proptest-regressions
+          retention-days: 90
 
   container-scan-scheduled:
     name: Weekly container vulnerability scan

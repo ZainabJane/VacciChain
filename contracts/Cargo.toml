@@ -11,7 +11,10 @@ soroban-sdk = { version = "22.0.0" }
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+# Property tests for record invariants (issue #84).
 proptest = "1.4"
+proptest-derive = "0.4"
+# Fuzz harnesses for public contract entry points (issue #85).
 arbitrary = { version = "1.3", features = ["derive"] }
 
 [profile.release]

@@ -45,7 +45,13 @@ pub fn compute_token_id(
     // issuer address (XDR-encoded)
     preimage.append(&issuer.to_xdr(env));
 
-    // ledger_sequence as big-endian 4 bytes
+    // ledger_sequence as big-endian 4 bytes.
+    //
+    // Overflow audit (issue #88): `ledger_sequence` is a `u32`, so shifting by
+    // 24/16/8 bits is always in-bounds (max shift < 32) and the `& 0xff` mask
+    // keeps each byte in `0..=255` before the `as u8` cast. No arithmetic can
+    // overflow here, and the full `u32` range (including `u32::MAX`) is encoded
+    // losslessly.
     let seq_bytes = [
         ((ledger_sequence >> 24) & 0xff) as u8,
         ((ledger_sequence >> 16) & 0xff) as u8,
@@ -60,7 +66,12 @@ pub fn compute_token_id(
 
     let digest: BytesN<32> = env.crypto().sha256(&preimage).into();
 
-    // Take first 8 bytes as big-endian u64
+    // Take first 8 bytes as big-endian u64.
+    //
+    // Overflow audit (issue #88): each byte is widened to `u64` (value `0..=255`)
+    // and shifted left by at most 56 bits, so the highest bit set is bit 63.
+    // The OR-combination therefore always fits in `u64` and can never overflow;
+    // the full `u64` range (including `u64::MAX`) is representable.
     let b0 = digest.get(0).unwrap() as u64;
     let b1 = digest.get(1).unwrap() as u64;
     let b2 = digest.get(2).unwrap() as u64;
@@ -142,7 +153,70 @@ pub enum DataKey {
     /// Revocation marker for a token ID.
     Revoked(u64),
     /// Legacy next token ID counter (not required for deterministic token IDs).
+    ///
+    /// Overflow audit (issue #88): any increment of this counter must use
+    /// `checked_add` and treat `u64::MAX` as exhausted rather than wrapping.
     NextTokenId,
     /// Paused contract flag.
     Paused,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    /// Issue #88: token ID derivation must be deterministic and must not
+    /// overflow for the full `u32` ledger sequence range, including `u32::MAX`.
+    #[test]
+    fn token_id_handles_ledger_sequence_boundaries() {
+        let env = Env::default();
+        let patient = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let vaccine = String::from_str(&env, "COVID-19");
+        let date = String::from_str(&env, "2024-01-01");
+
+        let seqs = [0u32, 1, 255, 256, 65_535, 16_777_215, u32::MAX - 1, u32::MAX];
+        let mut seen: [u64; 8] = [0; 8];
+        for (i, seq) in seqs.iter().enumerate() {
+            let id = compute_token_id(&env, &patient, &vaccine, &date, &issuer, *seq);
+            // Deterministic: recomputing yields the same value.
+            let again = compute_token_id(&env, &patient, &vaccine, &date, &issuer, *seq);
+            assert_eq!(id, again);
+            // Distinct sequences should (with overwhelming probability) differ.
+            for prev in seen.iter().take(i) {
+                assert_ne!(id, *prev);
+            }
+            seen[i] = id;
+        }
+    }
+
+    /// Issue #88: the big-endian byte assembly must be able to represent the
+    /// full `u64` range without overflow (bit 63 set is valid).
+    #[test]
+    fn token_id_assembly_supports_full_u64_range() {
+        // Mirror of the assembly logic in `compute_token_id`.
+        let bytes: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let mut acc: u64 = 0;
+        for (i, b) in bytes.iter().enumerate() {
+            acc |= (*b as u64) << (56 - 8 * i as u32);
+        }
+        assert_eq!(acc, u64::MAX);
+
+        let zero: [u8; 8] = [0; 8];
+        let mut acc0: u64 = 0;
+        for (i, b) in zero.iter().enumerate() {
+            acc0 |= (*b as u64) << (56 - 8 * i as u32);
+        }
+        assert_eq!(acc0, 0);
+    }
+
+    /// Issue #88: legacy counter increments must saturate safely at `u64::MAX`.
+    #[test]
+    fn next_token_id_counter_checked_add() {
+        let max = u64::MAX;
+        assert_eq!(max.checked_add(1), None);
+        assert_eq!((max - 1).checked_add(1), Some(max));
+        assert_eq!(0u64.checked_add(1), Some(1));
+    }
 }

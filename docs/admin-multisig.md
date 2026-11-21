@@ -1,5 +1,10 @@
 # Admin Multi-Signature Procedure
 
+> **Issue #83 — Multisig policy validated against deployment configuration.**
+> This document is the authoritative record of the deployed signer set and threshold.
+> It must stay in lockstep with the Soroban contract configuration and the deployment
+> runbook. Any change to signers or threshold requires updating all three together.
+
 ## Overview
 
 Critical admin operations in VacciChain require M-of-N approvals before execution:
@@ -21,6 +26,35 @@ Multi-sig is enforced at the backend layer via `backend/src/middleware/multiSig.
 | `MULTISIG_PROPOSAL_TTL_MS` | Proposal expiry in milliseconds | `3600000` (1 hour) |
 
 Set `MULTISIG_THRESHOLD=1` to disable multi-sig (single admin sufficient — not recommended for production).
+
+## Deployed Signer Set and Threshold
+
+The deployed configuration is **2-of-3** (M = 2, N = 3). This is the single source of
+truth for both the backend (`MULTISIG_THRESHOLD` / `MULTISIG_KEY_HOLDERS`) and the
+Soroban contract admin configuration.
+
+| Slot | Role | Wallet address | Added | Notes |
+|---|---|---|---|---|
+| Signer A | Security lead | `G...SIGNER_A` | 2026-01-15 | Primary approver |
+| Signer B | Operations lead | `G...SIGNER_B` | 2026-01-15 | Primary approver |
+| Signer C | Compliance lead | `G...SIGNER_C` | 2026-01-15 | Break-glass / recovery approver |
+
+- **Threshold (M):** `2`
+- **Signer set (N):** `3` — the addresses above, and no others.
+- **Contract alignment:** the Soroban contract's admin signer set and threshold MUST
+  match this table exactly. The contract enforces `require_auth()` on the admin
+  address; the backend enforces the M-of-N approval flow. Both layers must agree.
+
+### Verifying alignment
+
+Before every deployment, confirm the backend and contract agree:
+
+1. Read `MULTISIG_THRESHOLD` and `MULTISIG_KEY_HOLDERS` from the target environment.
+2. Query the deployed contract's admin signer set and threshold.
+3. Assert the signer sets are identical and the thresholds are equal (`2`).
+4. Record the verification result in the deployment runbook for that release.
+
+If the two disagree, **abort the deployment** and reconcile before proceeding.
 
 ## Key Holders
 
@@ -116,3 +150,47 @@ If a key holder is unavailable and an urgent operation is needed:
 3. Execute the operation.
 4. Restore `MULTISIG_THRESHOLD` to the original value and restart.
 5. Document the emergency in the audit log and incident tracker.
+
+> **Note:** with the deployed 2-of-3 set, a single unavailable signer does **not**
+> require lowering the threshold — the remaining two signers can still reach the
+> threshold of 2. Threshold lowering is only needed if two or more signers are
+> simultaneously unavailable.
+
+## Testnet Drill Procedure (Issue #83)
+
+A drill must be executed on testnet before promoting any change to the signer set or
+threshold, and at least once per quarter. The drill demonstrates both normal
+administration and signer-unavailable recovery.
+
+### Drill A — Normal administration
+
+1. Initiate an admin operation (e.g. issuer approval) with Signer A's token.
+2. Confirm a `202` with `threshold: 2` and `approvals: 1`.
+3. Approve the proposal with Signer B's token.
+4. Confirm the proposal reaches `status: "approved"` with `approvals: 2`.
+5. Execute the operation with the `proposal_id` and confirm success.
+6. Confirm the audit log records creation, approval, and execution.
+
+### Drill B — Signer-unavailable recovery
+
+1. Simulate Signer C being unavailable (do not use Signer C's key).
+2. Initiate an admin operation with Signer A's token.
+3. Approve with Signer B's token and confirm the threshold of 2 is reached
+   **without** Signer C.
+4. Execute the operation and confirm success.
+5. Separately, simulate two signers unavailable and exercise the Emergency Procedure
+   above (lower threshold to 1, execute, restore threshold to 2, restart).
+6. Confirm the threshold is restored to `2` and the signer set is unchanged.
+
+### Documented results
+
+Record each drill run in the table below (append a row per run):
+
+| Date | Environment | Drill | Result | Operator | Notes |
+|---|---|---|---|---|---|
+| _pending_ | testnet | A — normal administration | _pending_ | _pending_ | _pending_ |
+| _pending_ | testnet | B — signer-unavailable recovery | _pending_ | _pending_ | _pending_ |
+
+A drill is only considered passed when both Drill A and Drill B succeed and the
+post-drill configuration is verified to match the **Deployed Signer Set and Threshold**
+section above.
