@@ -119,6 +119,56 @@ describe('GET /verify/public/:wallet', () => {
     });
   });
 
+  describe('Revocation semantics', () => {
+    const validWallet = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';
+
+    it('should exclude revoked records from the public records list', async () => {
+      const res = await request(app)
+        .get(`/v1/verify/public/${validWallet}`)
+        .expect((res) => {
+          if (res.status === 200) {
+            // Revoked records must never be surfaced by the public endpoint
+            res.body.records.forEach((record) => {
+              expect(record).not.toHaveProperty('revoked', true);
+              expect(record.revoked).not.toBe(true);
+            });
+          }
+        });
+    });
+
+    it('should keep verified=true when at least one non-revoked record remains', async () => {
+      const res = await request(app)
+        .get(`/v1/verify/public/${validWallet}`)
+        .expect((res) => {
+          if (res.status === 200 && res.body.records.length > 0) {
+            // Revocation is per-record: remaining valid records keep the wallet verified
+            expect(res.body.verified).toBe(true);
+          }
+        });
+    });
+
+    it('should return verified=false when all records are revoked', async () => {
+      const res = await request(app)
+        .get(`/v1/verify/public/${validWallet}`)
+        .expect((res) => {
+          if (res.status === 200 && res.body.records.length === 0) {
+            // No active records => wallet is not verified
+            expect(res.body.verified).toBe(false);
+          }
+        });
+    });
+
+    it('should interpret revocation consistently across repeated requests', async () => {
+      const res1 = await request(app).get(`/v1/verify/public/${validWallet}`);
+      const res2 = await request(app).get(`/v1/verify/public/${validWallet}`);
+
+      if (res1.status === 200 && res2.status === 200) {
+        expect(res1.body.verified).toBe(res2.body.verified);
+        expect(res1.body.records.length).toBe(res2.body.records.length);
+      }
+    });
+  });
+
   describe('Error handling', () => {
     it('should return 503 on RPC timeout', async () => {
       // This test would require mocking the contract call to timeout

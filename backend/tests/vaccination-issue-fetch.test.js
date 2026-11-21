@@ -98,6 +98,74 @@ describe('POST /v1/vaccination/issue', () => {
     expect(res.status).toBe(409);
     expect(res.body.error).toMatch(/identical|duplicate/i);
   });
+
+  it('returns 409 for an exact duplicate record', async () => {
+    mintVaccination.mockRejectedValue(new Error('Error(Contract, #6)'));
+
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken}`)
+      .send({ ...VALID_BODY });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/identical|duplicate/i);
+  });
+
+  it('returns 409 for a duplicate with case-variant vaccine name', async () => {
+    mintVaccination.mockRejectedValue(new Error('Error(Contract, #6)'));
+
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken}`)
+      .send({ ...VALID_BODY, vaccine_name: 'covid-19' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/identical|duplicate/i);
+  });
+
+  it('returns 409 for a duplicate with surrounding whitespace in vaccine name', async () => {
+    mintVaccination.mockRejectedValue(new Error('Error(Contract, #6)'));
+
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken}`)
+      .send({ ...VALID_BODY, vaccine_name: '  COVID-19  ' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/identical|duplicate/i);
+  });
+
+  it('returns 409 for a duplicate with mixed case and whitespace', async () => {
+    mintVaccination.mockRejectedValue(new Error('Error(Contract, #6)'));
+
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken}`)
+      .send({ ...VALID_BODY, vaccine_name: ' Covid-19 ' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/identical|duplicate/i);
+  });
+
+  it('returns 200 for a legitimate repeat dose with a different dose_number', async () => {
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken}`)
+      .send({ ...VALID_BODY, dose_number: 2 });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ success: true, tokenId: 'tok_1', transactionHash: 'abc123' });
+  });
+
+  it('returns 200 for a repeat dose with different dose_number and formatting variants', async () => {
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken}`)
+      .send({ ...VALID_BODY, vaccine_name: ' covid-19 ', dose_number: 3 });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ success: true, tokenId: 'tok_1', transactionHash: 'abc123' });
+  });
 });
 
 describe('GET /v1/vaccination/:wallet', () => {

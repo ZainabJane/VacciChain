@@ -87,13 +87,19 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | C-S2 | Spoofing | Attacker impersonates admin to call `add_issuer` or `upgrade` | `admin.require_auth()` on every admin function | Low — requires admin key compromise |
 | C-T1 | Tampering | Attacker modifies a vaccination record after minting | Records stored in persistent contract storage; no update path exists — only `revoke_vaccination` (marks revoked, never deletes) | None |
 | C-T2 | Tampering | Malicious contract upgrade replaces all logic | `upgrade()` requires admin auth + emits `upgraded` event; two-step admin transfer limits key handoff risk | Medium — admin key compromise enables this |
+| C-T3 | Tampering | Revocation scope ambiguity — verifiers disagree on whether revocation affects a single record, the whole wallet, or the issuer's permission | Revocation is defined as **record-scoped and irreversible**: `revoke_vaccination` marks exactly one record revoked (never deletes, never cascades to other records or to the wallet), emits `VaccinationRevoked` with the record id, and `verify_vaccination` returns per-record status. Issuer permission is revoked only via the separate `remove_issuer` path. Contract and API specs must state this scope explicitly | Medium — until specs are formalized, integrators may over-interpret revocation |
+| C-T4 | Tampering | Duplicate-record detection bypassed via formatting variants (case, whitespace, unicode normalization, vaccine-name aliases) or concurrent mint calls | Duplicate key definition (patient wallet + normalized vaccine code + dose number) must be documented and normalized identically in API and contract; contract-level uniqueness check is authoritative and atomic within a single invocation | Medium — normalization rules not yet formalized across layers |
+| C-T5 | Tampering | Invalid issuer lifecycle transition (e.g., re-adding a removed issuer, handoff to a non-admin) leaves stale or escalated permissions | Issuer state machine (active → removed → re-added) and admin handoff transitions must be explicitly enumerated; disallowed transitions revert; repeated operations have defined idempotent-or-error semantics and emit events | Medium — state machine tests pending |
 | C-R1 | Repudiation | Issuer denies minting a record | All mint/revoke/issuer-add/admin actions emit on-chain events (`VaccinationMinted`, `VaccinationRevoked`, `IssuerAdded`, etc.) | Low |
+| C-R2 | Repudiation | Admin denies initiating a key rotation or recovery | Recovery/rotation proposals, acceptances, cancellations, and expiries must emit events and be recorded in the audit log | Medium — recovery flow not yet implemented |
 | C-I1 | Information Disclosure | Patient vaccination history exposed to anyone | `verify_vaccination` is intentionally public (by design — verifiers need it); wallet addresses are pseudonymous | Medium — acceptable by design; patients should be aware |
 | C-D1 | Denial of Service | Spam `register_patient` or `batch_verify` to exhaust contract storage / compute | `batch_verify` capped at 100 wallets; per-patient record limit (50) enforced in `mint.rs` | Low |
 | C-D2 | Denial of Service | Attacker fills issuer list to degrade `get_all_issuers` pagination | Only admin can add issuers | Low |
 | C-E1 | Elevation of Privilege | Non-admin calls `add_issuer` or `upgrade` | `admin.require_auth()` enforced; Soroban auth model rejects mismatched signers | None |
 | C-E2 | Elevation of Privilege | Soulbound bypass — transfer NFT to another wallet | `transfer()` always returns `SoulboundToken` (error 15); no alternative transfer path | None |
 | C-E3 | Elevation of Privilege | Double-initialization to replace admin | `AlreadyInitialized` check on `initialize()` | None |
+| C-E4 | Elevation of Privilege | Compromised admin key used to add malicious issuers, upgrade the contract, or unilaterally rotate the admin to an attacker-controlled key | Two-step admin transfer with 24-hour expiry; rotation/recovery requires threshold approval (proposal + acceptance by the new admin) with a delay window and cancellation path; emergency behavior defined in the recovery policy; `iss_add` and `upgraded` events monitored | **High** — single admin key remains a single point of failure until recovery flow (OR-4/OR-10) is implemented |
+| C-E5 | Elevation of Privilege | Attacker replays a captured admin rotation/recovery acceptance or exploits an expired proposal | Proposals carry an expiry and single-use identifier; acceptance requires the new admin's `require_auth()`; expired or already-consumed proposals revert; unauthorized attempts revert and are logged | Medium — depends on recovery flow implementation |
 
 ### 4.2 Backend API (Node.js / Express)
 
@@ -150,6 +156,10 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | OR-7 | CORS allowlist not verified for production — may be open | **Medium** | Backend | Restrict `Access-Control-Allow-Origin` to known frontend domain |
 | OR-8 | Soroban RPC outage has no circuit breaker — prolonged outage blocks all writes with no user feedback | **Low** | Backend | Add circuit breaker or health-check endpoint |
 | OR-9 | `nonceStore` is in-memory — restarting the backend invalidates all in-flight SEP-10 challenges | **Low** | Backend | Acceptable for single-instance; use Redis-backed store for multi-instance deployments |
+| OR-10 | Admin key recovery/rotation flow not implemented — a lost, compromised, or unavailable admin key cannot be safely replaced without unilateral control | **Critical** | Contracts + DevOps | Implement threshold-approved rotation with delay, cancellation, and emergency path; cover proposal/acceptance, expiry, replay, and unauthorized attempts in contract tests |
+| OR-11 | Revocation scope not formally specified — verifiers may interpret a revoked record as a revoked wallet or issuer | **High** | Contracts + Backend | Document record-scoped, irreversible revocation in contract and API specs; add tests revoking one of multiple records and verifying the remainder |
+| OR-12 | Duplicate-record detection rules not documented — formatting variants or concurrent calls may bypass uniqueness | **High** | Contracts + Backend | Define and normalize the duplicate key consistently across API and contract; test exact duplicates, semantically equivalent values, and legitimate repeat doses |
+| OR-13 | Issuer lifecycle transitions (add, revoke, re-add, admin handoff) lack state-machine tests; repeated operations have undefined semantics | **Medium** | Contracts | Add state-machine tests for allowed and disallowed transitions; define idempotent-or-error semantics for repeats |
 
 ---
 
@@ -162,6 +172,10 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 - [ ] OR-5: Audit log shipped to tamper-evident sink
 - [ ] OR-6: Rate limiting on analytics service
 - [ ] OR-7: CORS restricted to production frontend domain
+- [ ] OR-10: Admin key recovery/rotation flow implemented with threshold, delay, cancellation, and emergency behavior
+- [ ] OR-11: Revocation scope documented in contract and API specs; per-record revocation tests passing
+- [ ] OR-12: Duplicate key definition documented and normalized consistently across API and contract
+- [ ] OR-13: Issuer lifecycle state-machine tests passing with explicit repeat semantics
 - [ ] All secret keys rotated from testnet values
 - [ ] `STELLAR_NETWORK` set to `mainnet` with correct `STELLAR_NETWORK_PASSPHRASE`
 - [ ] Threat model reviewed and signed off by security reviewer
@@ -173,3 +187,4 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | Date | Version | Author | Notes |
 |---|---|---|---|
 | 2026-04-28 | 1.0 | — | Initial full threat model (issue #112) |
+| 2026-04-28 | 1.1 | — | Added revocation scope, duplicate detection, issuer lifecycle, and admin recovery/rotation threats (issues #79–#82) |

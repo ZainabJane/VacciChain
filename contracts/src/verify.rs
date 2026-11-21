@@ -23,12 +23,17 @@ pub struct DoseStatus {
 /// It succeeds for up to `MAX_BATCH_SIZE` wallets and returns a tuple for each wallet:
 /// `(wallet, vaccinated, records)`.
 ///
+/// Revocation semantics: revocation is **record-level** and **irreversible**.
+/// A revoked record is never returned in the active records list and never
+/// contributes to dose status, so a wallet with one revoked record among
+/// several still verifies as vaccinated based on its remaining active records.
+///
 /// # Arguments
 /// * `env` - The Soroban environment.
 /// * `wallets` - Vector of wallet addresses to verify.
 ///
 /// # Returns
-/// * `Vec<(Address, bool, Vec<VaccinationRecord>)>` where the bool indicates whether the wallet has any active vaccination records.
+/// * `Vec<(Address, bool, Vec<VaccinationRecord>)>` where the bool indicates whether the wallet has any active (non-revoked) vaccination records.
 pub fn batch_verify(env: &Env, wallets: Vec<Address>) -> Vec<(Address, bool, Vec<VaccinationRecord>)> {
     assert!(wallets.len() <= MAX_BATCH_SIZE, "batch size exceeds maximum of 100");
 
@@ -46,15 +51,22 @@ pub fn batch_verify(env: &Env, wallets: Vec<Address>) -> Vec<(Address, bool, Vec
 /// Returns whether the wallet has at least one active (non-revoked) record, the
 /// list of active vaccination records, and a per-vaccine dose completion summary.
 ///
+/// Revocation semantics: revocation applies to an individual vaccination record
+/// only (not to the wallet as a whole and not to the issuer's permission to
+/// issue). It is irreversible: once `record.revoked` is set, the record is
+/// permanently excluded from verification results. Revoked records are filtered
+/// out before both the active records list and the dose status summary are
+/// computed, so they can never be interpreted as valid vaccination evidence.
+///
 /// # Arguments
 /// * `env` - The Soroban environment.
 /// * `wallet` - The wallet address to check.
 ///
 /// # Returns
 /// * `(bool, Vec<VaccinationRecord>, Vec<DoseStatus>)`
-///   - bool: wallet has at least one active record
-///   - Vec<VaccinationRecord>: active vaccination records
-///   - Vec<DoseStatus>: per-vaccine dose completion summary
+///   - bool: wallet has at least one active (non-revoked) record
+///   - Vec<VaccinationRecord>: active (non-revoked) vaccination records only
+///   - Vec<DoseStatus>: per-vaccine dose completion summary derived from active records only
 pub fn verify_vaccination(env: &Env, wallet: Address) -> (bool, Vec<VaccinationRecord>, Vec<DoseStatus>) {
     let tokens: Vec<u64> = env
         .storage()
@@ -70,17 +82,22 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (bool, Vec<VaccinationR
     let mut has_active = false;
 
     // Load all active (non-revoked) records for the wallet.
+    // Revocation is record-level and irreversible: revoked records are skipped
+    // entirely and never surface in the active records list or dose status.
     for i in 0..tokens.len() {
         let tid = tokens.get(i).unwrap();
         if let Some(record) = env.storage().persistent().get::<DataKey, VaccinationRecord>(&DataKey::Token(tid)) {
-            if !record.revoked {
-                has_active = true;
-                records.push_back(record);
+            if record.revoked {
+                continue;
             }
+            has_active = true;
+            records.push_back(record);
         }
     }
 
-    // Build per-vaccine dose status.
+    // Build per-vaccine dose status from active records only.
+    // Revoked records were already excluded above, so they cannot inflate dose
+    // counts or mark a series complete.
     // We track highest dose_number and highest dose_series seen for each vaccine.
     // Parallel vecs are used because a no_std map implementation is unavailable.
     let mut vaccine_names: Vec<String> = Vec::new(env);

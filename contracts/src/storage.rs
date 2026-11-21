@@ -93,13 +93,36 @@ pub struct VaccinationRecord {
     /// Schema version for backwards compatibility.
     pub schema_version: u32,
     /// Revocation flag; true when this record has been revoked.
+    ///
+    /// Revocation is scoped to this individual record only. It does not
+    /// affect the patient wallet status, other records owned by the patient,
+    /// or the issuing issuer's authorization. Revocation is irreversible:
+    /// once set to `true` it can never be cleared.
     pub revoked: bool,
+    /// Ledger timestamp at which the record was revoked, if revoked.
+    pub revoked_at: Option<u64>,
     /// Which dose in the series this record represents (e.g. 1, 2, 3).
     /// `None` indicates a single-dose or legacy record.
     pub dose_number: Option<u32>,
     /// Total doses required for the series (e.g. 3 for a primary series).
     /// `None` indicates a single-dose or legacy record.
     pub dose_series: Option<u32>,
+}
+
+/// Lifecycle state of an issuer.
+///
+/// Transitions:
+/// * `Active` -> `Revoked` (allowed, auditable)
+/// * `Revoked` -> `Active` (allowed only via explicit re-add by admin)
+/// * `Active` -> `Active` (idempotent no-op)
+/// * `Revoked` -> `Revoked` (idempotent no-op)
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IssuerState {
+    /// Issuer may mint vaccination records.
+    Active,
+    /// Issuer may no longer mint; existing records remain valid.
+    Revoked,
 }
 
 #[contracttype]
@@ -113,6 +136,12 @@ pub struct IssuerRecord {
     pub country: String,
     /// Authorization status for minting vaccination records.
     pub authorized: bool,
+    /// Explicit lifecycle state for the issuer.
+    pub state: IssuerState,
+    /// Ledger timestamp when the issuer was added or last re-added.
+    pub added_at: u64,
+    /// Ledger timestamp when the issuer was revoked, if applicable.
+    pub revoked_at: Option<u64>,
 }
 
 #[contracttype]
@@ -125,6 +154,12 @@ pub enum DataKey {
     PendingAdmin,
     /// Expiry for delayed admin transfer operations.
     AdminTransferExpiry,
+    /// Monotonic nonce for admin rotation proposals; used to prevent replay.
+    AdminProposalNonce,
+    /// Ledger sequence at which the current pending admin proposal was created.
+    AdminProposalCreatedAt,
+    /// Cancellation marker for the current pending admin proposal.
+    AdminProposalCancelled,
     /// Authorized issuer record keyed by issuer address.
     Issuer(Address),
     /// Hashed issuer metadata index.
@@ -145,4 +180,98 @@ pub enum DataKey {
     NextTokenId,
     /// Paused contract flag.
     Paused,
+    /// Normalized duplicate key index mapping a normalized key to its token ID.
+    DuplicateKey(BytesN<32>),
+}
+
+/// Normalize a string for duplicate-key comparison.
+///
+/// The normalization is intentionally conservative and deterministic so that
+/// the API and contract agree on what constitutes a duplicate:
+/// * trims leading and trailing ASCII whitespace,
+/// * collapses internal runs of ASCII whitespace to a single space,
+/// * lowercases ASCII letters.
+///
+/// Non-ASCII bytes are preserved as-is. The result is returned as a Soroban
+/// `String` so it can be hashed or compared directly.
+pub fn normalize_string(env: &Env, input: &String) -> String {
+    let len = input.len() as usize;
+    let mut buf = [0u8; 256];
+    let mut out_len = 0usize;
+    let mut pending_space = false;
+    let mut seen_non_space = false;
+
+    for i in 0..len {
+        let b = input.get(i as u32).unwrap();
+        let is_space = b == b' ' || b == b'\t' || b == b'\n' || b == b'\r';
+        if is_space {
+            if seen_non_space {
+                pending_space = true;
+            }
+            continue;
+        }
+        if pending_space && out_len < buf.len() {
+            buf[out_len] = b' ';
+            out_len += 1;
+            pending_space = false;
+        }
+        let normalized = if b.is_ascii_uppercase() { b + 32 } else { b };
+        if out_len < buf.len() {
+            buf[out_len] = normalized;
+            out_len += 1;
+        }
+        seen_non_space = true;
+    }
+
+    let mut result = String::new(env);
+    for i in 0..out_len {
+        result.push_back(buf[i] as char);
+    }
+    result
+}
+
+/// Compute a normalized duplicate key for a vaccination record.
+///
+/// The key is derived from the normalized patient, vaccine name, date,
+/// dose number, and dose series. The issuer and ledger sequence are
+/// intentionally excluded so that the same dose cannot be recorded twice
+/// by different issuers or in different ledgers. Legitimate repeat doses
+/// are distinguished by `dose_number`.
+///
+/// # Arguments
+/// * `env` - The Soroban environment.
+/// * `patient` - The patient wallet address.
+/// * `vaccine_name` - The vaccine name string (normalized internally).
+/// * `date_administered` - The administration date string (normalized internally).
+/// * `dose_number` - The dose number, if any.
+/// * `dose_series` - The total dose series, if any.
+///
+/// # Returns
+/// * `BytesN<32>` deterministic duplicate key.
+pub fn compute_duplicate_key(
+    env: &Env,
+    patient: &Address,
+    vaccine_name: &String,
+    date_administered: &String,
+    dose_number: &Option<u32>,
+    dose_series: &Option<u32>,
+) -> BytesN<32> {
+    let mut preimage = Bytes::new(env);
+
+    preimage.append(&patient.to_xdr(env));
+    preimage.append(&normalize_string(env, vaccine_name).to_xdr(env));
+    preimage.append(&normalize_string(env, date_administered).to_xdr(env));
+
+    let dn = dose_number.unwrap_or(0);
+    let ds = dose_series.unwrap_or(0);
+    let mut buf = Bytes::new(env);
+    for v in [dn, ds] {
+        buf.push_back(((v >> 24) & 0xff) as u8);
+        buf.push_back(((v >> 16) & 0xff) as u8);
+        buf.push_back(((v >> 8) & 0xff) as u8);
+        buf.push_back((v & 0xff) as u8);
+    }
+    preimage.append(&buf);
+
+    env.crypto().sha256(&preimage).into()
 }

@@ -96,4 +96,104 @@ describe('Issuer Verification & Caching', () => {
     expect(next).not.toHaveBeenCalled();
     expect(simulateContract).not.toHaveBeenCalled();
   });
+
+  describe('issuer lifecycle state transitions', () => {
+    const makeReq = () => ({ user: { role: 'issuer', wallet: gAddress } });
+    const makeRes = () => ({
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis()
+    });
+
+    it('rejects a revoked issuer after cache invalidation', async () => {
+      // Add: issuer is authorized on-chain.
+      simulateContract.mockResolvedValue(StellarSdk.xdr.ScVal.scvBool(true));
+      const addReq = makeReq();
+      const addRes = makeRes();
+      const addNext = jest.fn();
+      await issuerMiddleware(addReq, addRes, addNext);
+      expect(addNext).toHaveBeenCalled();
+      expect(addRes.status).not.toHaveBeenCalled();
+
+      // Revoke: on-chain state flips to false and cache is invalidated.
+      simulateContract.mockResolvedValue(StellarSdk.xdr.ScVal.scvBool(false));
+      invalidateCache(gAddress);
+
+      const revokeReq = makeReq();
+      const revokeRes = makeRes();
+      const revokeNext = jest.fn();
+      await issuerMiddleware(revokeReq, revokeRes, revokeNext);
+      expect(revokeRes.status).toHaveBeenCalledWith(403);
+      expect(revokeRes.json).toHaveBeenCalledWith({
+        error: 'Issuer authorization revoked or not found on-chain'
+      });
+      expect(revokeNext).not.toHaveBeenCalled();
+    });
+
+    it('allows re-adding a previously revoked issuer', async () => {
+      // Revoked state.
+      simulateContract.mockResolvedValue(StellarSdk.xdr.ScVal.scvBool(false));
+      const revokedReq = makeReq();
+      const revokedRes = makeRes();
+      const revokedNext = jest.fn();
+      await issuerMiddleware(revokedReq, revokedRes, revokedNext);
+      expect(revokedRes.status).toHaveBeenCalledWith(403);
+      expect(revokedNext).not.toHaveBeenCalled();
+
+      // Re-add: on-chain state flips back to true and cache is invalidated.
+      simulateContract.mockResolvedValue(StellarSdk.xdr.ScVal.scvBool(true));
+      invalidateCache(gAddress);
+
+      const readdReq = makeReq();
+      const readdRes = makeRes();
+      const readdNext = jest.fn();
+      await issuerMiddleware(readdReq, readdRes, readdNext);
+      expect(readdNext).toHaveBeenCalled();
+      expect(readdRes.status).not.toHaveBeenCalled();
+    });
+
+    it('serves stale authorization from cache until invalidated on revoke', async () => {
+      simulateContract.mockResolvedValue(StellarSdk.xdr.ScVal.scvBool(true));
+      await isAuthorizedIssuer(gAddress);
+      expect(simulateContract).toHaveBeenCalledTimes(1);
+
+      // On-chain revoke without cache invalidation: cached value still returned.
+      simulateContract.mockResolvedValue(StellarSdk.xdr.ScVal.scvBool(false));
+      const stale = await isAuthorizedIssuer(gAddress);
+      expect(stale).toBe(true);
+      expect(simulateContract).toHaveBeenCalledTimes(1);
+
+      // After invalidation the revoked state is observed.
+      invalidateCache(gAddress);
+      const fresh = await isAuthorizedIssuer(gAddress);
+      expect(fresh).toBe(false);
+      expect(simulateContract).toHaveBeenCalledTimes(2);
+    });
+
+    it('treats repeated invalidation as idempotent', async () => {
+      simulateContract.mockResolvedValue(StellarSdk.xdr.ScVal.scvBool(true));
+      await isAuthorizedIssuer(gAddress);
+      expect(simulateContract).toHaveBeenCalledTimes(1);
+
+      invalidateCache(gAddress);
+      invalidateCache(gAddress);
+      invalidateCache(gAddress);
+
+      await isAuthorizedIssuer(gAddress);
+      expect(simulateContract).toHaveBeenCalledTimes(2);
+    });
+
+    it('repeated revoke checks remain rejected without re-adding', async () => {
+      simulateContract.mockResolvedValue(StellarSdk.xdr.ScVal.scvBool(false));
+
+      for (let i = 0; i < 2; i += 1) {
+        invalidateCache(gAddress);
+        const req = makeReq();
+        const res = makeRes();
+        const next = jest.fn();
+        await issuerMiddleware(req, res, next);
+        expect(res.status).toHaveBeenCalledWith(403);
+        expect(next).not.toHaveBeenCalled();
+      }
+    });
+  });
 });

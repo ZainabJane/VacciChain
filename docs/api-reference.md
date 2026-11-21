@@ -49,6 +49,73 @@ Errors:
 
 ---
 
+## Revocation semantics
+
+Revocation is **record-level and irreversible**. Revoking a vaccination record affects only that individual record; it does not revoke the patient's wallet, does not revoke the issuer's permission, and does not affect any other record held by the same wallet or issued by the same issuer.
+
+- **Scope:** a single `token_id`. Other records for the same wallet remain valid and verifiable.
+- **Irreversibility:** a revoked record cannot be un-revoked or re-issued with the same `token_id`. Re-vaccination must mint a new record.
+- **Event representation:** each revocation emits a `revoke` contract event containing `{ token_id, issuer, revoked_at }`. Verifiers must treat any record with a `revoke` event as invalid regardless of other fields.
+- **Verifier interpretation:** `GET /verify/:wallet` excludes revoked records from `records` and reports `verified: true` only if at least one non-revoked record remains (per policy). Revoked records are never counted as valid.
+
+---
+
+## Duplicate-record detection
+
+The duplicate key is defined as the normalized tuple `(patient_wallet, vaccine, date, batch)`:
+
+- `patient_wallet` is normalized to its canonical Stellar public key form.
+- `vaccine` and `batch` are trimmed, case-folded, and internal whitespace collapsed.
+- `date` is normalized to ISO-8601 `YYYY-MM-DD`.
+
+Formatting variants that normalize to the same tuple are treated as duplicates. Uniqueness is enforced atomically in the contract, so concurrent submissions cannot both succeed. Legitimate repeat doses are distinguished by a different `date` or `batch` and are therefore not duplicates.
+
+Errors:
+- 409: duplicate record detected (normalized key already exists)
+
+---
+
+## Issuer lifecycle
+
+Issuers move through the following states: `Active`, `Revoked`, `Removed`.
+
+Allowed transitions:
+- `Active -> Revoked` (revoke issuer permission)
+- `Active -> Removed` (administrator removal)
+- `Removed -> Active` (re-add)
+- `Revoked -> Active` (re-add)
+
+Disallowed transitions (return an error, no state change):
+- `Revoked -> Removed`, `Removed -> Revoked`
+- Any transition from a non-existent issuer
+
+Repeated operations are idempotent where the target state already holds (e.g. revoking an already-`Revoked` issuer is a no-op success); conflicting transitions return an explicit error. Every transition emits an auditable event `{ issuer, from_state, to_state, actor, timestamp }`.
+
+---
+
+## Administrator rotation and recovery
+
+Administrator key rotation and recovery use a threshold proposal/acceptance flow:
+
+- **Threshold:** a configurable number of current administrators must approve a rotation proposal.
+- **Delay:** an approved proposal takes effect only after a configurable delay, during which it can be cancelled.
+- **Cancellation:** any current administrator may cancel a pending proposal before it executes.
+- **Emergency:** an emergency path may bypass the delay only when the threshold is met and is recorded as an auditable emergency event.
+- **Expiry and replay:** proposals expire after a configured window; expired or already-executed proposals are rejected to prevent replay.
+
+Endpoints:
+- `POST /admin/rotation/propose` — create a rotation proposal (admin-only)
+- `POST /admin/rotation/approve` — approve a pending proposal (admin-only)
+- `POST /admin/rotation/cancel` — cancel a pending proposal (admin-only)
+- `POST /admin/rotation/execute` — execute an approved, matured proposal
+- `POST /admin/recovery/emergency` — initiate emergency recovery (threshold required)
+
+Errors:
+- 401/403: unauthorized or insufficient approvals
+- 409: proposal expired, already executed, or replayed
+
+---
+
 ## POST /vaccination/issue
 
 Mint a vaccination NFT for a patient. Issuer-only action.
@@ -78,8 +145,8 @@ Response (201):
 
 Errors:
 - 400: validation error (missing fields)
-- 403: issuer not authorized
-- 409: duplicate record detected
+- 403: issuer not authorized (issuer not `Active`)
+- 409: duplicate record detected (see Duplicate-record detection)
 
 ---
 
@@ -100,6 +167,8 @@ Response (200):
 Errors:
 - 404: wallet not found (no records)
 
+Revoked records are excluded from `records`; see Revocation semantics.
+
 ---
 
 ## GET /verify/:wallet
@@ -117,6 +186,8 @@ Response (200):
 
 Errors:
 - 400: malformed wallet address
+
+Revoked records are excluded and never counted as valid; see Revocation semantics.
 
 ---
 

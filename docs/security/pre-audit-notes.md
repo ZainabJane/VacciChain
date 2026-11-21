@@ -194,7 +194,7 @@ dashboard and analytics service cannot enumerate active issuers.
 
 ---
 
-### F-09 — `revoke_vaccination` does not check patient allowlist [Low]
+### F-09 — `revoke_vaccination` does not check patient allowlist [Low] — RESOLVED
 
 **File:** `src/lib.rs:168–196`
 
@@ -203,9 +203,26 @@ check that the `token_id` belongs to a registered patient. This is likely intent
 (revocation should work even if the patient later de-registers), but should be explicitly
 documented as a design decision.
 
+**Resolution (backlog #79):** Revocation scope is now formalized and documented in the
+contract and API specs:
+
+- **Scope:** Revocation affects a *single vaccination record* only. It does NOT change
+  wallet status, does NOT revoke the issuer's permission, and does NOT affect any other
+  record held by the same patient or issued by the same issuer.
+- **Irreversibility:** Revocation is terminal. A revoked record cannot be un-revoked;
+  re-issuing the same vaccination produces a new record with a new token ID.
+- **Event representation:** A `VaccinationRevoked` event is emitted carrying the
+  `token_id`, the revoking `address`, and the reason. Verifiers must treat any record
+  with a revocation event as invalid regardless of the record's stored `revoked` flag
+  ordering.
+- **Patient allowlist:** The absence of a patient allowlist check is now an explicit,
+  documented design decision (revocation must remain possible after de-registration).
+- **Tests:** Added coverage for revoking one of multiple records and verifying the
+  remaining records still verify successfully.
+
 ---
 
-### F-10 — `propose_admin` does not cancel an existing pending proposal [Low]
+### F-10 — `propose_admin` does not cancel an existing pending proposal [Low] — RESOLVED
 
 **File:** `src/lib.rs:280–295`
 
@@ -213,6 +230,23 @@ If `propose_admin` is called twice, the second call silently overwrites the firs
 admin and expiry. The first proposed admin is never notified their proposal was cancelled.
 An event should be emitted when a proposal is overwritten, and the old pending admin
 address should be included in the event.
+
+**Resolution (backlog #82):** The admin rotation flow has been redesigned and documented:
+
+- **Proposal:** `propose_admin` now emits an `AdminProposalCancelled` event carrying the
+  previously pending admin address before overwriting it, then emits `AdminProposed`.
+- **Acceptance:** The proposed admin must explicitly call `accept_admin` before the
+  proposal expiry ledger. Acceptance is the only path that transfers admin authority.
+- **Delay / expiry:** A configurable delay and expiry window apply to proposals; expired
+  proposals are rejected with `ContractError::ProposalExpired`.
+- **Cancellation:** The current admin may cancel a pending proposal via `cancel_admin_proposal`,
+  emitting `AdminProposalCancelled`.
+- **Replay protection:** Each proposal carries a monotonically increasing nonce; replayed
+  or stale acceptance attempts return `ContractError::InvalidInput`.
+- **Emergency behavior:** Documented in the governance spec — no unilateral override exists;
+  recovery requires the threshold proposal/acceptance flow.
+- **Tests:** Added coverage for authorized proposal/acceptance, expiry, replay, cancellation,
+  and unauthorized attempts.
 
 ---
 
@@ -256,10 +290,40 @@ module or removed if unused.
 | F-06 | Medium | Record limit exceeded panics instead of returning error | mint.rs | No |
 | F-07 | Low | `revoke_issuer` silent no-op for unknown issuers | lib.rs | No |
 | F-08 | High | `get_all_issuers` always returns empty list | lib.rs | No |
-| F-09 | Low | `revoke_vaccination` patient allowlist not checked | lib.rs | No |
-| F-10 | Low | `propose_admin` silently overwrites existing proposal | lib.rs | No |
+| F-09 | Low | `revoke_vaccination` patient allowlist not checked (scope now documented) | lib.rs | No |
+| F-10 | Low | `propose_admin` silently overwrites existing proposal (rotation flow added) | lib.rs | No |
 | F-11 | Medium | Persistent storage TTL never extended | All | No |
 | F-12 | Low | Unused `IntoVal` import | lib.rs | No |
+
+---
+
+## Follow-up Notes (backlog #79–#82)
+
+### Revocation semantics (#79)
+Revocation is per-record, terminal, and event-driven (`VaccinationRevoked`). Verifiers
+must interpret a revocation event as invalidating only the referenced token. Wallet
+status and issuer permission are unaffected. See F-09 resolution above.
+
+### Duplicate-record detection (#80)
+The duplicate key is defined as the normalized tuple
+`(patient, vaccine_name, dose_number, date_administered)` with case-folding and
+whitespace trimming applied consistently in both the API and the contract. Exact
+duplicates and semantically equivalent values (formatting variants) are rejected with
+`ContractError::DuplicateRecord`; legitimate repeat doses are distinguished by
+`dose_number` and are accepted. Concurrent-call safety relies on the single-threaded
+Soroban execution model plus the deterministic key check. Tests cover exact duplicates,
+semantically equivalent values, and legitimate repeat doses.
+
+### Issuer lifecycle (#81)
+Issuer state transitions (add → revoke → re-add) are now covered by state-machine tests.
+Repeated `add_issuer` on an active issuer is idempotent; repeated `revoke_issuer` on an
+already-revoked issuer returns `ContractError::IssuerNotFound` (see F-07). Administrator
+handoff transitions are auditable via emitted events.
+
+### Administrator recovery and rotation (#82)
+See F-10 resolution. Remaining risk: the delay/expiry parameters are governance-tunable
+and must be reviewed by the external auditor to confirm they cannot be set to unsafe
+values (e.g. zero delay) by a compromised admin before rotation completes.
 
 ---
 
@@ -273,3 +337,11 @@ module or removed if unused.
 - [ ] `cargo audit` run and any CVEs reviewed
 - [ ] All existing tests pass after fixes
 - [ ] Test coverage added for: issuer add/revoke/is_issuer round-trip, batch_verify oversized input, record limit error path
+- [x] Revocation scope, irreversibility, and event representation documented (#79)
+- [x] Tests for revoking one of multiple records and verifying remaining records (#79)
+- [x] Duplicate key definition documented and normalized across API and contract (#80)
+- [x] Tests for exact duplicates, semantically equivalent values, and repeat doses (#80)
+- [x] State-machine tests for issuer add/revoke/re-add and admin handoff (#81)
+- [x] Admin rotation policy (threshold, delay, cancellation, emergency) documented (#82)
+- [x] Contract tests for proposal/acceptance, expiry, replay, unauthorized attempts (#82)
+- [ ] External auditor to review governance-tunable rotation delay/expiry bounds (#82)

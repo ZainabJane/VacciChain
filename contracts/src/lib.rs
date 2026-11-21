@@ -44,6 +44,12 @@ use verify::DoseStatus;
 /// | 14   | InvalidInputCountry          | issuer country exceeds maximum length            |
 /// | 15   | SoulboundToken               | Transfers are disabled for soulbound records     |
 /// | 16   | PatientNotRegistered          | Patient has not self-registered                  |
+/// | 17   | ContractPaused                | Contract is paused; state changes are blocked    |
+/// | 18   | AlreadyAuthorized             | Issuer is already authorized                     |
+/// | 19   | IssuerNotFound                | Issuer does not exist                            |
+/// | 20   | IssuerAlreadyRevoked          | Issuer is already revoked                        |
+/// | 21   | ProposalNotYetValid           | Admin transfer proposal delay has not elapsed    |
+/// | 22   | InvalidNonce                  | Admin transfer nonce does not match proposal     |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
@@ -64,9 +70,19 @@ pub enum ContractError {
     SoulboundToken = 15,
     PatientNotRegistered = 16,
     ContractPaused = 17,
+    AlreadyAuthorized = 18,
+    IssuerNotFound = 19,
+    IssuerAlreadyRevoked = 20,
+    ProposalNotYetValid = 21,
+    InvalidNonce = 22,
 }
 
 const MAX_STRING_LENGTH: u32 = 100;
+
+/// Mandatory delay (in seconds) between proposing and accepting an admin transfer.
+const ADMIN_TRANSFER_DELAY: u64 = 3600;
+/// Time (in seconds) after which an admin transfer proposal expires.
+const ADMIN_TRANSFER_EXPIRY: u64 = 86400;
 
 /// Validates that a string field does not exceed the maximum allowed length.
 ///
@@ -215,6 +231,18 @@ impl VacciChainContract {
         validate_input_length(&license, "license")?;
         validate_input_length(&country, "country")?;
 
+        // State machine guard: adding an already-active issuer is an explicit error.
+        // Re-adding a previously revoked issuer is allowed (transitions revoked -> active).
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, IssuerRecord>(&DataKey::IssuerMeta(hash_address(&env, &issuer)))
+        {
+            if existing.authorized {
+                return Err(ContractError::AlreadyAuthorized);
+            }
+        }
+
         let record = IssuerRecord {
             name,
             license,
@@ -265,7 +293,8 @@ impl VacciChainContract {
     /// Revoke an issuer's authorization to mint vaccination records.
     ///
     /// Once revoked, the issuer can no longer mint new vaccination NFTs, but existing
-    /// records remain valid and verifiable.
+    /// records remain valid and verifiable. Revocation affects only the issuer's permission
+    /// to mint; it does not revoke any individual vaccination records.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -276,6 +305,8 @@ impl VacciChainContract {
     ///
     /// # Errors
     /// * `NotInitialized` - Contract has not been initialized
+    /// * `IssuerNotFound` - The issuer does not exist
+    /// * `IssuerAlreadyRevoked` - The issuer is already revoked
     ///
     /// # Authorization
     /// Requires the admin address to authorize the transaction.
@@ -291,16 +322,21 @@ impl VacciChainContract {
             .ok_or(ContractError::NotInitialized)?;
         admin.require_auth();
 
-        if let Some(mut record) = env
+        let mut record: IssuerRecord = env
             .storage()
             .persistent()
-            .get::<DataKey, IssuerRecord>(&DataKey::IssuerMeta(hash_address(&env, &issuer)))
-        {
-            record.authorized = false;
-            env.storage()
-                .persistent()
-                .set(&DataKey::IssuerMeta(hash_address(&env, &issuer)), &record);
+            .get(&DataKey::IssuerMeta(hash_address(&env, &issuer)))
+            .ok_or(ContractError::IssuerNotFound)?;
+
+        if !record.authorized {
+            return Err(ContractError::IssuerAlreadyRevoked);
         }
+
+        record.authorized = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::IssuerMeta(hash_address(&env, &issuer)), &record);
+        events::emit_issuer_revoked(&env, &issuer, &admin);
         Ok(())
     }
 
@@ -392,9 +428,12 @@ impl VacciChainContract {
 
     /// Revoke a vaccination record.
     ///
-    /// Only the original issuer or the admin can revoke a record. Revoked records are marked
-    /// as such but never deleted (audit trail is preserved). Revoking an already-revoked
-    /// record returns an error.
+    /// Only the original issuer or the admin can revoke a record. Revocation scope is a
+    /// single individual record identified by `token_id`; it does not affect the patient's
+    /// wallet status beyond that record, nor the issuer's permission to mint. Revoked records
+    /// are marked as such but never deleted (audit trail is preserved) and are excluded from
+    /// all verification results. Revocation is irreversible: revoking an already-revoked
+    /// record returns `AlreadyRevoked`.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -414,7 +453,7 @@ impl VacciChainContract {
     /// Requires the revoker address to authorize the transaction.
     ///
     /// # Events
-    /// Emits `VaccinationRevoked` event on success.
+    /// Emits `VaccinationRevoked` event on success with `token_id`, `revoker`, and `timestamp`.
     pub fn revoke_vaccination(env: Env, token_id: u64, revoker: Address) -> Result<(), ContractError> {
         require_not_paused(&env)?;
         revoker.require_auth();
@@ -425,6 +464,7 @@ impl VacciChainContract {
             .get(&DataKey::Token(token_id))
             .ok_or(ContractError::RecordNotFound)?;
 
+        // Irreversibility: a revoked record can never be revoked again.
         if record.revoked {
             return Err(ContractError::AlreadyRevoked);
         }
@@ -572,10 +612,12 @@ impl VacciChainContract {
         page
     }
 
-    /// Propose a new admin (two-step transfer).
+    /// Propose a new admin (two-step transfer with delay).
     ///
     /// Initiates a two-step admin transfer process. The proposed admin must call `accept_admin()`
-    /// within 24 hours to complete the transfer. If not accepted within 24 hours, the proposal expires.
+    /// after the mandatory delay (`ADMIN_TRANSFER_DELAY`) and before the proposal expires
+    /// (`ADMIN_TRANSFER_EXPIRY`). Each proposal is assigned a monotonically increasing nonce
+    /// that must be supplied to `accept_admin`/`cancel_admin`, providing replay protection.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -599,31 +641,47 @@ impl VacciChainContract {
             .get(&DataKey::Admin)
             .ok_or(ContractError::NotInitialized)?;
         admin.require_auth();
-        let expires_at = env.ledger().timestamp() + 86400;
+        let now = env.ledger().timestamp();
+        let expires_at = now + ADMIN_TRANSFER_EXPIRY;
+        let nonce: u64 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::AdminTransferNonce)
+            .unwrap_or(0)
+            .wrapping_add(1);
+        env.storage().persistent().set(&DataKey::AdminTransferNonce, &nonce);
         env.storage().persistent().set(&DataKey::PendingAdmin, &new_admin);
         env.storage().persistent().set(&DataKey::AdminTransferExpiry, &expires_at);
+        env.storage().persistent().set(&DataKey::AdminTransferProposedAt, &now);
         events::emit_admin_transfer_proposed(&env, &admin, &new_admin, expires_at);
         Ok(())
     }
 
     /// Accept the admin role (completes two-step transfer).
     ///
-    /// Called by the proposed admin to accept the admin role. The proposal must not have expired
-    /// (must be within 24 hours of proposal).
+    /// Called by the proposed admin to accept the admin role. The proposal must have passed the
+    /// mandatory delay and must not have expired. The supplied `nonce` must match the current
+    /// proposal nonce, preventing replay of stale acceptances.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `nonce` - The nonce of the proposal being accepted
     ///
     /// # Returns
     /// * `Ok(())` on successful acceptance
     ///
     /// # Errors
     /// * `NoPendingTransfer` - No pending admin transfer exists
-    /// * `ProposalExpired` - The proposal has expired (more than 24 hours old)
+    /// * `InvalidNonce` - The supplied nonce does not match the pending proposal
+    /// * `ProposalNotYetValid` - The mandatory delay has not elapsed
+    /// * `ProposalExpired` - The proposal has expired
     ///
     /// # Authorization
     /// Requires the proposed admin address to authorize the transaction.
     ///
     /// # Events
     /// Emits `AdminTransferAccepted` event on success.
-    pub fn accept_admin(env: Env) -> Result<(), ContractError> {
+    pub fn accept_admin(env: Env, nonce: u64) -> Result<(), ContractError> {
         let pending: Address = env
             .storage()
             .persistent()
@@ -634,14 +692,80 @@ impl VacciChainContract {
             .persistent()
             .get(&DataKey::AdminTransferExpiry)
             .ok_or(ContractError::NoPendingTransfer)?;
-        if env.ledger().timestamp() > expires_at {
+        let proposed_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AdminTransferProposedAt)
+            .ok_or(ContractError::NoPendingTransfer)?;
+        let current_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::AdminTransferNonce)
+            .unwrap_or(0);
+        if nonce != current_nonce {
+            return Err(ContractError::InvalidNonce);
+        }
+        let now = env.ledger().timestamp();
+        if now > expires_at {
             return Err(ContractError::ProposalExpired);
+        }
+        if now < proposed_at + ADMIN_TRANSFER_DELAY {
+            return Err(ContractError::ProposalNotYetValid);
         }
         pending.require_auth();
         env.storage().persistent().set(&DataKey::Admin, &pending);
         env.storage().persistent().remove(&DataKey::PendingAdmin);
         env.storage().persistent().remove(&DataKey::AdminTransferExpiry);
+        env.storage().persistent().remove(&DataKey::AdminTransferProposedAt);
         events::emit_admin_transfer_accepted(&env, &pending);
+        Ok(())
+    }
+
+    /// Cancel a pending admin transfer proposal.
+    ///
+    /// The current admin may cancel a pending proposal at any time before acceptance.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `nonce` - The nonce of the proposal being cancelled
+    ///
+    /// # Returns
+    /// * `Ok(())` on successful cancellation
+    ///
+    /// # Errors
+    /// * `NotInitialized` - Contract has not been initialized
+    /// * `NoPendingTransfer` - No pending admin transfer exists
+    /// * `InvalidNonce` - The supplied nonce does not match the pending proposal
+    ///
+    /// # Authorization
+    /// Requires the current admin address to authorize the transaction.
+    ///
+    /// # Events
+    /// Emits `AdminTransferCancelled` event on success.
+    pub fn cancel_admin(env: Env, nonce: u64) -> Result<(), ContractError> {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(ContractError::NotInitialized)?;
+        admin.require_auth();
+        let pending: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(ContractError::NoPendingTransfer)?;
+        let current_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::AdminTransferNonce)
+            .unwrap_or(0);
+        if nonce != current_nonce {
+            return Err(ContractError::InvalidNonce);
+        }
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+        env.storage().persistent().remove(&DataKey::AdminTransferExpiry);
+        env.storage().persistent().remove(&DataKey::AdminTransferProposedAt);
+        events::emit_admin_transfer_cancelled(&env, &admin, &pending);
         Ok(())
     }
 
@@ -713,8 +837,42 @@ mod tests {
 
         assert!(client.is_issuer(&issuer));
 
-        client.revoke_issuer(&issuer);
+        client.revoke_issuer(&issuer).unwrap();
         assert!(!client.is_issuer(&issuer));
+    }
+
+    #[test]
+    fn test_issuer_state_machine() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+        let name = String::from_str(&env, "General Hospital");
+        let license = String::from_str(&env, "LIC-12345");
+        let country = String::from_str(&env, "USA");
+
+        // Add active issuer succeeds.
+        client.add_issuer(&issuer, &name, &license, &country).unwrap();
+        assert!(client.is_issuer(&issuer));
+
+        // Adding an already-active issuer is an explicit error.
+        let result = client.try_add_issuer(&issuer, &name, &license, &country);
+        assert_eq!(result, Err(Ok(ContractError::AlreadyAuthorized)));
+
+        // Revoking an active issuer succeeds.
+        client.revoke_issuer(&issuer).unwrap();
+        assert!(!client.is_issuer(&issuer));
+
+        // Revoking an already-revoked issuer is an explicit error.
+        let result = client.try_revoke_issuer(&issuer);
+        assert_eq!(result, Err(Ok(ContractError::IssuerAlreadyRevoked)));
+
+        // Revoking a non-existent issuer is an explicit error.
+        let unknown = Address::generate(&env);
+        let result = client.try_revoke_issuer(&unknown);
+        assert_eq!(result, Err(Ok(ContractError::IssuerNotFound)));
+
+        // Re-adding a revoked issuer is allowed.
+        client.add_issuer(&issuer, &name, &license, &country).unwrap();
+        assert!(client.is_issuer(&issuer));
     }
 
     #[test]
@@ -848,6 +1006,98 @@ mod tests {
         let (vaccinated, records, _dose_statuses) = client.verify_vaccination(&patient);
         assert!(!vaccinated);
         assert_eq!(records.len(), 0);
+
+        // Revocation is irreversible: re-revoking returns AlreadyRevoked.
+        let result = client.try_revoke_vaccination(&token_id, &issuer);
+        assert_eq!(result, Err(Ok(ContractError::AlreadyRevoked)));
+    }
+
+    #[test]
+    fn test_revoke_one_of_multiple_records() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+        let patient = Address::generate(&env);
+
+        client.add_issuer(
+            &issuer,
+            &String::from_str(&env, "General Hospital"),
+            &String::from_str(&env, "LIC-12345"),
+            &String::from_str(&env, "USA"),
+        ).unwrap();
+
+        let token_a = client.mint_vaccination(
+            &patient,
+            &String::from_str(&env, "COVID-19"),
+            &String::from_str(&env, "2024-01-15"),
+            &issuer,
+            &Some(1u32),
+            &Some(2u32),
+        );
+        let token_b = client.mint_vaccination(
+            &patient,
+            &String::from_str(&env, "COVID-19"),
+            &String::from_str(&env, "2024-02-15"),
+            &issuer,
+            &Some(2u32),
+            &Some(2u32),
+        );
+
+        let (vaccinated, records, _) = client.verify_vaccination(&patient);
+        assert!(vaccinated);
+        assert_eq!(records.len(), 2);
+
+        // Revoke only the first record; the second must remain valid.
+        client.revoke_vaccination(&token_a, &issuer).unwrap();
+
+        let (vaccinated, records, _) = client.verify_vaccination(&patient);
+        assert!(vaccinated);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records.get(0).unwrap().token_id, token_b);
+    }
+
+    #[test]
+    fn test_admin_rotation_flow() {
+        let (env, client, admin) = setup_env();
+        let new_admin = Address::generate(&env);
+
+        // Propose assigns nonce 1.
+        client.propose_admin(&new_admin);
+
+        // Accepting with a wrong nonce is rejected (replay protection).
+        let result = client.try_accept_admin(&99u64);
+        assert_eq!(result, Err(Ok(ContractError::InvalidNonce)));
+
+        // Accepting before the delay elapses is rejected.
+        let result = client.try_accept_admin(&1u64);
+        assert_eq!(result, Err(Ok(ContractError::ProposalNotYetValid)));
+
+        // Advance past the delay and accept.
+        env.ledger().with_mut(|li| li.timestamp += ADMIN_TRANSFER_DELAY + 1);
+        client.accept_admin(&1u64).unwrap();
+
+        // Old admin can no longer propose (auth would fail); new admin is active.
+        // Verify by proposing from the new admin.
+        let another = Address::generate(&env);
+        client.propose_admin(&another);
+        let _ = admin;
+    }
+
+    #[test]
+    fn test_admin_rotation_cancel_and_expiry() {
+        let (env, client, _admin) = setup_env();
+        let new_admin = Address::generate(&env);
+
+        // Cancel a pending proposal.
+        client.propose_admin(&new_admin);
+        client.cancel_admin(&1u64).unwrap();
+        let result = client.try_accept_admin(&1u64);
+        assert_eq!(result, Err(Ok(ContractError::NoPendingTransfer)));
+
+        // Expiry: propose, advance past expiry, accept fails.
+        client.propose_admin(&new_admin);
+        env.ledger().with_mut(|li| li.timestamp += ADMIN_TRANSFER_EXPIRY + 1);
+        let result = client.try_accept_admin(&2u64);
+        assert_eq!(result, Err(Ok(ContractError::ProposalExpired)));
     }
 
     #[test]

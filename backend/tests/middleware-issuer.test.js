@@ -90,6 +90,81 @@ describe('issuerMiddleware — revoked / unauthorized issuer', () => {
     expect(next).not.toHaveBeenCalled();
     expect(logger.warn).toHaveBeenCalled();
   });
+
+  it('rejects a revoked issuer on every request (no stale allow after revoke)', async () => {
+    isAuthorizedIssuer.mockResolvedValue(false);
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const req = makeReq();
+      const res = makeRes();
+      const next = jest.fn();
+
+      await issuerMiddleware(req, res, next);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(next).not.toHaveBeenCalled();
+    }
+
+    // The allowlist is consulted per request so revocation takes effect immediately
+    expect(isAuthorizedIssuer).toHaveBeenCalledTimes(3);
+  });
+
+  it('rejects a revoked issuer even when the token still carries the issuer role', async () => {
+    isAuthorizedIssuer.mockResolvedValue(false);
+    const req = makeReq({ role: 'issuer' });
+    const res = makeRes();
+    const next = jest.fn();
+
+    await issuerMiddleware(req, res, next);
+
+    expect(isAuthorizedIssuer).toHaveBeenCalledWith(WALLET);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledWith({
+      error: 'Issuer authorization revoked or not found on-chain',
+    });
+    expect(next).not.toHaveBeenCalled();
+  });
+});
+
+describe('issuerMiddleware — re-added issuer', () => {
+  it('allows access again after a revoked issuer is re-added on-chain', async () => {
+    // Revoked state
+    isAuthorizedIssuer.mockResolvedValueOnce(false);
+    const revokedRes = makeRes();
+    const revokedNext = jest.fn();
+
+    await issuerMiddleware(makeReq(), revokedRes, revokedNext);
+
+    expect(revokedRes.status).toHaveBeenCalledWith(403);
+    expect(revokedNext).not.toHaveBeenCalled();
+
+    // Re-added state
+    isAuthorizedIssuer.mockResolvedValueOnce(true);
+    const readdedRes = makeRes();
+    const readdedNext = jest.fn();
+
+    await issuerMiddleware(makeReq(), readdedRes, readdedNext);
+
+    expect(readdedNext).toHaveBeenCalledTimes(1);
+    expect(readdedRes.status).not.toHaveBeenCalled();
+    expect(isAuthorizedIssuer).toHaveBeenCalledTimes(2);
+  });
+
+  it('treats repeated authorized checks as idempotent (next called once per request)', async () => {
+    isAuthorizedIssuer.mockResolvedValue(true);
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const res = makeRes();
+      const next = jest.fn();
+
+      await issuerMiddleware(makeReq(), res, next);
+
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(res.status).not.toHaveBeenCalled();
+    }
+
+    expect(isAuthorizedIssuer).toHaveBeenCalledTimes(3);
+  });
 });
 
 describe('issuerMiddleware — non-issuer role', () => {

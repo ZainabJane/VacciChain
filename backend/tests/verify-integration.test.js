@@ -123,6 +123,58 @@ describe('Integration Tests - Public Verify Endpoint (GET /v1/verify/:wallet)', 
     expect(res.body).toHaveProperty('error');
   });
 
+  it('Test: revoking one of multiple records excludes only the revoked record', async () => {
+    // Contract returns only non-revoked records; revoked record must be excluded
+    const mockResult = StellarSdk.xdr.ScVal.scvVec([
+      StellarSdk.xdr.ScVal.scvBool(true),
+      StellarSdk.xdr.ScVal.scvVec([
+        StellarSdk.xdr.ScVal.scvMap([
+          new StellarSdk.xdr.ScMapEntry({
+            key: StellarSdk.xdr.ScVal.scvSymbol('vaccine_name'),
+            val: StellarSdk.xdr.ScVal.scvString('COVID-19')
+          }),
+          new StellarSdk.xdr.ScMapEntry({
+            key: StellarSdk.xdr.ScVal.scvSymbol('date_administered'),
+            val: StellarSdk.xdr.ScVal.scvString('2024-01-15')
+          })
+        ])
+      ]),
+    ]);
+
+    simulateContract.mockResolvedValueOnce(mockResult);
+
+    const res = await request(app)
+      .get(`/v1/verify/${VALID_WALLET}`)
+      .set('Authorization', `Bearer ${validToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('verified', true);
+    expect(res.body).toHaveProperty('vaccinated', true);
+    expect(res.body.records).toHaveLength(1);
+    expect(res.body.records[0]).toHaveProperty('vaccine_name', 'COVID-19');
+    // Revoked record must not be present
+    expect(res.body.records.some((r) => r.vaccine_name === 'Influenza')).toBe(false);
+  });
+
+  it('Test: revoking all records returns verified=false with empty records', async () => {
+    // All records revoked -> contract returns [false, []]
+    const mockResult = StellarSdk.xdr.ScVal.scvVec([
+      StellarSdk.xdr.ScVal.scvBool(false),
+      StellarSdk.xdr.ScVal.scvVec([]),
+    ]);
+
+    simulateContract.mockResolvedValueOnce(mockResult);
+
+    const res = await request(app)
+      .get(`/v1/verify/${VALID_WALLET}`)
+      .set('Authorization', `Bearer ${validToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('verified', false);
+    expect(res.body).toHaveProperty('vaccinated', false);
+    expect(res.body.records).toHaveLength(0);
+  });
+
   it('Test: response is served from cache on second request within TTL', async () => {
     const mockResult = StellarSdk.xdr.ScVal.scvVec([
       StellarSdk.xdr.ScVal.scvBool(true),

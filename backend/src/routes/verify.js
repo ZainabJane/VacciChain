@@ -14,6 +14,25 @@ const verifyCache = new Map();
 const CACHE_TTL = 60 * 1000; // 60 seconds
 
 /**
+ * Revocation semantics (Backlog 079):
+ * - Revocation is per-record and irreversible; a revoked record can never be
+ *   un-revoked or re-issued under the same record id.
+ * - Revoking a record does NOT revoke the wallet or the issuer's permission.
+ * - Verifiers must treat revoked records as invalid: they are excluded from
+ *   results, and a wallet is only `verified` if at least one non-revoked
+ *   record remains.
+ */
+function isRevokedRecord(record) {
+  if (!record || typeof record !== 'object') return false;
+  return record.revoked === true || record.is_revoked === true || record.status === 'revoked';
+}
+
+function filterActiveRecords(records) {
+  if (!Array.isArray(records)) return [];
+  return records.filter((record) => !isRevokedRecord(record));
+}
+
+/**
  * Try JWT first; if no Authorization header, fall through to API key auth.
  * One of the two must succeed — otherwise 401.
  */
@@ -93,19 +112,22 @@ router.get(
     const now = Date.now();
     const cached = verifyCache.get(wallet);
     if (cached && (now - cached.timestamp < CACHE_TTL)) {
+      const activeRecords = filterActiveRecords(cached.records);
       return res.json({
         wallet,
-        verified: cached.vaccinated,
-        records: cached.records
+        verified: activeRecords.length > 0,
+        records: activeRecords
       });
     }
 
     try {
-      const { vaccinated, records } = await verifyVaccination(wallet);
+      const { records } = await verifyVaccination(wallet);
+      const activeRecords = filterActiveRecords(records);
+      const vaccinated = activeRecords.length > 0;
 
       verifyCache.set(wallet, {
         vaccinated,
-        records,
+        records: activeRecords,
         timestamp: now
       });
 
@@ -117,7 +139,7 @@ router.get(
         meta: { ip },
       });
 
-      res.json({ wallet, verified: vaccinated, records });
+      res.json({ wallet, verified: vaccinated, records: activeRecords });
     } catch (err) {
       const errorMessage = resolveContractErrorMessage(err);
       audit({ actor: ip, action: 'verify.public_lookup', target: wallet, result: 'failure', meta: { error: errorMessage, ip } });
@@ -200,21 +222,25 @@ router.get(
     const now = Date.now();
     const cached = verifyCache.get(wallet);
     if (cached && (now - cached.timestamp < CACHE_TTL)) {
+      const activeRecords = filterActiveRecords(cached.records);
+      const vaccinated = activeRecords.length > 0;
       return res.json({
         wallet,
-        vaccinated: cached.vaccinated,
-        verified: cached.vaccinated,
-        record_count: cached.records.length,
-        records: cached.records
+        vaccinated,
+        verified: vaccinated,
+        record_count: activeRecords.length,
+        records: activeRecords
       });
     }
 
     try {
-      const { vaccinated, records } = await verifyVaccination(wallet);
+      const { records } = await verifyVaccination(wallet);
+      const activeRecords = filterActiveRecords(records);
+      const vaccinated = activeRecords.length > 0;
 
       verifyCache.set(wallet, {
         vaccinated,
-        records,
+        records: activeRecords,
         timestamp: now
       });
 
@@ -226,7 +252,7 @@ router.get(
         meta: req.verifier ? { verifier_label: req.verifier.label } : {},
       });
 
-      res.json({ wallet, vaccinated, verified: vaccinated, record_count: records.length, records });
+      res.json({ wallet, vaccinated, verified: vaccinated, record_count: activeRecords.length, records: activeRecords });
     } catch (err) {
       const errorMessage = resolveContractErrorMessage(err);
       audit({ actor, action: 'verify.lookup', target: wallet, result: 'failure', meta: { error: errorMessage } });
@@ -242,4 +268,6 @@ router.get(
 );
 
 router.verifyCache = verifyCache;
+router.isRevokedRecord = isRevokedRecord;
+router.filterActiveRecords = filterActiveRecords;
 module.exports = router;

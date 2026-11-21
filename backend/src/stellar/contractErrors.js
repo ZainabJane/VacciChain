@@ -17,6 +17,18 @@ const CONTRACT_ERRORS = Object.freeze({
   14: { name: 'InvalidInputCountry', message: 'Issuer country exceeds 100 characters.' },
   15: { name: 'SoulboundToken', message: 'Transfers are disabled for soulbound records.' },
   16: { name: 'PatientNotRegistered', message: 'Patient has not self-registered.' },
+  17: { name: 'AlreadyAuthorized', message: 'Issuer is already authorized.' },
+  18: { name: 'NotAuthorized', message: 'Issuer is not authorized.' },
+  19: { name: 'InvalidThreshold', message: 'Proposed threshold is invalid.' },
+  20: { name: 'DelayNotElapsed', message: 'Recovery delay has not elapsed yet.' },
+  21: { name: 'ProposalCancelled', message: 'Admin transfer proposal has been cancelled.' },
+  22: { name: 'ProposalAlreadyAccepted', message: 'Admin transfer proposal has already been accepted.' },
+  23: { name: 'InvalidProposal', message: 'Admin transfer proposal is invalid.' },
+  24: { name: 'EmergencyRecoveryActive', message: 'Emergency recovery is already active.' },
+  25: { name: 'EmergencyRecoveryNotActive', message: 'Emergency recovery is not active.' },
+  26: { name: 'InsufficientApprovals', message: 'Insufficient approvals to execute this action.' },
+  27: { name: 'DuplicateApproval', message: 'Approval has already been recorded for this signer.' },
+  28: { name: 'AdminKeyUnavailable', message: 'Administrator key is unavailable.' },
 });
 
 function getContractErrorInfo(code) {

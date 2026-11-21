@@ -88,3 +88,93 @@ describe('POST /vaccination/issue — null / missing field validation (#345)', (
     expect(res.status).toBe(400);
   });
 });
+
+describe('POST /vaccination/issue — dose_number validation and normalization (#80)', () => {
+  const base = {
+    patient_address: VALID_WALLET,
+    vaccine_name: 'COVID-19',
+    date_administered: '2024-01-15',
+    dose_number: 1,
+  };
+
+  it('returns 400 when dose_number is null', async () => {
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken()}`)
+      .send({ ...base, dose_number: null });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 when dose_number is missing', async () => {
+    const { dose_number: _, ...body } = base;
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken()}`)
+      .send(body);
+
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 when dose_number is zero', async () => {
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken()}`)
+      .send({ ...base, dose_number: 0 });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 when dose_number is negative', async () => {
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken()}`)
+      .send({ ...base, dose_number: -1 });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 when dose_number is a non-integer', async () => {
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken()}`)
+      .send({ ...base, dose_number: 1.5 });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 when dose_number is a non-numeric string', async () => {
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken()}`)
+      .send({ ...base, dose_number: 'first' });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('accepts a legitimate repeat dose (dose_number 2)', async () => {
+    const res = await request(app)
+      .post('/v1/vaccination/issue')
+      .set('Authorization', `Bearer ${issuerToken()}`)
+      .send({ ...base, dose_number: 2 });
+
+    expect(res.status).not.toBe(400);
+  });
+
+  it('normalizes vaccine_name formatting variants to the same key', async () => {
+    const variants = ['COVID-19', 'covid-19', '  Covid-19  ', 'COVID19'];
+    const statuses = [];
+
+    for (const vaccine_name of variants) {
+      const res = await request(app)
+        .post('/v1/vaccination/issue')
+        .set('Authorization', `Bearer ${issuerToken()}`)
+        .send({ ...base, vaccine_name });
+
+      statuses.push(res.status);
+    }
+
+    // All formatting variants must be treated consistently (no 400 from normalization).
+    expect(statuses.every((s) => s !== 400)).toBe(true);
+  });
+});

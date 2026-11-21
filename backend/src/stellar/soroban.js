@@ -286,6 +286,123 @@ function sendRpcTimeout(res) {
   return res.status(503).json({ error: 'RPC timeout', retryAfter: 5 });
 }
 
+/**
+ * Map known contract error codes/messages to descriptive Soroban errors.
+ * Contract errors surface either as simulation errors (read paths) or as
+ * errorResult XDR strings (write paths). We normalize both into a stable
+ * shape so callers can branch on `error.contractError`.
+ */
+const CONTRACT_ERROR_MAP = {
+  // Admin rotation / recovery
+  AdminAlreadyProposed: 'An admin rotation proposal is already pending',
+  NoPendingAdmin: 'No pending admin rotation proposal exists',
+  ProposalExpired: 'Admin rotation proposal has expired',
+  ProposalNotYetValid: 'Admin rotation proposal delay has not elapsed',
+  Unauthorized: 'Caller is not authorized for this admin operation',
+  InvalidAdmin: 'Proposed admin address is invalid',
+  SelfRotation: 'Cannot propose the current admin as the new admin',
+  // Duplicate detection
+  DuplicateRecord: 'A matching vaccination record already exists',
+  DuplicateDose: 'This dose number has already been recorded for the series',
+};
+
+function mapContractError(rawMessage) {
+  if (!rawMessage) return null;
+  const text = String(rawMessage);
+  for (const [code, description] of Object.entries(CONTRACT_ERROR_MAP)) {
+    if (text.includes(code)) {
+      return { code, description };
+    }
+  }
+  return null;
+}
+
+function buildContractError(rawMessage, fallbackMessage) {
+  const mapped = mapContractError(rawMessage);
+  const message = mapped
+    ? `${fallbackMessage}: ${mapped.description} (${mapped.code})`
+    : `${fallbackMessage}: ${rawMessage}`;
+  const error = new SorobanTransactionError(message);
+  error.contractError = mapped ? mapped.code : null;
+  error.rawContractError = rawMessage;
+  return error;
+}
+
+/**
+ * Propose a new admin for the contract (current admin-signed).
+ * Starts the rotation delay window; the proposal must be accepted by the
+ * proposed admin after the delay and before expiry.
+ * @param {string} newAdminWallet - Stellar public key of the proposed admin
+ * @param {Object} [options]
+ * @param {string} [options.adminSecret] - Override for ADMIN_SECRET_KEY
+ */
+async function proposeAdmin(newAdminWallet, options = {}) {
+  const adminSecret = options.adminSecret || process.env.ADMIN_SECRET_KEY;
+  if (!adminSecret) throw new Error('ADMIN_SECRET_KEY not configured');
+  try {
+    const args = [
+      StellarSdk.xdr.ScVal.scvAddress(
+        StellarSdk.Address.fromString(newAdminWallet).toScAddress()
+      ),
+    ];
+    return await invokeContract(adminSecret, 'propose_admin', args);
+  } catch (error) {
+    if (error instanceof SorobanError) throw error;
+    throw buildContractError(error.message, 'Failed to propose admin rotation');
+  }
+}
+
+/**
+ * Accept a pending admin rotation (signed by the proposed admin).
+ * @param {string} newAdminSecret - Secret key of the proposed admin
+ */
+async function acceptAdmin(newAdminSecret) {
+  if (!newAdminSecret) throw new Error('Proposed admin secret key required');
+  try {
+    return await invokeContract(newAdminSecret, 'accept_admin', []);
+  } catch (error) {
+    if (error instanceof SorobanError) throw error;
+    throw buildContractError(error.message, 'Failed to accept admin rotation');
+  }
+}
+
+/**
+ * Cancel a pending admin rotation (current admin-signed).
+ * @param {Object} [options]
+ * @param {string} [options.adminSecret] - Override for ADMIN_SECRET_KEY
+ */
+async function cancelAdmin(options = {}) {
+  const adminSecret = options.adminSecret || process.env.ADMIN_SECRET_KEY;
+  if (!adminSecret) throw new Error('ADMIN_SECRET_KEY not configured');
+  try {
+    return await invokeContract(adminSecret, 'cancel_admin', []);
+  } catch (error) {
+    if (error instanceof SorobanError) throw error;
+    throw buildContractError(error.message, 'Failed to cancel admin rotation');
+  }
+}
+
+/**
+ * Read the pending admin rotation proposal, if any (read-only).
+ * Returns { pendingAdmin, proposedAt, expiresAt } or null.
+ */
+async function getPendingAdmin() {
+  try {
+    const rawResult = await simulateContract('get_pending_admin', []);
+    if (rawResult == null) return null;
+    const native = StellarSdk.scValToNative(rawResult);
+    if (!native) return null;
+    return {
+      pendingAdmin: native.pending_admin ?? native.pendingAdmin ?? null,
+      proposedAt: native.proposed_at ?? native.proposedAt ?? null,
+      expiresAt: native.expires_at ?? native.expiresAt ?? null,
+    };
+  } catch (error) {
+    if (error instanceof SorobanError) throw error;
+    throw new SorobanSimulationError('Failed to read pending admin', error);
+  }
+}
+
 module.exports = {
   getRpcServer,
   invokeContract,
@@ -294,6 +411,11 @@ module.exports = {
   verifyVaccination,
   addIssuer,
   revokeIssuer,
+  proposeAdmin,
+  acceptAdmin,
+  cancelAdmin,
+  getPendingAdmin,
+  mapContractError,
   sendRpcTimeout,
   SorobanError,
   SorobanRpcError,

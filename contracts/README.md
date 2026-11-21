@@ -51,12 +51,29 @@ Authorizes a new issuer to mint vaccination records.
 ---
 
 #### `revoke_issuer(env: Env, issuer: Address)`
-Revokes an issuer's authorization to mint new records.
+Revokes an issuer's authorization to mint new records. Existing records minted by the issuer are unaffected.
 
 **Parameters:**
 - `issuer`: Address of the issuer to revoke
 
 **Authorization:** Requires admin signature
+
+**Issuer Lifecycle State Machine:**
+
+States: `None` (address never added), `Active` (authorized to mint), `Revoked` (previously authorized, now disabled).
+
+| From | Operation | To | Result |
+|------|-----------|----|--------|
+| `None` | `add_issuer` | `Active` | Ok |
+| `Active` | `add_issuer` | `Active` | Ok (idempotent; metadata updated) |
+| `Revoked` | `add_issuer` | `Active` | Ok (re-add permitted) |
+| `Active` | `revoke_issuer` | `Revoked` | Ok |
+| `Revoked` | `revoke_issuer` | `Revoked` | Ok (idempotent no-op) |
+| `None` | `revoke_issuer` | `None` | Ok (idempotent no-op) |
+| `None`/`Revoked` | `mint_vaccination` | unchanged | `ContractError::Unauthorized` |
+| `Active` | `mint_vaccination` | `Active` | Ok |
+
+All transitions emit events (`IssuerAdded`, `IssuerRevoked`) for auditability. Re-add after revoke is a distinct auditable transition, not a silent reactivation.
 
 ---
 
@@ -71,6 +88,13 @@ Proposes a new admin address. Proposal expires after 24 hours.
 - `ContractError::NotInitialized` if contract not initialized
 
 **Authorization:** Requires current admin signature
+
+**Admin Recovery & Rotation Policy (formal):**
+- **Threshold:** Rotation requires two distinct signatures — the current admin (`propose_admin`) and the proposed admin (`accept_admin`). No single party can unilaterally take control.
+- **Delay:** A proposal is valid for a 24-hour window from creation. Acceptance before the proposal is recorded or after expiry fails (`ContractError::ProposalExpired`).
+- **Cancellation:** The current admin may cancel a pending proposal before acceptance; the pending transfer and expiry are cleared. A cancelled or expired proposal cannot be replayed.
+- **Replay protection:** Each proposal is single-use; `accept_admin` clears the pending state atomically, so a second acceptance fails with `ContractError::NoPendingTransfer`.
+- **Emergency path:** If the admin key is lost or compromised, recovery uses the same propose/accept flow initiated by the current admin. There is no bypass that skips the two-signature threshold; emergency rotation is bounded by the same delay and cancellation rules. Compromise response is to propose a new admin immediately and cancel any attacker-initiated proposal.
 
 ---
 
@@ -112,16 +136,42 @@ Mints a new vaccination record NFT.
 **Returns:**
 - `Ok(token_id)` with the new token ID on success
 - `ContractError::Unauthorized` if issuer is not authorized
-- `ContractError::DuplicateRecord` if identical record already exists
+- `ContractError::DuplicateRecord` if an equivalent record already exists (see Duplicate Key Definition)
 - `ContractError::InvalidInputVaccineName` if vaccine name exceeds 100 characters
 - `ContractError::InvalidInputDateAdministered` if date exceeds 100 characters
+
+**Authorization:** Requires issuer signature
+
+**Duplicate Key Definition (formal):** Two records are duplicates iff their normalized duplicate keys are equal. The duplicate key is the tuple:
+
+```
+(patient_wallet, normalize(vaccine_name), normalize(date_administered), dose_number)
+```
+
+Normalization rules (applied identically in API and contract):
+- `patient_wallet`: canonical Stellar address (case-sensitive, no transformation).
+- `vaccine_name`: trimmed of leading/trailing whitespace, internal whitespace collapsed to a single space, and lowercased (Unicode-aware). Formatting variants such as `"COVID-19"`, `" covid-19 "`, and `"Covid-19"` are equivalent.
+- `date_administered`: normalized to ISO-8601 `YYYY-MM-DD`; equivalent representations of the same calendar date are treated as equal.
+- `dose_number`: integer dose index (1-based) distinguishing legitimate repeat doses.
+
+**Repeat doses:** Legitimate repeat doses are allowed because `dose_number` is part of the key. Minting dose 2 of the same vaccine on the same date for the same patient is not a duplicate; minting the same `dose_number` again is. Concurrency cannot bypass the check: the duplicate lookup and insertion occur within a single contract invocation, and Soroban serializes invocations per contract instance.
 
 **Authorization:** Requires issuer signature
 
 ---
 
 #### `revoke_vaccination(env: Env, token_id: u64, revoker: Address) -> Result<(), ContractError>`
-Revokes a vaccination record. Record is marked as revoked but preserved for audit trail.
+Revokes a single vaccination record. Record is marked as revoked but preserved for audit trail.
+
+**Revocation Scope (formal):**
+- Revocation is **record-level only**. It affects exactly one `token_id`.
+- Revocation **never** changes wallet-level status directly; wallet status is derived from the set of non-revoked records at query time.
+- Revocation **never** affects issuer authorization. Issuer permission is governed solely by `revoke_issuer` (see Issuer Lifecycle State Machine).
+- Revocation is **irreversible**: a revoked record can never be un-revoked or re-minted under the same `token_id`. Re-vaccination must be minted as a new record (subject to duplicate rules).
+
+**Event:** Emits `VaccinationRevoked { token_id: u64, revoker: Address, timestamp: u64 }` where `timestamp` is the ledger timestamp at revocation.
+
+**Verifier semantics:** Verifiers MUST treat any record with `revoked == true` as invalid. `verify_vaccination` and `batch_verify` exclude revoked records from returned lists and from `is_vaccinated` computation. A wallet with only revoked records is reported as not vaccinated.
 
 **Parameters:**
 - `token_id`: ID of the token to revoke
@@ -130,7 +180,7 @@ Revokes a vaccination record. Record is marked as revoked but preserved for audi
 **Returns:**
 - `Ok(())` on success
 - `ContractError::RecordNotFound` if token doesn't exist
-- `ContractError::AlreadyRevoked` if record is already revoked
+- `ContractError::AlreadyRevoked` if record is already revoked (revocation is not idempotent; repeated calls error)
 - `ContractError::Unauthorized` if revoker is not authorized
 
 **Authorization:** Requires revoker signature
@@ -203,6 +253,7 @@ pub struct VaccinationRecord {
     pub patient: Address,        // Patient's wallet address
     pub vaccine_name: String,    // Name of the vaccine
     pub date_administered: String, // Date vaccine was given
+    pub dose_number: u32,        // 1-based dose index (part of duplicate key)
     pub issuer: Address,         // Issuer who minted the record
     pub timestamp: u64,          // Block timestamp when minted
     pub schema_version: u32,     // Schema version for future upgrades
@@ -229,6 +280,7 @@ pub enum DataKey {
     Initialized,                    // Contract initialization flag
     PendingAdmin,                   // Pending admin transfer address
     AdminTransferExpiry,            // Admin transfer expiry timestamp
+    AdminProposalNonce,             // Monotonic nonce for replay protection
     Issuer(BytesN<32>),            // Issuer authorization (hashed address)
     PatientTokens(BytesN<32>),     // Patient's token list (hashed address)
     Token(u64),                    // Individual vaccination record
@@ -323,7 +375,10 @@ The contract includes comprehensive tests covering:
 - Authorization checks
 - Input validation
 - Admin transfer functionality
-- Revocation mechanisms
+- Revocation mechanisms (record-level scope, irreversibility, revoking one of multiple records)
+- Duplicate detection (exact duplicates, normalized-equivalent values, legitimate repeat doses)
+- Issuer lifecycle state transitions (add, revoke, re-add, idempotency)
+- Admin recovery/rotation (proposal, acceptance, expiry, replay, unauthorized attempts)
 - Batch verification
 - Soulbound transfer prevention
 - Edge cases and error conditions
@@ -364,7 +419,8 @@ make deploy
 
 - **Soulbound Nature**: Transfers are permanently disabled via panic
 - **Authorization**: Only authorized issuers can mint records
-- **Duplicate Prevention**: Identical records are blocked
-- **Audit Trail**: Revoked records are preserved, not deleted
+- **Duplicate Prevention**: Records are blocked when their normalized duplicate key `(patient, normalized vaccine_name, normalized date, dose_number)` matches an existing record
+- **Audit Trail**: Revoked records are preserved, not deleted; revocation is record-level and irreversible
+- **Revocation Semantics**: Verifiers treat revoked records as invalid; revocation does not affect issuer permission or other records
 - **Input Validation**: All string inputs are length-validated
-- **Admin Controls**: Two-step admin transfer with expiry protection
+- **Admin Controls**: Two-step admin transfer with 24-hour expiry, cancellation, and replay protection; no unilateral control path

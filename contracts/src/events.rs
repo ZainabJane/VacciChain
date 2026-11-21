@@ -8,6 +8,11 @@ pub fn emit_minted(env: &Env, token_id: u64, patient: &Address, vaccine_name: &S
     );
 }
 
+/// Emitted when an individual vaccination record is revoked.
+///
+/// Revocation scope: affects only the single record identified by `token_id`.
+/// It does not revoke the issuer's permission nor other records they issued.
+/// Revocation is irreversible: a revoked record can never be un-revoked.
 pub fn emit_revoked(env: &Env, token_id: u64, revoker: &Address) {
     let timestamp = env.ledger().timestamp();
     env.events().publish(
@@ -24,6 +29,12 @@ pub fn emit_issuer_added(env: &Env, issuer: &Address, admin: &Address) {
     );
 }
 
+/// Emitted when an issuer's permission is revoked by the admin.
+///
+/// Revocation scope: affects the issuer's permission to mint new records.
+/// Previously minted records remain valid unless individually revoked.
+/// Revocation is irreversible for the current permission grant; re-adding
+/// the issuer emits a fresh `iss_add` event.
 pub fn emit_issuer_revoked(env: &Env, issuer: &Address, admin: &Address) {
     let timestamp = env.ledger().timestamp();
     env.events().publish(
@@ -44,6 +55,22 @@ pub fn emit_admin_transfer_accepted(env: &Env, new_admin: &Address) {
     env.events().publish(
         (symbol_short!("adm_acc"),),
         (new_admin.clone(), timestamp),
+    );
+}
+
+pub fn emit_admin_transfer_cancelled(env: &Env, current_admin: &Address, cancelled_by: &Address) {
+    let timestamp = env.ledger().timestamp();
+    env.events().publish(
+        (symbol_short!("adm_cncl"),),
+        (current_admin.clone(), cancelled_by.clone(), timestamp),
+    );
+}
+
+pub fn emit_admin_transfer_expired(env: &Env, current_admin: &Address, new_admin: &Address) {
+    let timestamp = env.ledger().timestamp();
+    env.events().publish(
+        (symbol_short!("adm_exp"),),
+        (current_admin.clone(), new_admin.clone(), timestamp),
     );
 }
 
