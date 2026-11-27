@@ -86,8 +86,28 @@ services:
     environment:
       - EVENT_POLL_INTERVAL_MS=${EVENT_POLL_INTERVAL_MS:-15000}
       - DATABASE_PATH=/data/vaccichain.db
+      # Persistence strategy (#52): SQLite in WAL mode with busy timeout for
+      # single-writer concurrency; see docs/persistence-strategy.md.
+      - DATABASE_JOURNAL_MODE=${DATABASE_JOURNAL_MODE:-WAL}
+      - DATABASE_BUSY_TIMEOUT_MS=${DATABASE_BUSY_TIMEOUT_MS:-5000}
+      - DATABASE_SYNCHRONOUS=${DATABASE_SYNCHRONOUS:-NORMAL}
+      # Trust-proxy topology (#56): number of trusted proxy hops in front of
+      # the backend (nginx only = 1). Set to "false" to disable trust proxy.
+      - TRUST_PROXY=${TRUST_PROXY:-1}
+      # Public verification response/work bounds (#54).
+      - PUBLIC_RECORD_MAX_HISTORY=${PUBLIC_RECORD_MAX_HISTORY:-100}
+      - PUBLIC_RECORD_DEFAULT_PAGE_SIZE=${PUBLIC_RECORD_DEFAULT_PAGE_SIZE:-20}
+      - PUBLIC_RECORD_MAX_PAGE_SIZE=${PUBLIC_RECORD_MAX_PAGE_SIZE:-100}
+      - PUBLIC_BATCH_MAX_ITEMS=${PUBLIC_BATCH_MAX_ITEMS:-50}
+      # Tamper-evident, rotation-safe audit logging (#57).
+      - AUDIT_LOG_PATH=${AUDIT_LOG_PATH:-/data/audit/audit.log}
+      - AUDIT_LOG_MAX_SIZE_BYTES=${AUDIT_LOG_MAX_SIZE_BYTES:-10485760}
+      - AUDIT_LOG_MAX_FILES=${AUDIT_LOG_MAX_FILES:-5}
+      - AUDIT_LOG_RETENTION_DAYS=${AUDIT_LOG_RETENTION_DAYS:-90}
+      - AUDIT_LOG_HMAC_SECRET=${AUDIT_LOG_HMAC_SECRET:-}
     volumes:
       - vaccichain_db:/data
+      - vaccichain_audit:/data/audit
     depends_on:
       python-service:
         condition: service_healthy
@@ -160,8 +180,13 @@ services:
   backup:
     build: ./backup
     env_file: .env
+    environment:
+      - DATABASE_PATH=/data/vaccichain.db
+      - BACKUP_DIR=/backups
+      - BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS:-30}
     volumes:
       - vaccichain_db:/data
+      - vaccichain_backups:/backups
     networks:
       - vaccichain
     healthcheck:
@@ -183,4 +208,6 @@ networks:
 
 volumes:
   vaccichain_db:
+  vaccichain_audit:
+  vaccichain_backups:
   certbot_webroot:

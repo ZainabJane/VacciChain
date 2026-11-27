@@ -1,39 +1,104 @@
 name: Deploy Contract
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "contracts/**"
   workflow_dispatch:
     inputs:
       network:
-        description: "Target network"
+        description: "Target network (explicit; no implicit push deploys)"
         required: true
-        default: testnet
         type: choice
         options: [testnet, mainnet]
+      action:
+        description: "Deployment action"
+        required: true
+        default: auto
+        type: choice
+        options: [auto, deploy, upgrade, noop]
+      target_contract:
+        description: "Existing contract ID to upgrade (required for upgrade)"
+        required: false
+        type: string
+      allow_second_production_contract:
+        description: "Explicitly allow creating a second production contract"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
 
 jobs:
+  validate-network:
+    name: Validate network configuration
+    runs-on: ubuntu-latest
+    outputs:
+      network: ${{ steps.validate.outputs.network }}
+      rpc-url: ${{ steps.validate.outputs.rpc_url }}
+      network-passphrase: ${{ steps.validate.outputs.network_passphrase }}
+      explorer-url: ${{ steps.validate.outputs.explorer_url }}
+    steps:
+      - name: Validate explicit network input
+        id: validate
+        env:
+          NETWORK: ${{ inputs.network }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NETWORK:-}" ]; then
+            echo "::error::No network specified. An explicit network input is required."
+            exit 1
+          fi
+          case "$NETWORK" in
+            testnet)
+              RPC_URL="https://soroban-testnet.stellar.org"
+              NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+              EXPLORER_URL="https://stellar.expert/explorer/testnet"
+              ;;
+            mainnet)
+              RPC_URL="https://soroban-mainnet.stellar.org"
+              NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"
+              EXPLORER_URL="https://stellar.expert/explorer/public"
+              ;;
+            *)
+              echo "::error::Invalid network '$NETWORK'. Expected one of: testnet, mainnet."
+              exit 1
+              ;;
+          esac
+          echo "network=$NETWORK" >> "$GITHUB_OUTPUT"
+          echo "rpc_url=$RPC_URL" >> "$GITHUB_OUTPUT"
+          echo "network_passphrase=$NETWORK_PASSPHRASE" >> "$GITHUB_OUTPUT"
+          echo "explorer_url=$EXPLORER_URL" >> "$GITHUB_OUTPUT"
+          echo "### Network validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Network:** \`$NETWORK\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **RPC URL:** \`$RPC_URL\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Passphrase:** \`$NETWORK_PASSPHRASE\`" >> "$GITHUB_STEP_SUMMARY"
+
   build:
     name: Build WASM
+    needs: validate-network
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     outputs:
       wasm-hash: ${{ steps.hash.outputs.hash }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
+
+      # Toolchain is pinned via contracts/rust-toolchain.toml so the build is reproducible.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ vars.RUST_TOOLCHAIN || '1.84.0' }}
           targets: wasm32-unknown-unknown
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             contracts/target
-          key: cargo-${{ hashFiles('contracts/Cargo.lock') }}
+          key: cargo-${{ hashFiles('contracts/Cargo.lock', 'contracts/rust-toolchain.toml') }}
 
       - name: Build WASM
         working-directory: contracts
@@ -43,64 +108,160 @@ jobs:
         id: hash
         run: echo "hash=$(sha256sum contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
+      - name: Verify reproducible build hash
+        id: verify
+        env:
+          WASM_HASH: ${{ steps.hash.outputs.hash }}
+        run: |
+          set -euo pipefail
+          EXPECTED_FILE=contracts/release-hashes.txt
+          if [ ! -f "$EXPECTED_FILE" ]; then
+            echo "::error::Missing $EXPECTED_FILE with reviewed release hashes"
+            exit 1
+          fi
+          EXPECTED=$(grep -E "^${GITHUB_SHA}[[:space:]]" "$EXPECTED_FILE" | awk '{print $2}' || true)
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::No reviewed hash recorded for commit $GITHUB_SHA in $EXPECTED_FILE"
+            exit 1
+          fi
+          if [ "$EXPECTED" != "$WASM_HASH" ]; then
+            echo "::error::WASM hash mismatch: expected $EXPECTED, got $WASM_HASH"
+            exit 1
+          fi
+          echo "WASM hash verified against reviewed release: $WASM_HASH"
+          echo "verified=true" >> "$GITHUB_OUTPUT"
+
       - uses: actions/upload-artifact@v4
         with:
           name: vaccichain-wasm
           path: contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm
           retention-days: 7
 
+      - name: Write build hash to summary
+        run: |
+          echo "### Reproducible Build" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **WASM SHA-256:** \`${{ steps.hash.outputs.hash }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Toolchain:** \`${{ vars.RUST_TOOLCHAIN || '1.84.0' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commit:** \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+
   deploy-testnet:
     name: Deploy → Testnet
-    needs: build
+    needs: [validate-network, build]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.network == 'testnet')
+    if: needs.build.outputs.wasm-hash != '' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.network == 'testnet'))
     environment:
       name: testnet
-      url: https://stellar.expert/explorer/testnet/contract/${{ steps.deploy.outputs.contract_id }}
+      url: ${{ needs.validate-network.outputs.explorer-url }}/contract/${{ steps.deploy.outputs.contract_id }}
     outputs:
       contract_id: ${{ steps.deploy.outputs.contract_id }}
+      action: ${{ steps.decide.outputs.action }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: vaccichain-wasm
           path: contracts/target/wasm32-unknown-unknown/release/
+
+      - name: Verify artifact provenance
+        env:
+          EXPECTED_HASH: ${{ needs.build.outputs.wasm-hash }}
+          EXPECTED_REVISION: ${{ github.sha }}
+          WASM_PATH: contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm
+        run: |
+          set -euo pipefail
+          ACTUAL_HASH=$(sha256sum "$WASM_PATH" | cut -d' ' -f1)
+          if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
+            echo "::error::Artifact hash mismatch: expected $EXPECTED_HASH, got $ACTUAL_HASH"
+            exit 1
+          fi
+          gh attestation verify "$WASM_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/deploy.yml" \
+            --source-digest "$EXPECTED_REVISION" \
+            --source-ref "$GITHUB_REF"
+          echo "Provenance verified for $WASM_PATH (sha256=$ACTUAL_HASH, revision=$EXPECTED_REVISION)"
 
       - name: Install Stellar CLI
         run: |
           curl -sSL https://github.com/stellar/stellar-cli/releases/download/v22.8.1/stellar-cli-v22.8.1-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz -C /usr/local/bin stellar
 
+      - name: Validate network-specific configuration
+        env:
+          NETWORK: ${{ needs.validate-network.outputs.network }}
+          RPC_URL: ${{ needs.validate-network.outputs.rpc-url }}
+          NETWORK_PASSPHRASE: ${{ needs.validate-network.outputs.network-passphrase }}
+          ADMIN_SECRET_KEY: ${{ secrets.TESTNET_ADMIN_SECRET_KEY }}
+          ADMIN_PUBLIC_KEY: ${{ secrets.TESTNET_ADMIN_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          [ "$NETWORK" = "testnet" ] || { echo "::error::Expected network 'testnet', got '$NETWORK'."; exit 1; }
+          [ -n "${RPC_URL:-}" ] || { echo "::error::RPC URL is not configured for testnet."; exit 1; }
+          [ -n "${NETWORK_PASSPHRASE:-}" ] || { echo "::error::Network passphrase is not configured for testnet."; exit 1; }
+          [ -n "${ADMIN_SECRET_KEY:-}" ] || { echo "::error::TESTNET_ADMIN_SECRET_KEY secret is missing."; exit 1; }
+          [ -n "${ADMIN_PUBLIC_KEY:-}" ] || { echo "::error::TESTNET_ADMIN_PUBLIC_KEY secret is missing."; exit 1; }
+          echo "Network configuration validated for testnet."
+
       - name: Deploy contract
         id: deploy
+        if: steps.decide.outputs.action == 'deploy' || steps.decide.outputs.action == 'upgrade'
         env:
           ADMIN_SECRET_KEY: ${{ secrets.TESTNET_ADMIN_SECRET_KEY }}
+          RPC_URL: ${{ needs.validate-network.outputs.rpc-url }}
+          NETWORK_PASSPHRASE: ${{ needs.validate-network.outputs.network-passphrase }}
         run: |
+          set -euo pipefail
           CONTRACT_ID=$(stellar contract deploy \
             --wasm contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm \
             --source "$ADMIN_SECRET_KEY" \
-            --network testnet)
+            --rpc-url "$RPC_URL" \
+            --network-passphrase "$NETWORK_PASSPHRASE")
           echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
-          echo "### Testnet Deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Staging Deployment ($ACTION)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Contract ID:** \`$CONTRACT_ID\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **WASM SHA-256:** \`${{ needs.build.outputs.wasm-hash }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Commit:** \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Smoke test
+      - name: Smoke test (network + artifact hash)
         env:
           ADMIN_SECRET_KEY: ${{ secrets.TESTNET_ADMIN_SECRET_KEY }}
           ADMIN_PUBLIC_KEY: ${{ secrets.TESTNET_ADMIN_PUBLIC_KEY }}
           CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          EXPECTED_NETWORK: ${{ needs.validate-network.outputs.network }}
+          EXPECTED_HASH: ${{ needs.build.outputs.wasm-hash }}
+          RPC_URL: ${{ needs.validate-network.outputs.rpc-url }}
+          NETWORK_PASSPHRASE: ${{ needs.validate-network.outputs.network-passphrase }}
         run: |
-          stellar contract invoke \
+          set -euo pipefail
+          [ -n "${CONTRACT_ID:-}" ] || { echo "::error::Deployed contract ID is empty."; exit 1; }
+          # Contract IDs are network-specific: verify the ID resolves on the expected network.
+          if ! stellar contract invoke \
             --id "$CONTRACT_ID" \
             --source "$ADMIN_SECRET_KEY" \
-            --network testnet \
+            --rpc-url "$RPC_URL" \
+            --network-passphrase "$NETWORK_PASSPHRASE" \
             -- verify_vaccination \
-            --wallet "$ADMIN_PUBLIC_KEY"
+            --wallet "$ADMIN_PUBLIC_KEY"; then
+            echo "::error::Contract $CONTRACT_ID is not invocable on network '$EXPECTED_NETWORK'."
+            exit 1
+          fi
+          # Verify the deployed WASM hash matches the build artifact hash.
+          DEPLOYED_HASH=$(stellar contract fetch \
+            --id "$CONTRACT_ID" \
+            --rpc-url "$RPC_URL" \
+            --network-passphrase "$NETWORK_PASSPHRASE" \
+            | sha256sum | cut -d' ' -f1)
+          if [ "$DEPLOYED_HASH" != "$EXPECTED_HASH" ]; then
+            echo "::error::Deployed WASM hash ($DEPLOYED_HASH) does not match build artifact hash ($EXPECTED_HASH)."
+            exit 1
+          fi
+          echo "Smoke test passed: contract $CONTRACT_ID on '$EXPECTED_NETWORK' matches artifact hash $EXPECTED_HASH."
 
       - name: Write contract ID to env config
+        if: steps.decide.outputs.action == 'deploy' || steps.decide.outputs.action == 'upgrade'
         env:
           CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -171,21 +332,28 @@ jobs:
 
   deploy-mainnet:
     name: Deploy → Mainnet
-    needs: [build, deploy-testnet]
+    needs: [validate-network, build, deploy-testnet]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
     # Production promotion is gated on successful staging smoke tests:
     # - deploy-testnet (incl. its smoke test step) must succeed via `needs`
     # - the "Deploy to Staging" workflow must have completed successfully for
     #   this commit (checked in the first step below), so a failing staging
     #   smoke test blocks promotion even when triggered manually.
-    if: github.event_name == 'workflow_dispatch' && inputs.network == 'mainnet'
+    if: needs.build.outputs.wasm-hash != '' && github.event_name == 'workflow_dispatch' && inputs.network == 'mainnet'
     environment:
       name: mainnet
-      url: https://stellar.expert/explorer/public/contract/${{ steps.deploy.outputs.contract_id }}
+      url: ${{ needs.validate-network.outputs.explorer-url }}/contract/${{ steps.deploy.outputs.contract_id }}
     outputs:
       contract_id: ${{ steps.deploy.outputs.contract_id }}
+      action: ${{ steps.decide.outputs.action }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Require successful staging smoke tests
         env:
@@ -210,46 +378,131 @@ jobs:
           fi
           echo "Staging smoke tests passed for $TARGET_SHA. Proceeding with production promotion."
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: vaccichain-wasm
           path: contracts/target/wasm32-unknown-unknown/release/
+
+      - name: Verify artifact provenance
+        env:
+          EXPECTED_HASH: ${{ needs.build.outputs.wasm-hash }}
+          EXPECTED_REVISION: ${{ github.sha }}
+          WASM_PATH: contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm
+        run: |
+          set -euo pipefail
+          ACTUAL_HASH=$(sha256sum "$WASM_PATH" | cut -d' ' -f1)
+          if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
+            echo "::error::Artifact hash mismatch: expected $EXPECTED_HASH, got $ACTUAL_HASH"
+            exit 1
+          fi
+          gh attestation verify "$WASM_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/deploy.yml" \
+            --source-digest "$EXPECTED_REVISION" \
+            --source-ref "$GITHUB_REF"
+          echo "Provenance verified for $WASM_PATH (sha256=$ACTUAL_HASH, revision=$EXPECTED_REVISION)"
+
+      - name: Release gate (approval and identifiers)
+        env:
+          EXPECTED_NETWORK: mainnet
+          EXPECTED_CONTRACT_ID: ${{ vars.MAINNET_CONTRACT_ID }}
+          APPROVED_BY: ${{ github.actor }}
+          APPROVAL_RECORD: ${{ vars.MAINNET_RELEASE_APPROVAL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPROVAL_RECORD:-}" ]; then
+            echo "::error::No recorded mainnet release approval (MAINNET_RELEASE_APPROVAL is unset)"
+            exit 1
+          fi
+          if [ -z "${EXPECTED_CONTRACT_ID:-}" ]; then
+            echo "::error::Expected mainnet contract identifier (MAINNET_CONTRACT_ID) is unset"
+            exit 1
+          fi
+          if [ "$EXPECTED_NETWORK" != "mainnet" ]; then
+            echo "::error::Unexpected target network: $EXPECTED_NETWORK"
+            exit 1
+          fi
+          echo "Release gate passed: approved by $APPROVED_BY, network=$EXPECTED_NETWORK, contract=$EXPECTED_CONTRACT_ID"
 
       - name: Install Stellar CLI
         run: |
           curl -sSL https://github.com/stellar/stellar-cli/releases/download/v22.8.1/stellar-cli-v22.8.1-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz -C /usr/local/bin stellar
 
+      - name: Validate network-specific configuration
+        env:
+          NETWORK: ${{ needs.validate-network.outputs.network }}
+          RPC_URL: ${{ needs.validate-network.outputs.rpc-url }}
+          NETWORK_PASSPHRASE: ${{ needs.validate-network.outputs.network-passphrase }}
+          ADMIN_SECRET_KEY: ${{ secrets.MAINNET_ADMIN_SECRET_KEY }}
+          ADMIN_PUBLIC_KEY: ${{ secrets.MAINNET_ADMIN_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          [ "$NETWORK" = "mainnet" ] || { echo "::error::Expected network 'mainnet', got '$NETWORK'."; exit 1; }
+          [ -n "${RPC_URL:-}" ] || { echo "::error::RPC URL is not configured for mainnet."; exit 1; }
+          [ -n "${NETWORK_PASSPHRASE:-}" ] || { echo "::error::Network passphrase is not configured for mainnet."; exit 1; }
+          [ -n "${ADMIN_SECRET_KEY:-}" ] || { echo "::error::MAINNET_ADMIN_SECRET_KEY secret is missing."; exit 1; }
+          [ -n "${ADMIN_PUBLIC_KEY:-}" ] || { echo "::error::MAINNET_ADMIN_PUBLIC_KEY secret is missing."; exit 1; }
+          echo "Network configuration validated for mainnet."
+
       - name: Deploy contract
         id: deploy
+        if: steps.decide.outputs.action == 'deploy' || steps.decide.outputs.action == 'upgrade'
         env:
           ADMIN_SECRET_KEY: ${{ secrets.MAINNET_ADMIN_SECRET_KEY }}
+          RPC_URL: ${{ needs.validate-network.outputs.rpc-url }}
+          NETWORK_PASSPHRASE: ${{ needs.validate-network.outputs.network-passphrase }}
         run: |
+          set -euo pipefail
           CONTRACT_ID=$(stellar contract deploy \
             --wasm contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm \
             --source "$ADMIN_SECRET_KEY" \
-            --network mainnet)
+            --rpc-url "$RPC_URL" \
+            --network-passphrase "$NETWORK_PASSPHRASE")
           echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
-          echo "### Mainnet Deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Production Deployment ($ACTION)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Contract ID:** \`$CONTRACT_ID\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **WASM SHA-256:** \`${{ needs.build.outputs.wasm-hash }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Commit:** \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Approved by:** \`${{ github.actor }}\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Smoke test
+      - name: Smoke test (network + artifact hash)
         env:
           ADMIN_SECRET_KEY: ${{ secrets.MAINNET_ADMIN_SECRET_KEY }}
           ADMIN_PUBLIC_KEY: ${{ secrets.MAINNET_ADMIN_PUBLIC_KEY }}
           CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          EXPECTED_NETWORK: ${{ needs.validate-network.outputs.network }}
+          EXPECTED_HASH: ${{ needs.build.outputs.wasm-hash }}
+          RPC_URL: ${{ needs.validate-network.outputs.rpc-url }}
+          NETWORK_PASSPHRASE: ${{ needs.validate-network.outputs.network-passphrase }}
         run: |
-          stellar contract invoke \
+          set -euo pipefail
+          [ -n "${CONTRACT_ID:-}" ] || { echo "::error::Deployed contract ID is empty."; exit 1; }
+          # Contract IDs are network-specific: verify the ID resolves on the expected network.
+          if ! stellar contract invoke \
             --id "$CONTRACT_ID" \
             --source "$ADMIN_SECRET_KEY" \
-            --network mainnet \
+            --rpc-url "$RPC_URL" \
+            --network-passphrase "$NETWORK_PASSPHRASE" \
             -- verify_vaccination \
-            --wallet "$ADMIN_PUBLIC_KEY"
+            --wallet "$ADMIN_PUBLIC_KEY"; then
+            echo "::error::Contract $CONTRACT_ID is not invocable on network '$EXPECTED_NETWORK'."
+            exit 1
+          fi
+          # Verify the deployed WASM hash matches the build artifact hash.
+          DEPLOYED_HASH=$(stellar contract fetch \
+            --id "$CONTRACT_ID" \
+            --rpc-url "$RPC_URL" \
+            --network-passphrase "$NETWORK_PASSPHRASE" \
+            | sha256sum | cut -d' ' -f1)
+          if [ "$DEPLOYED_HASH" != "$EXPECTED_HASH" ]; then
+            echo "::error::Deployed WASM hash ($DEPLOYED_HASH) does not match build artifact hash ($EXPECTED_HASH)."
+            exit 1
+          fi
+          echo "Smoke test passed: contract $CONTRACT_ID on '$EXPECTED_NETWORK' matches artifact hash $EXPECTED_HASH."
 
       - name: Write contract ID to env config
+        if: steps.decide.outputs.action == 'deploy' || steps.decide.outputs.action == 'upgrade'
         env:
           CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

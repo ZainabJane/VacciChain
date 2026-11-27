@@ -15,6 +15,27 @@
   --role-issuer-text: #16a34a;
   --focus-ring: #0284c7;
   --focus-ring-offset: #ffffff;
+
+  /* ── Responsive layout tokens ───────────────────────────────────────────── */
+  /* Breakpoints (reference values; use the .bp-* classes or media queries)   */
+  --bp-sm: 320px;
+  --bp-md: 768px;
+  --bp-lg: 1024px;
+  --bp-xl: 1280px;
+
+  /* Page-width constraints */
+  --page-max-width: 1200px;
+  --page-padding-x: 1rem;
+
+  /* Spacing scale */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
 }
 
 .dark {
@@ -46,6 +67,114 @@ button { cursor: pointer; }
 nav a { color: var(--nav-text); }
 nav a[aria-current="page"] { color: var(--accent); font-weight: 600; }
 #main-content:focus { outline: none; }
+
+/* ── Shared layout utilities ─────────────────────────────────────────────── */
+
+/*
+ * .page-container
+ * Centres content, enforces max-width, and adds responsive horizontal padding.
+ * Use this on the top-level wrapper of every dashboard and verification page.
+ */
+.page-container {
+  width: 100%;
+  max-width: var(--page-max-width);
+  margin-inline: auto;
+  padding-inline: var(--page-padding-x);
+}
+
+/*
+ * .page-section
+ * Vertical breathing room between major sections inside a page.
+ */
+.page-section {
+  padding-block: var(--space-8);
+}
+
+/*
+ * .page-section--narrow
+ * Tighter vertical padding for compact sections (e.g. form cards).
+ */
+.page-section--narrow {
+  padding-block: var(--space-4);
+}
+
+/*
+ * .content-narrow / .content-medium / .content-wide
+ * Optional inner width constraints for text-heavy or form-heavy regions.
+ */
+.content-narrow  { max-width: 500px;  width: 100%; margin-inline: auto; }
+.content-medium  { max-width: 700px;  width: 100%; margin-inline: auto; }
+.content-wide    { max-width: 960px;  width: 100%; margin-inline: auto; }
+
+/* ── Responsive adjustments ─────────────────────────────────────────────── */
+
+/* Narrow phones: more padding, less gap */
+@media (max-width: 374px) {
+  :root { --page-padding-x: 0.75rem; }
+}
+
+/* Tablets and up: more comfortable horizontal padding */
+@media (min-width: 768px) {
+  :root { --page-padding-x: 2rem; }
+}
+
+/* Wide desktops */
+@media (min-width: 1280px) {
+  :root { --page-padding-x: 3rem; }
+}
+
+/* Prevent horizontal scrolling at the body level */
+html, body {
+  overflow-x: hidden;
+}
+
+/* Utility class to disable animations/transitions for components using inline styles */
+.reduce-motion,
+.reduce-motion *,
+.reduce-motion *::before,
+.reduce-motion *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    animation-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Disable non-essential keyframe animations (skeletons, toasts, nav, etc.) */
+  .skeleton,
+  .skeleton *,
+  [class*="skeleton"],
+  [class*="toast"],
+  [class*="notification"],
+  nav,
+  nav * {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  /* Ensure skeleton pulse is fully disabled */
+  .skeleton-pulse,
+  .pulse {
+    animation: none !important;
+    opacity: 1 !important;
+  }
+
+  /* Disable smooth scrolling and parallax-like effects */
+  html {
+    scroll-behavior: auto !important;
+  }
+}
 
 /* ── NavBar responsive styles ───────────────────────────────────────────── */
 

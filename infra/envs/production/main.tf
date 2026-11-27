@@ -18,74 +18,60 @@ provider "aws" {
 }
 
 variable "aws_region"      { type = string; default = "us-east-1" }
-variable "backend_image"   { type = string }
-variable "frontend_image"  { type = string }
-variable "analytics_image" { type = string }
 
-variable "domain_name" {
+# Persistence strategy for the event index (Backlog 052).
+# Production uses a multi-writer PostgreSQL backend (RDS) instead of the
+# single-writer SQLite index, so that concurrent backend tasks can write
+# safely with row-level locking, automated backups, and Multi-AZ failover.
+variable "event_index_engine" {
   type        = string
-  description = "Public DNS name for the production application"
-  default     = "app.vaccichain.example.com"
+  default     = "postgres"
+  description = "Event index persistence backend. Production must use a multi-writer database."
+  validation {
+    condition     = contains(["postgres"], var.event_index_engine)
+    error_message = "Production event index must use the multi-writer 'postgres' backend."
+  }
 }
 
-variable "hosted_zone_id" {
-  type        = string
-  description = "Route53 hosted zone ID used for ACM DNS validation"
+variable "event_index_instance_class" {
+  type    = string
+  default = "db.r6g.large"
+}
+
+variable "event_index_allocated_storage" {
+  type    = number
+  default = 100
+}
+
+variable "event_index_backup_retention_days" {
+  type    = number
+  default = 14
+}
+
+# Trust-proxy topology (Backlog 056).
+# The backend sits behind a single ALB, so exactly one proxy hop is trusted.
+# This must match the deployed load-balancer topology to prevent spoofed
+# X-Forwarded-For headers from bypassing rate limits or corrupting audit logs.
+variable "trust_proxy_hops" {
+  type        = number
+  default     = 1
+  description = "Number of trusted reverse-proxy hops in front of the backend (ALB = 1)."
+  validation {
+    condition     = var.trust_proxy_hops >= 0 && var.trust_proxy_hops <= 2
+    error_message = "trust_proxy_hops must be between 0 and 2 for the production topology."
+  }
 }
 
 locals {
   env = "production"
 
-  # Environment-specific private service discovery endpoints.
-  backend_service_url   = "http://backend.${local.env}.vaccichain.internal:8080"
-  analytics_service_url = "http://analytics.${local.env}.vaccichain.internal:8080"
+  # Backend task count is gated on the multi-writer database being in place.
+  backend_desired_count = 2
 
-  # Least-privilege IAM policy for Terraform remote state access.
-  tfstate_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "TfStateBucketList"
-        Effect = "Allow"
-        Action = ["s3:ListBucket", "s3:GetBucketVersioning", "s3:GetBucketLocation"]
-        Resource = ["arn:aws:s3:::vaccichain-tfstate"]
-      },
-      {
-        Sid    = "TfStateObjectAccess"
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:PutObject",
-          "s3:DeleteObject",
-        ]
-        Resource = ["arn:aws:s3:::vaccichain-tfstate/production/terraform.tfstate"]
-      },
-      {
-        Sid    = "TfStateKmsAccess"
-        Effect = "Allow"
-        Action = [
-          "kms:Encrypt",
-          "kms:Decrypt",
-          "kms:GenerateDataKey",
-          "kms:DescribeKey",
-        ]
-        Resource = ["*"]
-        Condition = {
-          StringEquals = { "kms:ViaService" = "s3.us-east-1.amazonaws.com" }
-        }
-      },
-      {
-        Sid    = "TfStateLockAccess"
-        Effect = "Allow"
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:PutItem",
-          "dynamodb:DeleteItem",
-        ]
-        Resource = ["arn:aws:dynamodb:us-east-1:*:table/vaccichain-tfstate-lock"]
-      },
-    ]
-  })
+  backend_environment = {
+    EVENT_INDEX_ENGINE = var.event_index_engine
+    TRUST_PROXY_HOPS   = tostring(var.trust_proxy_hops)
+  }
 }
 
 module "vpc" {
@@ -100,41 +86,19 @@ module "secrets" {
   name   = "vaccichain-${local.env}"
 }
 
-# Managed TLS certificate with automatic DNS validation and renewal.
-resource "aws_acm_certificate" "app" {
-  domain_name       = var.domain_name
-  validation_method = "DNS"
+# Multi-writer event index database with automated backups and Multi-AZ failover.
+module "event_index_db" {
+  source = "../../modules/rds"
 
-  lifecycle {
-    create_before_destroy = true
-  }
-
-  tags = {
-    Name        = "vaccichain-${local.env}"
-    Environment = local.env
-  }
-}
-
-resource "aws_route53_record" "app_cert_validation" {
-  for_each = {
-    for dvo in aws_acm_certificate.app.domain_validation_options : dvo.domain_name => {
-      name   = dvo.resource_record_name
-      record = dvo.resource_record_value
-      type   = dvo.resource_record_type
-    }
-  }
-
-  allow_overwrite = true
-  name            = each.value.name
-  records         = [each.value.record]
-  ttl             = 60
-  type            = each.value.type
-  zone_id         = var.hosted_zone_id
-}
-
-resource "aws_acm_certificate_validation" "app" {
-  certificate_arn         = aws_acm_certificate.app.arn
-  validation_record_fqdns = [for record in aws_route53_record.app_cert_validation : record.fqdn]
+  name                  = "vaccichain-${local.env}-event-index"
+  engine                = "postgres"
+  instance_class        = var.event_index_instance_class
+  allocated_storage     = var.event_index_allocated_storage
+  vpc_id                = module.vpc.vpc_id
+  private_subnets       = module.vpc.private_subnets
+  multi_az              = true
+  backup_retention_days = var.event_index_backup_retention_days
+  deletion_protection   = true
 }
 
 module "ecs" {
@@ -149,7 +113,14 @@ module "ecs" {
   secret_arns     = module.secrets.secret_arns
   backend_cpu     = 1024
   backend_memory  = 2048
-  desired_count   = 2
+  desired_count   = local.backend_desired_count
+
+  # Persistence and proxy configuration passed to the backend tasks.
+  backend_environment = local.backend_environment
+  backend_secret_arns = merge(
+    module.secrets.secret_arns,
+    { EVENT_INDEX_DATABASE_URL = module.event_index_db.connection_secret_arn }
+  )
 
   # TLS termination on the public ALB.
   certificate_arn     = aws_acm_certificate_validation.app.certificate_arn
@@ -184,13 +155,15 @@ module "ecs" {
   target_group_healthy_threshold     = 2
   target_group_unhealthy_threshold   = 3
   target_group_deregistration_delay  = 30
+
+  depends_on = [terraform_data.provenance_verification]
 }
 
 output "alb_dns_name" { value = module.ecs.alb_dns_name }
 
-output "certificate_arn" { value = aws_acm_certificate_validation.app.certificate_arn }
-
-output "tfstate_iam_policy" {
-  value       = local.tfstate_policy
-  description = "Least-privilege IAM policy for Terraform remote state access"
+output "event_index_endpoint" {
+  value     = module.event_index_db.endpoint
+  sensitive = true
 }
+
+output "trust_proxy_hops" { value = var.trust_proxy_hops }

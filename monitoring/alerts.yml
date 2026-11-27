@@ -7,11 +7,13 @@ groups:
         for: 2m
         labels:
           severity: critical
+          owner: sre-oncall
         annotations:
           summary: "VacciChain service down: {{ $labels.instance }}"
           description: >
             {{ $labels.instance }} (env={{ $labels.env }}) has been unreachable
             for more than 2 minutes.
+          runbook_url: "monitoring/runbooks/service-down.md"
 
       # Warn if response time exceeds 3 seconds
       - alert: ServiceSlowResponse
@@ -19,11 +21,13 @@ groups:
         for: 5m
         labels:
           severity: warning
+          owner: sre-oncall
         annotations:
           summary: "Slow response: {{ $labels.instance }}"
           description: >
             {{ $labels.instance }} response time is {{ $value | humanizeDuration }},
             exceeding the 3s threshold.
+          runbook_url: "monitoring/runbooks/service-slow-response.md"
 
       # Alert if health endpoint returns degraded status (503)
       - alert: ServiceDegraded
@@ -31,11 +35,148 @@ groups:
         for: 2m
         labels:
           severity: warning
+          owner: sre-oncall
         annotations:
           summary: "VacciChain service degraded: {{ $labels.instance }}"
           description: >
             {{ $labels.instance }} is returning HTTP 503 (degraded).
             Soroban RPC may be unreachable.
+          runbook_url: "monitoring/runbooks/service-degraded.md"
+
+  - name: vaccichain_slo_recording
+    rules:
+      # SLI: backend latency p95 (seconds) over a 5m window
+      - record: slo:backend_latency:p95
+        expr: histogram_quantile(0.95, sum by (le, job, env) (rate(http_request_duration_seconds_bucket{job="vaccichain-backend"}[5m])))
+
+      # SLI: backend error rate (ratio of 5xx responses to total) over a 5m window
+      - record: slo:backend_error_rate
+        expr: >
+          sum by (job, env) (rate(http_requests_total{job="vaccichain-backend", status=~"5.."}[5m]))
+          /
+          sum by (job, env) (rate(http_requests_total{job="vaccichain-backend"}[5m]))
+
+      # SLI: poller lag in seconds (time since last successful poll)
+      - record: slo:poller_lag_seconds
+        expr: time() - max by (job, env) (vaccichain_poller_last_success_timestamp_seconds)
+
+      # SLI: data freshness in seconds (age of the most recent indexed ledger)
+      - record: slo:data_freshness_seconds
+        expr: time() - max by (job, env) (vaccichain_indexer_last_ledger_timestamp_seconds)
+
+  - name: vaccichain_slo_alerts
+    rules:
+      # Latency objective: p95 backend latency must stay under 1s
+      - alert: BackendLatencySLOBreach
+        expr: slo:backend_latency:p95 > 1
+        for: 10m
+        labels:
+          severity: warning
+          owner: backend-team
+        annotations:
+          summary: "Backend latency SLO breach (p95 > 1s)"
+          description: >
+            Backend p95 latency is {{ $value | humanizeDuration }} (env={{ $labels.env }}),
+            exceeding the 1s SLO objective for more than 10 minutes.
+          runbook_url: "monitoring/runbooks/backend-latency-slo.md"
+
+      # Latency objective (critical): p95 backend latency above 2s
+      - alert: BackendLatencySLOCritical
+        expr: slo:backend_latency:p95 > 2
+        for: 5m
+        labels:
+          severity: critical
+          owner: backend-team
+        annotations:
+          summary: "Backend latency SLO critical breach (p95 > 2s)"
+          description: >
+            Backend p95 latency is {{ $value | humanizeDuration }} (env={{ $labels.env }}),
+            exceeding the 2s critical threshold for more than 5 minutes.
+          runbook_url: "monitoring/runbooks/backend-latency-slo.md"
+
+      # Error-rate objective: 5xx ratio must stay under 1%
+      - alert: BackendErrorRateSLOBreach
+        expr: slo:backend_error_rate > 0.01
+        for: 10m
+        labels:
+          severity: warning
+          owner: backend-team
+        annotations:
+          summary: "Backend error rate SLO breach (> 1%)"
+          description: >
+            Backend 5xx error rate is {{ $value | humanizePercentage }} (env={{ $labels.env }}),
+            exceeding the 1% SLO objective for more than 10 minutes.
+          runbook_url: "monitoring/runbooks/backend-error-rate-slo.md"
+
+      # Error-rate objective (critical): 5xx ratio above 5%
+      - alert: BackendErrorRateSLOCritical
+        expr: slo:backend_error_rate > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          owner: backend-team
+        annotations:
+          summary: "Backend error rate SLO critical breach (> 5%)"
+          description: >
+            Backend 5xx error rate is {{ $value | humanizePercentage }} (env={{ $labels.env }}),
+            exceeding the 5% critical threshold for more than 5 minutes.
+          runbook_url: "monitoring/runbooks/backend-error-rate-slo.md"
+
+      # Poller-lag objective: lag must stay under 60s
+      - alert: PollerLagSLOBreach
+        expr: slo:poller_lag_seconds > 60
+        for: 5m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "Poller lag SLO breach (> 60s)"
+          description: >
+            Poller lag is {{ $value | humanizeDuration }} (env={{ $labels.env }}),
+            exceeding the 60s SLO objective for more than 5 minutes.
+          runbook_url: "monitoring/runbooks/poller-lag-slo.md"
+
+      # Poller-lag objective (critical): lag above 300s
+      - alert: PollerLagSLOCritical
+        expr: slo:poller_lag_seconds > 300
+        for: 2m
+        labels:
+          severity: critical
+          owner: indexer-team
+        annotations:
+          summary: "Poller lag SLO critical breach (> 300s)"
+          description: >
+            Poller lag is {{ $value | humanizeDuration }} (env={{ $labels.env }}),
+            exceeding the 300s critical threshold for more than 2 minutes.
+          runbook_url: "monitoring/runbooks/poller-lag-slo.md"
+
+      # Data-freshness objective: indexed data must be under 120s old
+      - alert: DataFreshnessSLOBreach
+        expr: slo:data_freshness_seconds > 120
+        for: 5m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "Data freshness SLO breach (> 120s)"
+          description: >
+            Indexed data is {{ $value | humanizeDuration }} old (env={{ $labels.env }}),
+            exceeding the 120s SLO objective for more than 5 minutes.
+          runbook_url: "monitoring/runbooks/data-freshness-slo.md"
+
+      # Data-freshness objective (critical): indexed data above 600s old
+      - alert: DataFreshnessSLOCritical
+        expr: slo:data_freshness_seconds > 600
+        for: 2m
+        labels:
+          severity: critical
+          owner: indexer-team
+        annotations:
+          summary: "Data freshness SLO critical breach (> 600s)"
+          description: >
+            Indexed data is {{ $value | humanizeDuration }} old (env={{ $labels.env }}),
+            exceeding the 600s critical threshold for more than 2 minutes.
+          runbook_url: "monitoring/runbooks/data-freshness-slo.md"
 
   - name: vaccichain_backups
     rules:

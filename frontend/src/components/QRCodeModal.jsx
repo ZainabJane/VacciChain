@@ -1,5 +1,4 @@
-import { useEffect, useRef } from 'react';
-import QRCode from 'qrcode';
+import { useEffect, useRef, useState } from 'react';
 
 function getFocusableElements(root) {
   if (!root) return [];
@@ -8,39 +7,26 @@ function getFocusableElements(root) {
 }
 
 export default function QRCodeModal({ url, onClose }) {
+  const [failed, setFailed] = useState(false);
   const canvasRef = useRef(null);
   const overlayRef = useRef(null);
   const modalRef = useRef(null);
-  const previousActive = useRef(null);
+
+  const { onKeyDown } = useAccessibleDialog({
+    dialogRef: modalRef,
+    onClose,
+    dismissible: true,
+  });
 
   useEffect(() => {
-    if (canvasRef.current) {
-      QRCode.toCanvas(canvasRef.current, url, { width: 256, margin: 2 });
-    }
+    let active = true;
+    import('qrcode')
+      .then(({ default: QRCode }) => {
+        if (active && canvasRef.current) return QRCode.toCanvas(canvasRef.current, url, { width: 256, margin: 2 });
+      })
+      .catch(() => { if (active) setFailed(true); });
+    return () => { active = false; };
   }, [url]);
-
-  useEffect(() => {
-    previousActive.current = document.activeElement;
-    const nodes = getFocusableElements(modalRef.current);
-    (nodes[0] || modalRef.current)?.focus?.();
-
-    const onKey = (e) => {
-      if (e.key === 'Escape') { e.preventDefault(); onClose(); }
-      if (e.key === 'Tab') {
-        const nodes = getFocusableElements(modalRef.current);
-        if (nodes.length === 0) { e.preventDefault(); return; }
-        const idx = nodes.indexOf(document.activeElement);
-        if (e.shiftKey) {
-          if (idx === 0 || document.activeElement === modalRef.current) { nodes[nodes.length - 1].focus(); e.preventDefault(); }
-        } else {
-          if (idx === nodes.length - 1) { nodes[0].focus(); e.preventDefault(); }
-        }
-      }
-    };
-
-    document.addEventListener('keydown', onKey);
-    return () => { document.removeEventListener('keydown', onKey); previousActive.current?.focus?.(); };
-  }, [onClose]);
 
   const handleDownload = () => {
     const link = document.createElement('a');
@@ -51,9 +37,6 @@ export default function QRCodeModal({ url, onClose }) {
 
   return (
     <div
-      role="dialog"
-      aria-modal="true"
-      aria-label="Vaccination QR Code"
       onClick={(e) => e.target === overlayRef.current && onClose()}
       ref={overlayRef}
       style={{
@@ -62,7 +45,11 @@ export default function QRCodeModal({ url, onClose }) {
       }}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Vaccination QR Code"
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={onKeyDown}
         ref={modalRef}
         tabIndex={-1}
         style={{
@@ -71,6 +58,7 @@ export default function QRCodeModal({ url, onClose }) {
         }}
       >
         <h3 style={{ color: '#e2e8f0', margin: 0 }}>Vaccination QR Code</h3>
+        {failed && <p role="alert">Could not load the QR code. Close this dialog and try again.</p>}
         <canvas ref={canvasRef} style={{ borderRadius: 8 }} />
         <div style={{ display: 'flex', gap: '0.75rem' }}>
           <button

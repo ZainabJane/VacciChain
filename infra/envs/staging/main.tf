@@ -22,20 +22,27 @@ variable "backend_image"   { type = string }
 variable "frontend_image"  { type = string }
 variable "analytics_image" { type = string }
 
-variable "domain_name" {
-  type        = string
-  description = "Public DNS name served by the load balancer (e.g. staging.vaccichain.example.com)."
-}
+# Immutable artifact digests (sha256:...) produced by the release build.
+# These must match the attested artifacts recorded in the provenance metadata.
+variable "backend_digest"   { type = string }
+variable "frontend_digest"  { type = string }
+variable "analytics_digest" { type = string }
 
-variable "hosted_zone_id" {
-  type        = string
-  description = "Route53 hosted zone ID used for ACM DNS validation and the public alias record."
-}
-
-variable "tls_policy" {
-  type        = string
-  default     = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-  description = "Modern ALB TLS security policy (TLS 1.2+ with TLS 1.3 preferred)."
+# Trusted provenance metadata emitted by the build workflow (e.g. in-toto
+# attestation / SLSA provenance). Each entry links an artifact to its source
+# revision, build workflow, and dependency inputs.
+variable "provenance" {
+  type = object({
+    source_revision = string
+    build_workflow  = string
+    build_run_id    = string
+    artifacts = object({
+      backend   = string
+      frontend  = string
+      analytics = string
+    })
+  })
+  description = "Trusted provenance metadata for release artifacts (source revision, build workflow, attested digests)."
 }
 
 variable "backend_health_check_path" {
@@ -98,12 +105,42 @@ variable "health_check_retries" {
   default     = 3
 }
 
+# Persistence strategy for the event index (backlog #52).
+# Staging mirrors production topology: a single ALB fronts the backend, so the
+# SQLite-based index is retained here for load/failure analysis. The selected
+# multi-writer database option is exercised via the persistence_mode variable.
+variable "persistence_mode" {
+  type        = string
+  default     = "sqlite"
+  description = "Event index persistence backend: 'sqlite' (single-writer) or 'postgres' (multi-writer)."
+  validation {
+    condition     = contains(["sqlite", "postgres"], var.persistence_mode)
+    error_message = "persistence_mode must be either 'sqlite' or 'postgres'."
+  }
+}
+
+# Trust-proxy configuration (backlog #56).
+# Staging sits behind exactly one ALB hop, so the backend must trust the
+# forwarded headers from that single proxy layer only. This prevents spoofed
+# X-Forwarded-For headers from bypassing rate limits or corrupting audit
+# attribution.
+variable "trust_proxy_hops" {
+  type        = number
+  default     = 1
+  description = "Number of trusted proxy hops in front of the backend (matches ALB topology)."
+}
+
 locals {
   env = "staging"
 
-  # Environment-specific private backend endpoint for the analytics service.
-  # Resolved via the private service discovery namespace, never loopback.
-  analytics_backend_url = "http://backend.${local.env}.vaccichain.internal:8080"
+  # Derived trust-proxy setting passed to the backend container. A numeric hop
+  # count is used rather than a blanket `true` so only the ALB is trusted.
+  trust_proxy_setting = tostring(var.trust_proxy_hops)
+
+  backend_environment = {
+    PERSISTENCE_MODE = var.persistence_mode
+    TRUST_PROXY      = local.trust_proxy_setting
+  }
 }
 
 module "vpc" {
@@ -168,9 +205,9 @@ module "ecs" {
   vpc_id          = module.vpc.vpc_id
   public_subnets  = module.vpc.public_subnets
   private_subnets = module.vpc.private_subnets
-  backend_image   = var.backend_image
-  frontend_image  = var.frontend_image
-  analytics_image = var.analytics_image
+  backend_image   = "${var.backend_image}@${var.backend_digest}"
+  frontend_image  = "${var.frontend_image}@${var.frontend_digest}"
+  analytics_image = "${var.analytics_image}@${var.analytics_digest}"
   secret_arns     = module.secrets.secret_arns
   desired_count   = 1
 
@@ -197,39 +234,14 @@ module "ecs" {
   health_check_grace_period        = var.health_check_grace_period
   health_check_start_period        = var.health_check_start_period
   health_check_retries             = var.health_check_retries
-}
 
-# Public alias record pointing at the load balancer.
-resource "aws_route53_record" "app" {
-  zone_id = var.hosted_zone_id
-  name    = var.domain_name
-  type    = "A"
-
-  alias {
-    name                   = module.ecs.alb_dns_name
-    zone_id                = module.ecs.alb_zone_id
-    evaluate_target_health = true
-  }
+  # Persistence and trust-proxy configuration for the staging topology.
+  backend_environment = local.backend_environment
+  trust_proxy_hops    = var.trust_proxy_hops
 }
 
 output "alb_dns_name" { value = module.ecs.alb_dns_name }
 
-output "app_url" {
-  value       = "https://${var.domain_name}"
-  description = "Public HTTPS endpoint for the staging environment."
-}
+output "persistence_mode" { value = var.persistence_mode }
 
-output "certificate_arn" {
-  value       = aws_acm_certificate_validation.public.certificate_arn
-  description = "Validated ACM certificate ARN used by the HTTPS listener."
-}
-
-output "service_discovery_namespace" {
-  value       = aws_service_discovery_private_dns_namespace.internal.name
-  description = "Private service discovery namespace for internal routing."
-}
-
-output "analytics_backend_url" {
-  value       = local.analytics_backend_url
-  description = "Private backend endpoint used by the analytics service."
-}
+output "trust_proxy_hops" { value = var.trust_proxy_hops }

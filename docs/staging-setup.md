@@ -153,17 +153,112 @@ aws ecs create-service \
   --load-balancers targetGroupArn=arn:aws:elasticloadbalancing:...,containerName=frontend,containerPort=80
 ```
 
-## Step 7: Configure GitHub Secrets
+## Step 7: Configure GitHub Environments and Secrets
 
-Add these secrets to your GitHub repository:
+Staging and production must be isolated. Do **not** use repository-level secrets for
+deployment credentials — use two separate GitHub Environments (`staging` and
+`production`) with their own scoped secrets, so a staging run can never reach
+mainnet resources.
+
+### Create the environments
 
 ```bash
-# AWS role for GitHub Actions
-AWS_ROLE_TO_ASSUME_STAGING=arn:aws:iam::123456789012:role/GitHubActionsRole
+# Create both environments (requires the gh CLI authenticated with admin rights)
+gh api --method PUT repos/your-org/VacciChain/environments/staging
+gh api --method PUT repos/your-org/VacciChain/environments/production
+```
+
+### Staging environment secrets
+
+```bash
+# AWS role for GitHub Actions (staging account/role only)
+gh secret set AWS_ROLE_TO_ASSUME_STAGING --env staging --body "arn:aws:iam::123456789012:role/GitHubActionsRoleStaging"
 
 # AWS region
-AWS_REGION=us-east-1
+gh secret set AWS_REGION --env staging --body "us-east-1"
+
+# Staging-only Stellar/mainnet guard values (testnet contract, testnet issuer)
+gh secret set STELLAR_NETWORK --env staging --body "testnet"
 ```
+
+### Production environment secrets
+
+```bash
+# Production uses a *different* role scoped to the production account
+gh secret set AWS_ROLE_TO_ASSUME_PRODUCTION --env production --body "arn:aws:iam::987654321098:role/GitHubActionsRoleProduction"
+
+gh secret set AWS_REGION --env production --body "us-east-1"
+
+# Production-only mainnet values
+gh secret set STELLAR_NETWORK --env production --body "mainnet"
+```
+
+### Require reviewers for production
+
+Production deployments must be deliberately approved. Configure required reviewers
+(and optionally a wait timer) on the `production` environment:
+
+```bash
+# Require at least one reviewer from the release team before a production job runs
+gh api --method PUT repos/your-org/VacciChain/environments/production \
+  -f 'reviewers[][type]=User' \
+  -f 'reviewers[][id]=<GITHUB_USER_ID>' \
+  -f 'deployment_branch_policy[protected_branches]=true' \
+  -f 'deployment_branch_policy[custom_branch_policies]=false'
+
+# Optional: 10-minute wait timer as a second safety gate
+gh api --method PUT repos/your-org/VacciChain/environments/production \
+  -F 'wait_timer=10'
+```
+
+The `deployment_branch_policy` above restricts the `production` environment to
+protected branches only, so a production job cannot be triggered from an
+arbitrary branch.
+
+### Policy guard: block unapproved production deploys
+
+Add a guard job (or reusable workflow) that runs before any production deploy and
+fails unless the event and branch are explicitly approved. Example
+`.github/workflows/deploy-production.yml` guard:
+
+```yaml
+jobs:
+  production-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce production deploy policy
+        run: |
+          set -euo pipefail
+          # Only allow manual dispatch or a push to main
+          if [[ "${{ github.event_name }}" != "workflow_dispatch" && \
+                "${{ github.event_name }}" != "push" ]]; then
+            echo "::error::Production deploys are only allowed via workflow_dispatch or push to main (got ${{ github.event_name }})"
+            exit 1
+          fi
+          if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
+            echo "::error::Production deploys are only allowed from refs/heads/main (got ${{ github.ref }})"
+            exit 1
+          fi
+          # Staging must never target mainnet
+          if [[ "${{ secrets.STELLAR_NETWORK }}" == "mainnet" && "${{ github.ref }}" != "refs/heads/main" ]]; then
+            echo "::error::Mainnet resources are only reachable from the production environment on main"
+            exit 1
+          fi
+
+  deploy-production:
+    needs: production-guard
+    runs-on: ubuntu-latest
+    environment: production   # required reviewers + protected-branch policy apply here
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy
+        run: ./scripts/deploy-production.sh
+```
+
+Because the `deploy-production` job declares `environment: production`, GitHub
+will not start it until the required reviewers approve, and the environment's
+branch policy will reject any ref other than a protected branch. The guard job
+adds an explicit event/branch check so unapproved events fail fast.
 
 ## Step 8: Create GitHub Actions Role
 

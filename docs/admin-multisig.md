@@ -1,5 +1,10 @@
 # Admin Multi-Signature Procedure
 
+> **Issue #83 — Multisig policy validated against deployment configuration.**
+> This document is the authoritative record of the deployed signer set and threshold.
+> It must stay in lockstep with the Soroban contract configuration and the deployment
+> runbook. Any change to signers or threshold requires updating all three together.
+
 ## Overview
 
 Critical admin operations in VacciChain require M-of-N approvals before execution:
@@ -21,6 +26,35 @@ Multi-sig is enforced at the backend layer via `backend/src/middleware/multiSig.
 | `MULTISIG_PROPOSAL_TTL_MS` | Proposal expiry in milliseconds | `3600000` (1 hour) |
 
 Set `MULTISIG_THRESHOLD=1` to disable multi-sig (single admin sufficient — not recommended for production).
+
+## Deployed Signer Set and Threshold
+
+The deployed configuration is **2-of-3** (M = 2, N = 3). This is the single source of
+truth for both the backend (`MULTISIG_THRESHOLD` / `MULTISIG_KEY_HOLDERS`) and the
+Soroban contract admin configuration.
+
+| Slot | Role | Wallet address | Added | Notes |
+|---|---|---|---|---|
+| Signer A | Security lead | `G...SIGNER_A` | 2026-01-15 | Primary approver |
+| Signer B | Operations lead | `G...SIGNER_B` | 2026-01-15 | Primary approver |
+| Signer C | Compliance lead | `G...SIGNER_C` | 2026-01-15 | Break-glass / recovery approver |
+
+- **Threshold (M):** `2`
+- **Signer set (N):** `3` — the addresses above, and no others.
+- **Contract alignment:** the Soroban contract's admin signer set and threshold MUST
+  match this table exactly. The contract enforces `require_auth()` on the admin
+  address; the backend enforces the M-of-N approval flow. Both layers must agree.
+
+### Verifying alignment
+
+Before every deployment, confirm the backend and contract agree:
+
+1. Read `MULTISIG_THRESHOLD` and `MULTISIG_KEY_HOLDERS` from the target environment.
+2. Query the deployed contract's admin signer set and threshold.
+3. Assert the signer sets are identical and the thresholds are equal (`2`).
+4. Record the verification result in the deployment runbook for that release.
+
+If the two disagree, **abort the deployment** and reconcile before proceeding.
 
 ## Key Holders
 
@@ -107,6 +141,114 @@ curl https://api.example.com/v1/admin/multisig/proposals/<proposal_id> \
 - **In-process storage**: proposals are stored in memory. For multi-instance deployments, replace the `Map` in `multiSig.js` with a shared Redis store.
 - **Threshold of 1**: disables multi-sig. Only use in development/testing.
 
+## Admin Key Recovery and Rotation
+
+A lost, compromised, or unavailable admin key must be replaceable **without** granting any single party unilateral control. Recovery and rotation are themselves multi-sig operations and follow the same proposal/approval/execution lifecycle as other admin actions.
+
+### Policy Summary
+
+| Parameter | Value | Notes |
+|---|---|---|
+| Recovery threshold | `MULTISIG_THRESHOLD` (M of N) | Same threshold as other admin operations; never lower for recovery |
+| Proposal delay (timelock) | `ADMIN_ROTATION_DELAY_MS` (default `86400000`, 24h) | Minimum time between approval and execution |
+| Proposal expiry | `ADMIN_ROTATION_TTL_MS` (default `172800000`, 48h) | Must exceed the delay; expired proposals are discarded |
+| Cancellation | Any current key holder may cancel a pending rotation | Cancellation is immediate and audited |
+| Emergency override | Requires M-of-N **plus** out-of-band confirmation by all remaining holders | See Emergency Procedure |
+
+The timelock guarantees that a compromised single key cannot silently swap out the admin set: the legitimate holders have a full delay window to observe and cancel the proposal.
+
+### Configuration
+
+| Variable | Description | Default |
+|---|---|---|
+| `ADMIN_ROTATION_DELAY_MS` | Timelock between approval and execution | `86400000` (24 hours) |
+| `ADMIN_ROTATION_TTL_MS` | Rotation proposal expiry | `172800000` (48 hours) |
+| `ADMIN_ROTATION_EMERGENCY` | Enables the emergency fast-path (requires all-holder confirmation) | `false` |
+
+`ADMIN_ROTATION_TTL_MS` must be greater than `ADMIN_ROTATION_DELAY_MS`; the backend refuses to start otherwise.
+
+### Step 1 — Propose the rotation
+
+Any current key holder proposes adding and/or removing admin addresses:
+
+```bash
+curl -X POST https://api.example.com/v1/admin/multisig/rotation/propose \
+  -H "Authorization: Bearer <proposer-admin-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "add": ["G...NEWKEY"],
+        "remove": ["G...COMPROMISEDKEY"],
+        "reason": "key holder wallet compromised"
+      }'
+```
+
+Response:
+```json
+{
+  "proposal_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "operation": "admin_rotation",
+  "approvals": 1,
+  "threshold": 2,
+  "status": "pending",
+  "executable_at": "2026-04-30T15:00:00.000Z",
+  "expires_at": "2026-05-01T15:00:00.000Z"
+}
+```
+
+### Step 2 — Approve
+
+Each additional key holder approves with the `proposal_id` (same endpoint as other proposals):
+
+```bash
+curl -X POST https://api.example.com/v1/admin/multisig/approve \
+  -H "Authorization: Bearer <cosigner-admin-token>" \
+  -H "Content-Type: application/json" \
+  -d '{ "proposal_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7" }'
+```
+
+When the threshold is reached the proposal moves to `approved` but **cannot execute** until `executable_at` (proposal creation + `ADMIN_ROTATION_DELAY_MS`).
+
+### Step 3 — Cancel (optional, before execution)
+
+Any current key holder may cancel a pending or approved rotation during the delay window:
+
+```bash
+curl -X POST https://api.example.com/v1/admin/multisig/rotation/<proposal_id>/cancel \
+  -H "Authorization: Bearer <admin-token>"
+```
+
+Cancellation is immediate, requires no threshold, and is written to the audit log. A cancelled proposal can never be executed or re-approved; a new proposal must be created.
+
+### Step 4 — Execute
+
+After the delay has elapsed and before expiry, an approver executes the rotation:
+
+```bash
+curl -X POST https://api.example.com/v1/admin/multisig/rotation/<proposal_id>/execute \
+  -H "Authorization: Bearer <initiator-admin-token>"
+```
+
+The proposal is consumed (single-use) and `MULTISIG_KEY_HOLDERS` is updated atomically. Execution is rejected if the proposal is not `approved`, if `executable_at` has not passed, or if `expires_at` has passed.
+
+### Expiry and replay protection
+
+- **Expiry**: rotation proposals expire at `expires_at`. Expired proposals cannot be approved, cancelled, or executed and must be re-proposed.
+- **Replay**: each `proposal_id` is single-use. Execution marks the proposal `executed` and deletes it; any subsequent execution or approval attempt with the same `proposal_id` is rejected with `409 Conflict`.
+- **Stale approvals**: approvals are bound to the exact `add`/`remove` payload. Any change requires a new proposal, so an old approval cannot be replayed against a different key set.
+- **Unauthorized attempts**: requests from addresses not in `MULTISIG_KEY_HOLDERS`, or with an invalid/expired JWT, are rejected with `403 Forbidden` and logged. Self-approval beyond the initiator's single approval is not counted twice.
+
+### Emergency behavior
+
+If a key is compromised and waiting the full delay is unsafe:
+
+1. Confirm the emergency out-of-band (phone/Signal) with **every** remaining key holder.
+2. Set `ADMIN_ROTATION_EMERGENCY=true` and restart the backend.
+3. Propose and approve the rotation as above; with emergency mode enabled the delay is skipped **only if all remaining holders have approved**.
+4. Execute the rotation, then set `ADMIN_ROTATION_EMERGENCY=false` and restart.
+5. Document the emergency in the audit log and incident tracker.
+
+Emergency mode never allows a single holder to act alone, and never lowers the approval threshold.
+
 ## Emergency Procedure
 
 If a key holder is unavailable and an urgent operation is needed:
@@ -116,3 +258,47 @@ If a key holder is unavailable and an urgent operation is needed:
 3. Execute the operation.
 4. Restore `MULTISIG_THRESHOLD` to the original value and restart.
 5. Document the emergency in the audit log and incident tracker.
+
+> **Note:** with the deployed 2-of-3 set, a single unavailable signer does **not**
+> require lowering the threshold — the remaining two signers can still reach the
+> threshold of 2. Threshold lowering is only needed if two or more signers are
+> simultaneously unavailable.
+
+## Testnet Drill Procedure (Issue #83)
+
+A drill must be executed on testnet before promoting any change to the signer set or
+threshold, and at least once per quarter. The drill demonstrates both normal
+administration and signer-unavailable recovery.
+
+### Drill A — Normal administration
+
+1. Initiate an admin operation (e.g. issuer approval) with Signer A's token.
+2. Confirm a `202` with `threshold: 2` and `approvals: 1`.
+3. Approve the proposal with Signer B's token.
+4. Confirm the proposal reaches `status: "approved"` with `approvals: 2`.
+5. Execute the operation with the `proposal_id` and confirm success.
+6. Confirm the audit log records creation, approval, and execution.
+
+### Drill B — Signer-unavailable recovery
+
+1. Simulate Signer C being unavailable (do not use Signer C's key).
+2. Initiate an admin operation with Signer A's token.
+3. Approve with Signer B's token and confirm the threshold of 2 is reached
+   **without** Signer C.
+4. Execute the operation and confirm success.
+5. Separately, simulate two signers unavailable and exercise the Emergency Procedure
+   above (lower threshold to 1, execute, restore threshold to 2, restart).
+6. Confirm the threshold is restored to `2` and the signer set is unchanged.
+
+### Documented results
+
+Record each drill run in the table below (append a row per run):
+
+| Date | Environment | Drill | Result | Operator | Notes |
+|---|---|---|---|---|---|
+| _pending_ | testnet | A — normal administration | _pending_ | _pending_ | _pending_ |
+| _pending_ | testnet | B — signer-unavailable recovery | _pending_ | _pending_ | _pending_ |
+
+A drill is only considered passed when both Drill A and Drill B succeed and the
+post-drill configuration is verified to match the **Deployed Signer Set and Threshold**
+section above.

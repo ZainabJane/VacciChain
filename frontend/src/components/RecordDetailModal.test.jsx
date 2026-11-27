@@ -1,4 +1,5 @@
 import { render, screen, fireEvent } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import RecordDetailModal from './RecordDetailModal';
 
 describe('RecordDetailModal', () => {
@@ -117,9 +118,10 @@ describe('RecordDetailModal', () => {
     expect(mockOnClose).toHaveBeenCalledTimes(1);
   });
 
-  it('calls onClose when Escape key is pressed', () => {
+  it('calls onClose when Escape key is pressed', async () => {
+    const user = userEvent.setup();
     render(<RecordDetailModal record={mockRecord} onClose={mockOnClose} />);
-    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+    await user.keyboard('{Escape}');
     expect(mockOnClose).toHaveBeenCalledTimes(1);
   });
 
@@ -128,5 +130,52 @@ describe('RecordDetailModal', () => {
     const dialog = screen.getByRole('dialog');
     expect(dialog).toHaveAttribute('aria-modal', 'true');
     expect(dialog).toHaveAttribute('aria-label', 'Vaccination record details');
+  });
+
+  it('moves focus into the dialog on open', () => {
+    render(<RecordDetailModal record={mockRecord} onClose={mockOnClose} />);
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toContainElement(document.activeElement);
+  });
+
+  it('constrains Tab navigation within the dialog', async () => {
+    const user = userEvent.setup();
+    render(<RecordDetailModal record={mockRecord} onClose={mockOnClose} />);
+    const dialog = screen.getByRole('dialog');
+    const focusable = Array.from(
+      dialog.querySelectorAll(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )
+    );
+    expect(focusable.length).toBeGreaterThan(0);
+
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+
+    last.focus();
+    await user.tab();
+    expect(first).toHaveFocus();
+
+    first.focus();
+    await user.tab({ shift: true });
+    expect(last).toHaveFocus();
+  });
+
+  it('restores focus to the previously focused element on close', () => {
+    const trigger = document.createElement('button');
+    trigger.textContent = 'Open record';
+    document.body.appendChild(trigger);
+    trigger.focus();
+    expect(trigger).toHaveFocus();
+
+    const { unmount } = render(
+      <RecordDetailModal record={mockRecord} onClose={mockOnClose} />
+    );
+    expect(trigger).not.toHaveFocus();
+
+    unmount();
+    expect(trigger).toHaveFocus();
+
+    document.body.removeChild(trigger);
   });
 });

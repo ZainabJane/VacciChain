@@ -38,7 +38,7 @@ if [ "$BENCHMARK_TYPE" = "backend" ] || [ "$BENCHMARK_TYPE" = "all" ]; then
   echo "Benchmarking /verify endpoint..."
   autocannon -c 10 -d 30 -p 10 \
     -H "Content-Type: application/json" \
-    http://localhost:4000/verify/GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4 \
+    http://localhost:4000/v1/verify/GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4 \
     > "$RESULTS_DIR/verify_${TIMESTAMP}.txt"
   
   echo "✅ Backend benchmarks complete"

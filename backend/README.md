@@ -36,3 +36,35 @@ npm run dev      # development (nodemon)
 npm start        # production
 npm test         # Jest test suite
 ```
+
+## Event Index Persistence
+
+The backend maintains an event index that tracks Soroban contract events. This section documents the production persistence strategy for that index. The full decision record is in [ADR-052: Event Index Persistence Strategy](../docs/adr/052-event-index-persistence.md).
+
+### Load and Failure Analysis
+
+Before scaling the backend task count, the current SQLite-based index was compared against a multi-writer database option (PostgreSQL).
+
+| Concern | SQLite (current) | PostgreSQL (multi-writer) |
+|---|---|---|
+| Concurrent writers | Single writer at a time; `SQLITE_BUSY` under contention | Multiple concurrent writers via MVCC |
+| Read concurrency | WAL mode allows concurrent readers with one writer | Full concurrent reads and writes |
+| Durability | `synchronous=FULL` with WAL; fsync per commit | `synchronous=on`; WAL with configurable durability |
+| Locking | Database-level write lock; busy-timeout retry | Row-level locks; no global write lock |
+| Backup | Online backup API / file copy while quiesced | `pg_dump` / continuous archiving (WAL) |
+| Failover | Single node; restore from backup | Streaming replication with automatic failover |
+| Migration | Schema migrations applied in-process at startup | Versioned migrations run as a separate step |
+| Operational cost | Zero external infrastructure | Managed service or self-hosted cluster |
+
+**Findings:** SQLite comfortably meets current throughput (a single indexer task), but the single-writer constraint becomes a bottleneck once multiple backend tasks write to the index concurrently. The selected architecture keeps SQLite for single-task deployments and supports PostgreSQL as the multi-writer production target, selected via `DATABASE_URL`.
+
+### Tested Behavior
+
+The following behaviors are covered by the test suite (`npm test`):
+
+- **Locking:** busy-timeout retry on `SQLITE_BUSY`; PostgreSQL row-level locking under concurrent writers.
+- **Backup:** online backup produces a consistent snapshot while the index is live; restore is verified against a known event set.
+- **Failover:** indexer resumes from the last committed cursor after a simulated primary failure.
+- **Migration:** schema migrations apply cleanly from an empty database and from the previous schema version, and are idempotent on re-run.
+
+See the ADR for the detailed benchmark numbers and the rationale behind the selected architecture.

@@ -162,8 +162,8 @@ This endpoint is rate-limited to 60 requests per IP per minute on staging (same 
 | **Rate limits are enforced** | SEP-10 challenge requests are capped at 10 per IP per minute. If you hit this limit during automated testing, wait 60 seconds or use a different IP. |
 | **No SLA** | Staging has no uptime guarantee. It may be unavailable during deployments or maintenance. |
 | **Audit log is ephemeral** | The audit log is wiped on each weekly reset. Do not rely on it for long-running test evidence. |
-| **Contract ID changes weekly** | After each reset the contract is redeployed to a new address. Any hardcoded contract IDs in test scripts must be updated after a reset. |
-| **No mainnet passphrase** | The staging network passphrase is `Test SDF Network ; September 2015`. Transactions signed with the mainnet passphrase will be rejected. |
+| **Contract ID changes weekly** | After each reset the contract is redeployed to a new address. Any hardcoded contract IDs in test scripts must be updated after a reset. The post-deploy smoke test compares the deployed contract ID and artifact hash against the expected values for the current deployment and fails on a mismatch. |
+| **No mainnet passphrase** | The staging network passphrase is `Test SDF Network ; September 2015`. Transactions signed with the mainnet passphrase will be rejected. Deployments require an explicit `network=testnet` and the smoke test verifies the passphrase, contract ID, and artifact hash. |
 
 ---
 
@@ -209,6 +209,28 @@ VacciChain maintains a production-equivalent staging environment for testing bef
 - **URL:** https://staging.vaccichain.example.com
 - **Infrastructure:** AWS ECS Fargate (same as production)
 - **Secrets:** AWS Secrets Manager (same as production)
+- **GitHub Environment:** `staging`
+
+## Environment Isolation
+
+Staging is bound to the GitHub environment `staging`. This environment has its own
+scoped secrets and variables; it does **not** inherit any production secrets.
+
+- All staging workflows must declare `environment: staging` so they resolve
+  staging-scoped secrets (e.g. `AWS_ROLE_ARN`, `STELLAR_NETWORK_PASSPHRASE`,
+  `ISSUER_SECRET_KEY`) from the `staging` environment only.
+- Production secrets live in the separate `production` environment and are never
+  exposed to staging jobs.
+- Staging is configured with the Stellar **testnet** passphrase
+  (`Test SDF Network ; September 2015`) and testnet RPC/Horizon endpoints. It has
+  no mainnet credentials, no mainnet contract IDs, and no mainnet network
+  passphrase, so a staging deployment cannot reach mainnet resources.
+- Production deploys require a deliberate approval: the `production` environment
+  has required reviewers, and production is deployed only via the separate
+  `deploy.yml` workflow (manual `workflow_dispatch` with `network=mainnet`), never
+  from the staging workflow.
+- Merges to `main` are gated by the `ci-required` aggregate status check, which
+  passes only when all required CI jobs succeed.
 
 ## Architecture
 
@@ -246,17 +268,112 @@ VacciChain maintains a production-equivalent staging environment for testing bef
 2. CI tests run (contract, backend, python, docker)
 3. On success, `deploy-staging.yml` workflow triggers
 4. Docker images are built and pushed to ECR
-5. ECS task definition is updated
-6. New containers are deployed to staging cluster
-7. Smoke tests verify deployment
-8. Deployment summary posted to GitHub
+5. New task definition revision is registered (blue/green target group)
+6. Green (new) tasks are started alongside the existing blue (current) tasks
+7. Deployment waits for green targets to pass health checks
+8. A canary slice of traffic is shifted to green and smoke tests run
+9. Remaining traffic is shifted to green; blue tasks are drained and stopped
+10. Deployment summary posted to GitHub
+
+### Blue/Green Deployment with Canary Traffic Shift
+
+Staging uses AWS CodeDeploy blue/green deployments on ECS, mirroring production.
+
+| Phase | Traffic to green | Gate before proceeding |
+|---|---|---|
+| Provision | 0% | Green tasks reach `HEALTHY` in the target group (2 consecutive passing checks) |
+| Canary | 10% | Smoke tests pass and error rate stays below 1% for 5 minutes |
+| Linear shift | 10% → 100% in 10% steps every 2 minutes | Health checks and SLO error-rate alarm stay green |
+| Complete | 100% | Blue tasks drained (connection draining, 30s) and terminated |
+
+If any gate fails, CodeDeploy automatically rolls back to the blue task set and the workflow fails.
+
+Health checks used as gates:
+
+- **ECS/ALB health check:** `GET /health` — must return `200` with `{"status":"ok"}`
+- **Smoke tests:** `npm run test:smoke` against the canary target group
+- **SLO alarm:** the staging `error-rate` CloudWatch alarm (see [Monitoring Staging](#monitoring-staging)) must remain in `OK`
 
 ### Manual Deployment
 
+Deployments **require an explicit network**. The workflow refuses to run without `network` set to `testnet` for staging, and validates the network-specific configuration (RPC URL, Horizon URL, network passphrase, and expected contract ID) before any container is updated.
+
 ```bash
-# Trigger deployment manually
-gh workflow run deploy-staging.yml
+# Trigger deployment manually — network is mandatory
+gh workflow run deploy-staging.yml -f network=testnet
 ```
+
+If `network` is omitted or set to anything other than `testnet`, the workflow fails fast with a validation error. This prevents accidentally deploying staging configuration against mainnet.
+
+### Post-Deploy Smoke Test: Network and Contract ID Validation
+
+After the new containers are healthy, the `deploy-staging.yml` workflow runs a smoke test that confirms the deployment targets the expected network and contract:
+
+1. **Network passphrase check** — the backend reports its configured network passphrase; it must equal `Test SDF Network ; September 2015`. Any other passphrase (including the mainnet passphrase) fails the smoke test.
+2. **RPC/Horizon check** — the configured Soroban RPC and Horizon URLs must be the testnet endpoints listed in this guide.
+3. **Contract ID check** — the deployed contract ID is read from the backend configuration and compared against the expected contract ID recorded for the current staging deployment. A mismatch fails the smoke test.
+4. **Artifact hash check** — the deployed contract WASM hash is compared against the artifact hash produced by the CI build for the deployed commit. A mismatch means the running contract does not match the tested artifact and fails the smoke test.
+
+The smoke test fails the workflow (and the deployment is marked failed) if any check does not match. To verify manually:
+
+```bash
+# Confirm the network passphrase reported by the backend
+curl -s https://staging.vaccichain.example.com/health | jq '.network_passphrase'
+# Expected: "Test SDF Network ; September 2015"
+
+# Confirm the deployed contract ID and artifact hash
+curl -s https://staging.vaccichain.example.com/health | jq '{contract_id, wasm_hash}'
+# Compare contract_id against the expected staging contract ID and
+# wasm_hash against the artifact hash from the CI build for this commit
+```
+
+### Rollback Procedure
+
+Rollback is a first-class operation and is exercised on every release candidate (see failure injection below).
+
+**Automatic rollback:** triggered by CodeDeploy when a health check, smoke test, or SLO alarm gate fails. No action required; the previous blue task set resumes 100% of traffic.
+
+**Manual rollback:**
+
+```bash
+# 1. Find the current deployment
+aws deploy list-deployments \
+  --application-name vaccichain-staging \
+  --deployment-group-name vaccichain-staging-dg \
+  --include-only-statuses InProgress
+
+# 2. Stop and roll back the in-progress deployment
+aws deploy stop-deployment \
+  --deployment-id <deployment-id> \
+  --auto-rollback-enabled
+
+# 3. Confirm traffic is back on the previous task set
+aws deploy get-deployment --deployment-id <deployment-id> \
+  --query 'deploymentInfo.{status:status,rollback:rollbackInfo}'
+
+# 4. Verify service health
+curl https://staging.vaccichain.example.com/health
+```
+
+**Rollback verification checklist:**
+
+- [ ] CodeDeploy deployment status is `STOPPED` or `ROLLED_BACK`
+- [ ] ALB target group shows the previous task set as `HEALTHY` and receiving 100% traffic
+- [ ] `/health` returns `200`
+- [ ] Smoke tests pass against the restored environment
+- [ ] The failing release is recorded in the deployment summary and a follow-up issue is opened
+
+### Failure Injection (Rollback & SLO Alert Testing)
+
+Staging is the environment where rollback and alerting are deliberately broken to prove they work. Run this before promoting a release:
+
+1. **Deliberately failing release:** deploy a build with a broken health endpoint (e.g. `HEALTH_CHECK_FORCE_FAIL=true` in the staging task definition) via `gh workflow run deploy-staging.yml -f inject_failure=health`
+2. **Confirm the gate holds:** the canary must never exceed 10% traffic; CodeDeploy should roll back automatically within the canary window
+3. **Confirm rollback:** follow the rollback verification checklist above
+4. **Confirm SLO alerts fire:** the injected failure should trip the staging `error-rate` and `latency-p99` alarms; verify the alert reaches the on-call channel with its runbook link
+5. **Clean up:** remove the failure flag and redeploy the good build
+
+Failure injection runs only in staging and must never be enabled in production.
 
 ## Testing in Staging
 
@@ -365,6 +482,20 @@ aws ecs list-tasks --cluster vaccichain-staging
 aws ecs describe-tasks --cluster vaccichain-staging --tasks <task-arn>
 ```
 
+### Service-Level Objectives and Alerts
+
+Staging carries the same SLO definitions as production so alerts can be validated before release. Each SLI has an owner, severity, and runbook.
+
+| SLI | Objective (staging) | Alert threshold | Severity | Owner | Runbook |
+|---|---|---|---|---|---|
+| Availability (`/health` success rate) | 99.5% over 1h | < 99% for 5m | P1 | Backend on-call | `docs/runbooks/availability.md` |
+| Error rate (5xx / total) | < 1% over 1h | > 1% for 5m | P1 | Backend on-call | `docs/runbooks/error-rate.md` |
+| Latency (p99 API) | < 800ms over 1h | > 800ms for 10m | P2 | Backend on-call | `docs/runbooks/latency.md` |
+| Poller lag | < 30s | > 60s for 5m | P2 | Indexer on-call | `docs/runbooks/poller-lag.md` |
+| Data freshness | < 2 min | > 5m | P2 | Indexer on-call | `docs/runbooks/data-freshness.md` |
+
+Alerts are validated with the controlled failure injection described in [Failure Injection](#failure-injection-rollback--slo-alert-testing) — a failing release must trip the error-rate and latency alarms before it is promoted.
+
 ## Secrets Management in Staging
 
 Staging uses the same AWS Secrets Manager setup as production:
@@ -385,9 +516,11 @@ aws secretsmanager update-secret \
 ### Deployment Failed
 
 1. Check GitHub Actions workflow logs
-2. Review ECS task logs: `aws logs tail /ecs/vaccichain-staging`
-3. Verify secrets exist in Secrets Manager
-4. Check IAM permissions for ECS task role
+2. Review the CodeDeploy deployment status and rollback info: `aws deploy get-deployment --deployment-id <deployment-id>`
+3. Review ECS task logs: `aws logs tail /ecs/vaccichain-staging`
+4. Verify secrets exist in Secrets Manager
+5. Check IAM permissions for ECS task role
+6. If the deployment rolled back, confirm the previous task set is healthy before retrying
 
 ### Service Not Responding
 
@@ -413,6 +546,9 @@ aws logs tail /ecs/vaccichain-staging --follow --since 10m
 
 ## Promoting to Production
 
+Staging and production are deliberately separated. A staging deployment never
+reaches mainnet resources, and production requires explicit approval.
+
 When staging is verified and ready:
 
 1. Confirm the staging smoke tests pass (`npm run test:smoke:staging`). Production
@@ -420,8 +556,16 @@ When staging is verified and ready:
 2. Update `CHANGELOG.md` with release notes for the new version.
 3. Create a release tag: `git tag v1.0.0`
 4. Push tag: `git push origin v1.0.0`
-5. Trigger production deployment: `gh workflow run deploy.yml -f network=mainnet`
-6. Monitor production deployment
+5. Trigger the separate production workflow: `gh workflow run deploy.yml -f network=mainnet`
+6. A required reviewer must approve the run in the `production` GitHub environment before any deployment step executes
+7. Monitor production deployment
+
+Production deploys are blocked unless all of the following hold:
+
+- The workflow is `deploy.yml` (the staging workflow cannot deploy to production)
+- The run is a deliberate `workflow_dispatch` on an approved branch (or an approved release tag) — pushes and pull request events are rejected
+- The `production` environment approval has been granted by a required reviewer
+- The `ci-required` aggregate check passed for the commit being deployed
 
 ## Cost Optimization
 

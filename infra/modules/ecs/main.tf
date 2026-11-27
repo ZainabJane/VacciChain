@@ -15,6 +15,42 @@ variable "service_discovery_namespace" {
   default = "internal"
 }
 
+# Persistence strategy: "sqlite-efs" (single writer, EFS-backed SQLite) or
+# "postgres-rds" (multi-writer, RDS-backed). See docs/persistence-strategy.md.
+variable "persistence_backend" {
+  type    = string
+  default = "sqlite-efs"
+
+  validation {
+    condition     = contains(["sqlite-efs", "postgres-rds"], var.persistence_backend)
+    error_message = "persistence_backend must be one of: sqlite-efs, postgres-rds."
+  }
+}
+
+# Number of trusted proxy hops between the client and the backend task.
+# The ALB is the only hop in front of the backend, so this defaults to 1.
+variable "trust_proxy_hops" {
+  type    = number
+  default = 1
+}
+
+# CIDR ranges of the load balancer / VPC from which forwarded headers are trusted.
+variable "trusted_proxy_cidrs" {
+  type    = list(string)
+  default = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+}
+
+# Percentage of backend traffic routed to the canary target group (0-100).
+# 0 = all traffic on the stable target group; 100 = fully promoted canary.
+variable "backend_canary_weight" {
+  type    = number
+  default = 0
+  validation {
+    condition     = var.backend_canary_weight >= 0 && var.backend_canary_weight <= 100
+    error_message = "backend_canary_weight must be between 0 and 100."
+  }
+}
+
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
@@ -190,67 +226,106 @@ resource "aws_lb_listener" "https" {
   }
 }
 
+# ── Canary target group for backend (weighted traffic switching) ──────────────
+# Deploy the new backend revision to this target group, verify health/smoke
+# checks, then shift weights on the listener rule below. Rollback = set the
+# canary weight back to 0 and drain the canary target group.
+resource "aws_lb_target_group" "backend_canary" {
+  name        = "${var.name}-backend-canary-tg"
+  port        = 4000
+  protocol    = "HTTP"
+  vpc_id      = var.vpc_id
+  target_type = "ip"
+  health_check {
+    path                = "/health"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    interval            = 30
+  }
+}
+
 resource "aws_lb_listener_rule" "api" {
   listener_arn = aws_lb_listener.https.arn
   priority     = 10
   action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.backend.arn
+    type = "forward"
+    forward {
+      target_group {
+        arn    = aws_lb_target_group.backend.arn
+        weight = var.backend_canary_weight
+      }
+      target_group {
+        arn    = aws_lb_target_group.backend_canary.arn
+        weight = 100 - var.backend_canary_weight
+      }
+      stickiness {
+        enabled  = true
+        duration = 3600
+      }
+    }
   }
   condition {
     path_pattern { values = ["/v1/*", "/health"] }
   }
 }
 
-# Plaintext HTTP is an explicit redirect to HTTPS; no application traffic is
-# served over port 80.
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.this.arn
-  port              = 80
-  protocol          = "HTTP"
-  default_action {
-    type = "redirect"
-    redirect {
-      port        = "443"
-      protocol    = "HTTPS"
-      status_code = "HTTP_301"
-    }
-  }
-}
-
-# ── Private service discovery (AWS Cloud Map) ─────────────────────────────────
-resource "aws_service_discovery_private_dns_namespace" "this" {
-  name        = var.service_discovery_namespace
-  description = "Private DNS namespace for ${var.name} services"
-  vpc         = var.vpc_id
-}
-
-resource "aws_service_discovery_service" "backend" {
-  name = "backend"
-  dns_config {
-    namespace_id = aws_service_discovery_private_dns_namespace.this.id
-    dns_records {
-      ttl  = 10
-      type = "A"
-    }
-    routing_policy = "MULTIVALUE"
-  }
-  health_check_custom_config {
-    failure_threshold = 1
-  }
-}
-
-# ── EFS for SQLite persistence ────────────────────────────────────────────────
+# ── Persistence: EFS for SQLite (single-writer) ───────────────────────────────
 resource "aws_efs_file_system" "db" {
+  count     = var.persistence_backend == "sqlite-efs" ? 1 : 0
   encrypted = true
   tags      = { Name = "${var.name}-db" }
 }
 
 resource "aws_efs_mount_target" "db" {
-  count           = length(var.private_subnets)
-  file_system_id  = aws_efs_file_system.db.id
+  count           = var.persistence_backend == "sqlite-efs" ? length(var.private_subnets) : 0
+  file_system_id  = aws_efs_file_system.db[0].id
   subnet_id       = var.private_subnets[count.index]
   security_groups = [aws_security_group.tasks.id]
+}
+
+# ── Persistence: RDS PostgreSQL (multi-writer) ────────────────────────────────
+resource "aws_db_subnet_group" "db" {
+  count      = var.persistence_backend == "postgres-rds" ? 1 : 0
+  name       = "${var.name}-db-subnets"
+  subnet_ids = var.private_subnets
+}
+
+resource "aws_security_group" "db" {
+  count  = var.persistence_backend == "postgres-rds" ? 1 : 0
+  name   = "${var.name}-db-sg"
+  vpc_id = var.vpc_id
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.tasks.id]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_db_instance" "db" {
+  count                     = var.persistence_backend == "postgres-rds" ? 1 : 0
+  identifier                = "${var.name}-db"
+  engine                    = "postgres"
+  engine_version            = "16"
+  instance_class            = "db.t4g.medium"
+  allocated_storage         = 50
+  max_allocated_storage     = 200
+  storage_encrypted         = true
+  multi_az                  = true
+  db_subnet_group_name      = aws_db_subnet_group.db[0].name
+  vpc_security_group_ids    = [aws_security_group.db[0].id]
+  backup_retention_period   = 7
+  deletion_protection       = true
+  skip_final_snapshot       = false
+  final_snapshot_identifier = "${var.name}-db-final"
+  username                  = "vaccichain"
+  manage_master_user_password = true
 }
 
 # ── Backend task definition ───────────────────────────────────────────────────
@@ -262,11 +337,14 @@ resource "aws_ecs_task_definition" "backend" {
   memory                   = var.backend_memory
   execution_role_arn       = aws_iam_role.execution.arn
 
-  volume {
-    name = "db-data"
-    efs_volume_configuration {
-      file_system_id = aws_efs_file_system.db.id
-      root_directory = "/"
+  dynamic "volume" {
+    for_each = var.persistence_backend == "sqlite-efs" ? [1] : []
+    content {
+      name = "db-data"
+      efs_volume_configuration {
+        file_system_id = aws_efs_file_system.db[0].id
+        root_directory = "/"
+      }
     }
   }
 
@@ -275,16 +353,26 @@ resource "aws_ecs_task_definition" "backend" {
     image     = var.backend_image
     essential = true
     portMappings = [{ containerPort = 4000, protocol = "tcp" }]
-    mountPoints = [{
+    mountPoints = var.persistence_backend == "sqlite-efs" ? [{
       sourceVolume  = "db-data"
       containerPath = "/data"
       readOnly      = false
-    }]
+    }] : []
     secrets = [for k, arn in var.secret_arns : { name = k, valueFrom = arn }]
-    environment = [
-      { name = "NODE_ENV", value = "production" },
-      { name = "DATABASE_PATH", value = "/data/vaccichain.db" },
-    ]
+    environment = concat(
+      [
+        { name = "NODE_ENV", value = "production" },
+        { name = "PERSISTENCE_BACKEND", value = var.persistence_backend },
+        # Trust-proxy settings must match the ALB topology (single ALB hop).
+        { name = "TRUST_PROXY_HOPS", value = tostring(var.trust_proxy_hops) },
+        { name = "TRUSTED_PROXY_CIDRS", value = join(",", var.trusted_proxy_cidrs) },
+      ],
+      var.persistence_backend == "sqlite-efs" ? [
+        { name = "DATABASE_PATH", value = "/data/vaccichain.db" },
+      ] : [
+        { name = "DATABASE_URL", value = "postgres://${aws_db_instance.db[0].username}@${aws_db_instance.db[0].endpoint}/${aws_db_instance.db[0].db_name}" },
+      ],
+    )
     logConfiguration = {
       logDriver = "awslogs"
       options = {
@@ -307,8 +395,17 @@ resource "aws_ecs_service" "backend" {
   name            = "${var.name}-backend"
   cluster         = aws_ecs_cluster.this.id
   task_definition = aws_ecs_task_definition.backend.arn
-  desired_count   = var.desired_count
-  launch_type     = "FARGATE"
+  # SQLite over EFS supports only a single writer; scale out only with RDS.
+  desired_count = var.persistence_backend == "sqlite-efs" ? 1 : var.desired_count
+  launch_type   = "FARGATE"
+
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
 
   network_configuration {
     subnets         = var.private_subnets
@@ -367,6 +464,14 @@ resource "aws_ecs_service" "frontend" {
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
   network_configuration {
     subnets         = var.private_subnets
     security_groups = [aws_security_group.tasks.id]
@@ -423,6 +528,14 @@ resource "aws_ecs_service" "analytics" {
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
   network_configuration {
     subnets         = var.private_subnets
     security_groups = [aws_security_group.tasks.id]
@@ -433,6 +546,9 @@ resource "aws_ecs_service" "analytics" {
 
 output "alb_dns_name" { value = aws_lb.this.dns_name }
 output "cluster_name" { value = aws_ecs_cluster.this.name }
-output "backend_service_discovery_dns" {
-  value = "backend.${var.service_discovery_namespace}"
+output "backend_target_group_arn"        { value = aws_lb_target_group.backend.arn }
+output "backend_canary_target_group_arn" { value = aws_lb_target_group.backend_canary.arn }
+output "persistence_backend" { value = var.persistence_backend }
+output "database_endpoint" {
+  value = var.persistence_backend == "postgres-rds" ? aws_db_instance.db[0].endpoint : null
 }

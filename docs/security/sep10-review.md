@@ -173,12 +173,20 @@ All fixes are covered by `backend/tests/sep10.test.js` (15 tests, all passing):
 | wrong `home_domain` key rejected | F-01 |
 | sequence ≠ 0 rejected | F-03 |
 | missing client signature rejected | Spec §verification |
+| simultaneous verify requests: exactly one succeeds | Spec §nonce (concurrency) |
+| concurrent replay across instances rejected | Spec §nonce (concurrency) |
+| challenge rejected after expiry under concurrent verify | Spec §timeBounds |
+| process restart: in-flight challenge cannot be replayed | Spec §nonce (restart) |
+| store unavailable → 503, challenge not accepted | Store failure (fail closed) |
+| store error during consume → 503, nonce not consumed | Store failure (fail closed) |
 
 ---
 
 ## Remaining Notes
 
-1. **`nonceStore` is in-memory.** A process restart invalidates all in-flight challenges. Acceptable for single-instance deployments; use a Redis-backed store for multi-instance or zero-downtime deployments.
+1. **`nonceStore` is Redis-backed with atomic consume.** Nonces are written to Redis with a TTL matching the challenge `timeBounds` (5 minutes). Consumption uses an atomic `GETDEL` (falling back to a `MULTI`/`EXEC` `GET`+`DEL` on older Redis versions), so a nonce can be accepted at most once even under simultaneous verify requests or across multiple server instances. A nonce is never accepted after its TTL expires, and a process restart no longer invalidates in-flight challenges because state lives in Redis rather than process memory.
+
+   **Store failure behavior (fail closed):** If the store is unreachable or returns an error during `consume`, the request is rejected with `503 Service Unavailable` and the challenge is **not** accepted. A store error never falls back to accepting the challenge, and a failed `consume` does not mark the nonce as used (the client may retry with the same challenge until it expires). Failures are logged with the nonce identifier (not the full nonce) for diagnosis.
 
 2. **`HOME_DOMAIN` and `WEB_AUTH_DOMAIN` must be set correctly before mainnet.** Both default to `localhost` for local development. Production values must match the domain in `stellar.toml`.
 

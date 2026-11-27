@@ -78,6 +78,51 @@ All ratios computed using the WCAG relative luminance formula.
 
 ---
 
+## Forms — Labels, Errors, and Required Fields
+
+Issuer and onboarding forms communicate field purpose, constraints, and validation status accessibly.
+
+### Labels and error association
+
+- Every form control has a programmatic label: inputs are associated with a `<label htmlFor>` matching the control's `id`, or an `aria-label` where a visible label is not rendered.
+- Validation errors are associated with the invalid field via `aria-describedby` pointing at the error message element, and the field is marked `aria-invalid="true"` while invalid.
+- Error messages are rendered in a live region (`role="alert"` / `aria-live="assertive"`) so screen readers announce them when validation fails.
+- Field purpose and constraints (e.g., format hints) are exposed through `aria-describedby` alongside the error message.
+
+### Required and optional fields
+
+- Required fields are marked with `required` / `aria-required="true"` and a visible required indicator.
+- Optional fields are explicitly labeled as optional so the distinction is clear to all users.
+- The required/optional distinction is conveyed in text, not by color or asterisk alone.
+
+### Verification
+
+- Run an accessibility checker (e.g., axe DevTools, Lighthouse accessibility audit, or `jest-axe` in tests) against the issuer and onboarding forms and confirm zero label/error-association violations.
+- Manually verify with a screen reader that focusing an invalid field announces its label, constraint, and error message.
+- Confirm required and optional fields are announced correctly.
+
+---
+
+## Reduced Motion
+
+The app honors the user's `prefers-reduced-motion` setting. When reduced motion is requested, non-essential transitions and animations are disabled or reduced to near-instant.
+
+### Covered areas
+
+- **Navigation:** route/page transitions and nav hover/active animations are suppressed.
+- **Skeletons:** loading skeleton shimmer/pulse animations are replaced with a static placeholder.
+- **Notifications:** toast/notification enter/exit animations are reduced to instant appearance/disappearance.
+
+### Verification
+
+- Enable reduced motion at the OS level (macOS: System Settings → Accessibility → Display → Reduce motion; Windows: Settings → Accessibility → Visual effects → Animation effects off) or emulate it in DevTools (Rendering → Emulate CSS media feature `prefers-reduced-motion: reduce`).
+- Navigate between pages and confirm no non-essential transitions play.
+- Trigger loading states and confirm skeletons render statically without shimmer/pulse.
+- Trigger a notification and confirm it appears/disappears without animation.
+- Confirm all content remains fully usable and no information is conveyed by motion alone.
+
+---
+
 ## Verification Status Cues (Color-Independent)
 
 Record validity and revocation are never communicated by color alone. Every status
