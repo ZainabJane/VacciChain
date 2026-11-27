@@ -15,7 +15,17 @@ updates:
     schedule:
       interval: "weekly"
 
+  # Contracts Cargo ecosystem.
+  # Dependency upgrade review policy (see contracts/DEPENDENCY_POLICY.md):
+  #  - Upgrades require passing tests, a resource comparison, and release-note updates.
+  #  - Soroban SDK and toolchain bumps are never auto-merged; they are grouped and
+  #    reviewed manually alongside the CI advisory checks (cargo-audit / cargo-deny).
   - package-ecosystem: "cargo"
     directory: "/contracts"
     schedule:
       interval: "daily"
+
+  - package-ecosystem: "terraform"
+    directory: "/infra"
+    schedule:
+      interval: "weekly"

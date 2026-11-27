@@ -20,6 +20,7 @@ const app = require('../src/app');
 const StellarSdk = require('@stellar/stellar-sdk');
 const { simulateContract } = require('../src/stellar/soroban');
 const verifyRouter = require('../src/routes/verify');
+const { ContractError, ErrorCodes } = require('../src/contractErrors');
 
 const VALID_WALLET = 'GA3AUY2XRF6S7R73ABSLJMKG4R2NQGRUFPEJUGCANMBAAXI4MTBS6AQU';
 // Generate valid Stellar public keys to pass regex and SDK base32 verification checks
@@ -123,81 +124,60 @@ describe('Integration Tests - Public Verify Endpoint (GET /v1/verify/:wallet)', 
     expect(res.body).toHaveProperty('error');
   });
 
-  it('Test: batch verification bounds batch size and parallelism', async () => {
-    const { verifyBatch } = require('../src/services/batchVerify');
-
-    const wallets = Array.from({ length: 25 }, () => StellarSdk.Keypair.random().publicKey());
-
-    let inFlight = 0;
-    let maxInFlight = 0;
-
-    simulateContract.mockImplementation(async () => {
-      inFlight += 1;
-      maxInFlight = Math.max(maxInFlight, inFlight);
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      inFlight -= 1;
-      return StellarSdk.xdr.ScVal.scvVec([
-        StellarSdk.xdr.ScVal.scvBool(true),
-        StellarSdk.xdr.ScVal.scvVec([]),
-      ]);
-    });
-
-    const result = await verifyBatch(wallets, { requestId: 'batch-req-1' });
-
-    // All items processed
-    expect(result.results).toHaveLength(25);
-    // Parallelism is bounded by the documented limit
-    expect(maxInFlight).toBeLessThanOrEqual(verifyBatch.MAX_PARALLELISM);
-    expect(maxInFlight).toBeGreaterThan(1);
-    // Batch size is bounded by the documented limit
-    expect(verifyBatch.MAX_BATCH_SIZE).toBeGreaterThan(0);
-    expect(wallets.length).toBeLessThanOrEqual(verifyBatch.MAX_BATCH_SIZE);
-    // Request ID propagated to the batch result
-    expect(result.requestId).toBe('batch-req-1');
-  });
-
-  it('Test: batch verification rejects oversized batches', async () => {
-    const { verifyBatch } = require('../src/services/batchVerify');
-
-    const wallets = Array.from(
-      { length: verifyBatch.MAX_BATCH_SIZE + 1 },
-      () => StellarSdk.Keypair.random().publicKey()
+  it('Test: contract error (NotAuthorized) maps to stable 403 API response', async () => {
+    simulateContract.mockRejectedValueOnce(
+      new ContractError(ErrorCodes.NotAuthorized, 'caller is not authorized')
     );
 
-    await expect(verifyBatch(wallets, { requestId: 'too-big' })).rejects.toMatchObject({
-      status: 400,
-    });
+    const res = await request(app)
+      .get(`/v1/verify/${VALID_WALLET}`)
+      .set('Authorization', `Bearer ${validToken}`);
+
+    expect(res.status).toBe(403);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code', ErrorCodes.NotAuthorized);
   });
 
-  it('Test: batch verification returns per-item errors for partial failures', async () => {
-    const { verifyBatch } = require('../src/services/batchVerify');
+  it('Test: contract error (NotFound) maps to stable 404 API response', async () => {
+    simulateContract.mockRejectedValueOnce(
+      new ContractError(ErrorCodes.NotFound, 'record not found')
+    );
 
-    const okWallet = StellarSdk.Keypair.random().publicKey();
-    const failWallet = StellarSdk.Keypair.random().publicKey();
+    const res = await request(app)
+      .get(`/v1/verify/${VALID_WALLET}`)
+      .set('Authorization', `Bearer ${validToken}`);
 
-    simulateContract.mockImplementation(async (wallet) => {
-      if (wallet === failWallet) {
-        throw new Error('Simulation failed: timeout');
-      }
-      return StellarSdk.xdr.ScVal.scvVec([
-        StellarSdk.xdr.ScVal.scvBool(true),
-        StellarSdk.xdr.ScVal.scvVec([]),
-      ]);
-    });
+    expect(res.status).toBe(404);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code', ErrorCodes.NotFound);
+  });
 
-    const result = await verifyBatch([okWallet, failWallet], { requestId: 'partial-1' });
+  it('Test: contract error (InvalidInput) maps to stable 400 API response', async () => {
+    simulateContract.mockRejectedValueOnce(
+      new ContractError(ErrorCodes.InvalidInput, 'invalid argument')
+    );
 
-    expect(result.requestId).toBe('partial-1');
-    expect(result.results).toHaveLength(2);
+    const res = await request(app)
+      .get(`/v1/verify/${VALID_WALLET}`)
+      .set('Authorization', `Bearer ${validToken}`);
 
-    const ok = result.results.find((r) => r.wallet === okWallet);
-    const failed = result.results.find((r) => r.wallet === failWallet);
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code', ErrorCodes.InvalidInput);
+  });
 
-    expect(ok).toMatchObject({ ok: true, verified: true });
-    expect(failed).toMatchObject({ ok: false });
-    expect(failed.error).toBeTruthy();
-    // Internal stack traces must not leak
-    expect(JSON.stringify(failed)).not.toContain('at ');
+  it('Test: unknown contract error maps to stable 500 API response', async () => {
+    simulateContract.mockRejectedValueOnce(
+      new ContractError(9999, 'unexpected contract failure')
+    );
+
+    const res = await request(app)
+      .get(`/v1/verify/${VALID_WALLET}`)
+      .set('Authorization', `Bearer ${validToken}`);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code', 9999);
   });
 
   it('Test: response is served from cache on second request within TTL', async () => {

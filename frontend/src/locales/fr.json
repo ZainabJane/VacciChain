@@ -1,6 +1,37 @@
 {
   "accessibility": {
-    "skipToContent": "Aller au contenu principal"
+    "skipToContent": "Aller au contenu principal",
+    "announce": {
+      "walletConnected": "Portefeuille connecté : {{address}}",
+      "walletDisconnected": "Portefeuille déconnecté",
+      "walletError": "Échec de la connexion du portefeuille : {{message}}",
+      "mintSuccess": "NFT de vaccination émis. ID du jeton : {{tokenId}}",
+      "mintError": "Échec de l'émission : {{message}}",
+      "verifySuccess": "Vérification terminée : {{count}} dossier trouvé",
+      "verifySuccess_other": "Vérification terminée : {{count}} dossiers trouvés",
+      "verifyError": "Échec de la vérification : {{message}}",
+      "copySuccess": "Copié dans le presse-papiers",
+      "copyError": "Échec de la copie dans le presse-papiers"
+    }
+  },
+  "network": {
+    "configured": "Réseau configuré : {{network}}",
+    "walletNetwork": "Réseau du portefeuille : {{network}}",
+    "mismatchTitle": "Réseau du portefeuille incorrect",
+    "mismatch": "Votre portefeuille est sur {{walletNetwork}}, mais cette application nécessite {{expectedNetwork}}. La soumission de transactions est bloquée.",
+    "recovery": "Ouvrez Freighter, passez au réseau {{expectedNetwork}}, puis reconnectez votre portefeuille.",
+    "blocked": "Impossible de signer : le réseau du portefeuille ne correspond pas au réseau configuré."
+  },
+  "links": {
+    "opensInNewTab": "(s'ouvre dans un nouvel onglet)"
+  },
+  "asyncState": {
+    "loading": "Chargement…",
+    "empty": "Aucune donnée disponible.",
+    "partial": "Certaines données n'ont pas pu être chargées.",
+    "error": "Échec du chargement des données : {{message}}",
+    "retry": "Réessayer",
+    "retrying": "Nouvelle tentative…"
   },
   "nav": {
     "home": "Accueil",
@@ -15,6 +46,91 @@
     "connect": "Connecter le portefeuille Freighter",
     "requiresFreighter": "Nécessite l'extension Freighter sur le réseau de test Stellar."
   },
+  "wallet": {
+    "errors": {
+      "notInstalled": {
+        "title": "Freighter n'est pas installé",
+        "message": "L'extension de portefeuille Freighter est requise pour utiliser cette application.",
+        "steps": "Installez l'extension Freighter depuis freighter.app ou depuis la boutique d'extensions de votre navigateur, puis rechargez cette page.",
+        "install": "Installer Freighter",
+        "retry": "J'ai installé Freighter — réessayer"
+      },
+      "rejected": {
+        "title": "Connexion refusée",
+        "message": "Vous avez refusé la demande de connexion dans Freighter.",
+        "steps": "Ouvrez Freighter, déverrouillez-le si nécessaire, puis cliquez à nouveau sur « Connecter le portefeuille » et approuvez la demande.",
+        "retry": "Réessayer la connexion"
+      },
+      "locked": {
+        "title": "Portefeuille verrouillé",
+        "message": "Votre portefeuille Freighter est verrouillé.",
+        "steps": "Ouvrez l'extension Freighter, saisissez votre mot de passe pour la déverrouiller, puis réessayez.",
+        "retry": "Réessayer"
+      },
+      "provider": {
+        "title": "Le portefeuille a rencontré un problème",
+        "message": "Freighter n'a pas pu traiter la demande.",
+        "steps": "Vérifiez que Freighter est à jour et que le réseau de test Stellar est sélectionné, puis réessayez. Si le problème persiste, contactez le support.",
+        "retry": "Réessayer",
+        "support": "Contacter le support"
+      }
+    }
+  },
+  "transaction": {
+    "status": {
+      "pending": "En attente de confirmation…",
+      "confirmed": "Confirmée",
+      "failed": "Échouée",
+      "expired": "Expirée"
+    },
+    "pendingHint": "La transaction a été soumise et attend d'être confirmée sur le réseau.",
+    "confirmedHint": "La transaction a été confirmée sur le réseau.",
+    "failedHint": "La transaction n'a pas abouti. Aucun dossier n'a été émis.",
+    "expiredHint": "La confirmation a expiré avant d'aboutir. Le résultat est inconnu — ne supposez pas que la transaction a réussi.",
+    "retry": "Réessayer",
+    "support": "Contacter le support",
+    "viewExplorer": "Voir sur l'explorateur Stellar ↗",
+    "explorerAriaLabel": "Voir la transaction {{hash}} sur l'explorateur Stellar (nouvel onglet)"
+  },
+  "consent": {
+    "title": "Consentement et confidentialité",
+    "description": "Contrôlez qui peut consulter votre statut vaccinal.",
+    "statusLabel": "Statut actuel",
+    "status": {
+      "granted": "Consentement accordé",
+      "revoked": "Consentement révoqué",
+      "unknown": "Statut inconnu"
+    },
+    "scopeLabel": "Portée du consentement",
+    "scope": {
+      "verification": "Vérification du statut vaccinal",
+      "records": "Consultation des dossiers de vaccination",
+      "none": "Aucune portée accordée"
+    },
+    "grant": "Accorder le consentement",
+    "revoke": "Révoquer le consentement",
+    "grantConsequence": "En accordant votre consentement, les vérificateurs autorisés pourront consulter votre statut vaccinal.",
+    "revokeConsequence": "En révoquant votre consentement, les vérificateurs ne pourront plus consulter votre statut vaccinal. Cette action peut être annulée plus tard.",
+    "confirmGrant": "Confirmer l'accord du consentement",
+    "confirmRevoke": "Confirmer la révocation du consentement",
+    "cancel": "Annuler",
+    "updating": "Mise à jour…",
+    "updated": "Consentement mis à jour.",
+    "error": "Impossible de mettre à jour le consentement. Veuillez réessayer.",
+    "loading": "Chargement du consentement…"
+  },
+  "qr": {
+    "title": "Vérification par QR code",
+    "ariaLabel": "Code QR de vérification",
+    "description": "Scannez ce code QR avec un appareil photo, ou copiez le lien de vérification ci-dessous.",
+    "urlLabel": "Lien de vérification",
+    "urlAriaLabel": "Lien de vérification, sélectionnable et copiable",
+    "copy": "Copier le lien",
+    "copied": "Lien copié dans le presse-papiers.",
+    "copyFailed": "Impossible de copier automatiquement. Sélectionnez le lien ci-dessus et copiez-le manuellement.",
+    "copyDenied": "L'accès au presse-papiers a été refusé. Sélectionnez le lien ci-dessus et copiez-le manuellement.",
+    "close": "Fermer la fenêtre du QR code"
+  },
   "patient": {
     "connectPrompt": "Connectez votre portefeuille pour voir vos dossiers.",
     "connectWallet": "Connecter le portefeuille",
@@ -24,6 +140,9 @@
     "wallet": "Portefeuille : {{address}}",
     "loading": "Chargement…",
     "error": "Erreur : {{message}}",
+    "retry": "Réessayer",
+    "retrying": "Nouvelle tentative…",
+    "partial": "Certains dossiers n'ont pas pu être chargés.",
     "noRecords": "Aucun dossier de vaccination trouvé.",
     "prevPage": "‹ Préc.",
     "nextPage": "Suiv. ›",
@@ -41,10 +160,14 @@
     "submit": "Émettre le NFT de vaccination",
     "submitting": "Émission en cours…",
     "error": "Erreur : {{message}}",
+    "retry": "Réessayer",
+    "retrying": "Nouvelle tentative…",
     "success": "✅ NFT de vaccination émis ! ID du jeton : {{tokenId}}",
     "validation": {
       "invalidAddress": "Doit être une clé publique Stellar valide (G…, 56 caractères)",
       "vaccineRequired": "Le nom du vaccin est requis",
+      "dosePositive": "Doit être un nombre entier positif",
+      "doseExceedsSeries": "Le numéro de dose ne peut pas dépasser le nombre de doses de la série",
       "dateRequired": "La date est requise",
       "dateFuture": "La date ne peut pas être dans le futur"
     }
@@ -54,7 +177,10 @@
     "placeholder": "Entrez l'adresse du portefeuille Stellar (G...)",
     "submit": "Vérifier",
     "checking": "Vérification…",
-    "error": "Erreur : {{message}}"
+    "error": "Erreur : {{message}}",
+    "retry": "Réessayer",
+    "retrying": "Nouvelle tentative…",
+    "empty": "Aucun dossier trouvé pour cette adresse."
   },
   "nftCard": {
     "date": "Date : {{date}}",
@@ -98,7 +224,7 @@
     "tokenId": "ID du jeton",
     "issuerAddress": "Adresse de l'émetteur",
     "txHash": "Hash de transaction",
-    "viewExplorer": "Voir sur Stellar Explorer ↗",
+    "viewExplorer": "Voir sur Stellar Explorer (s'ouvre dans un nouvel onglet)",
     "noTxHash": "Hash de transaction non disponible pour ce dossier."
   },
   "format": {

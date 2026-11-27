@@ -7,6 +7,7 @@
  */
 
 const express = require('express');
+const { ERROR_CODES, sendError } = require('../errors');
 const crypto = require('crypto');
 const authMiddleware = require('../middleware/auth');
 const validate = require('../middleware/validate');
@@ -20,27 +21,33 @@ const {
   updateIssuerApplicationStatus,
 } = require('../indexer/db');
 const { applySchema, reviewSchema } = require('./schemas/onboarding.schemas');
+const { createRateLimiter } = require('../middleware/rateLimit');
 
 const router = express.Router();
 
-// Explicit onboarding state machine.
-// Only pending applications may transition to a terminal state.
-const ONBOARDING_STATES = Object.freeze({
-  PENDING: 'pending',
-  APPROVED: 'approved',
-  REJECTED: 'rejected',
+/**
+ * Rate limiters for onboarding endpoints.
+ *
+ * Client identity is derived from the trusted proxy configuration (see
+ * `middleware/rateLimit`), so spoofed `X-Forwarded-For` headers from
+ * untrusted sources cannot be used to bypass the limit.
+ *
+ * On limit exceeded the response is:
+ *   429 Too Many Requests
+ *   Retry-After: <seconds>
+ *   { "error": "Too many requests", "retryAfter": <seconds> }
+ */
+const applyLimiter = createRateLimiter({
+  name: 'onboarding_apply',
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5,
 });
 
-const ALLOWED_TRANSITIONS = Object.freeze({
-  [ONBOARDING_STATES.PENDING]: [ONBOARDING_STATES.APPROVED, ONBOARDING_STATES.REJECTED],
-  [ONBOARDING_STATES.APPROVED]: [],
-  [ONBOARDING_STATES.REJECTED]: [],
+const reviewLimiter = createRateLimiter({
+  name: 'onboarding_review',
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 30,
 });
-
-function isValidTransition(from, to) {
-  const allowed = ALLOWED_TRANSITIONS[from];
-  return Array.isArray(allowed) && allowed.includes(to);
-}
 
 function adminOnly(req, res, next) {
   if (req.user?.role !== 'issuer') {
@@ -50,10 +57,9 @@ function adminOnly(req, res, next) {
 }
 
 /**
- * POST /onboarding/apply
  * Any authenticated user can submit an onboarding request.
  */
-router.post('/apply', authMiddleware, validate(applySchema), async (req, res) => {
+router.post('/apply', applyLimiter, authMiddleware, validate(applySchema), async (req, res) => {
   const { name, license_number, country, wallet } = req.body;
 
   // Prevent duplicate applications from the same wallet
@@ -89,7 +95,7 @@ router.get('/applications', authMiddleware, adminOnly, (req, res) => {
  * On approval, the wallet is added to the contract issuer allowlist.
  * Requires M-of-N multi-sig approval (see MULTISIG_THRESHOLD env var).
  */
-router.post('/applications/:id/review', authMiddleware, adminOnly, validate(reviewSchema), requireMultiSig('onboarding_review'), async (req, res) => {
+router.post('/applications/:id/review', reviewLimiter, authMiddleware, adminOnly, validate(reviewSchema), requireMultiSig('onboarding_review'), async (req, res) => {
   const application = getIssuerApplication(req.params.id);
   if (!application) {
     return res.status(404).json({ error: 'Application not found' });
@@ -113,7 +119,7 @@ router.post('/applications/:id/review', authMiddleware, adminOnly, validate(revi
     try {
       await addIssuer(application.wallet);
     } catch (err) {
-      return res.status(502).json({ error: `Contract call failed: ${err.message}` });
+      return sendError(req, res, 502, ERROR_CODES.RPC_ERROR, 'Contract call failed');
     }
   }
 

@@ -1,6 +1,8 @@
 'use strict';
 
 const http = require('http');
+const express = require('express');
+const { validateConfig } = require('./config/validateConfig');
 const config = require('./config');
 const logger = require('./logger');
 const secrets = require('./secrets');
@@ -290,7 +292,20 @@ function createShutdownCoordinator({ server, poller, db, timeoutMs, log = logger
   };
 }
 
-function main() {
+function start() {
+  let validatedConfig;
+  try {
+    validatedConfig = validateConfig(process.env);
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    // eslint-disable-next-line no-console
+    console.error(`[startup] Configuration validation failed:\n${message}`);
+    process.exit(1);
+    return;
+  }
+
+  const port = validatedConfig.port;
+
   const db = createDatabase(config);
   const poller = createPoller({ config, db, logger });
 
@@ -329,8 +344,14 @@ function main() {
   process.on('SIGTERM', () => handleSignal('SIGTERM'));
   process.on('SIGINT', () => handleSignal('SIGINT'));
 
-  server.listen(config.PORT, () => {
-    logger.info({ port: config.PORT }, 'Server listening');
+  server.on('error', (err) => {
+    // eslint-disable-next-line no-console
+    console.error(`[startup] Failed to bind port ${port}: ${err.message}`);
+    process.exit(1);
+  });
+
+  server.listen(port, () => {
+    logger.info({ port }, 'Server listening');
     if (poller && typeof poller.start === 'function') {
       poller.start();
     }
@@ -339,15 +360,12 @@ function main() {
   return { server, poller, db, coordinator };
 }
 
-if (require.main === module) {
-  main();
+function main() {
+  return start();
 }
 
-module.exports = {
-  main,
-  createShutdownCoordinator,
-  runStartup,
-  isReady,
-  sanitizeError,
-  getRequiredSteps,
-};
+if (require.main === module) {
+  start();
+}
+
+module.exports = { app: createApp, start, main, createShutdownCoordinator };

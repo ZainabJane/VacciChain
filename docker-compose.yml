@@ -79,6 +79,13 @@ services:
         max-file: "3"
     restart: unless-stopped
 
+  # SINGLE-WRITER CONSTRAINT (Backlog #117):
+  # SQLite on the shared `vaccichain_db` volume supports only ONE writer.
+  # Do NOT scale this service (`docker compose up --scale backend=N` is
+  # unsupported) and do NOT add a second backend replica sharing the volume —
+  # concurrent writers can corrupt the database or split the event index.
+  # Production (ECS/EFS) must likewise pin the backend to a single task
+  # (desiredCount=1, no autoscaling) or move to a DB with multi-writer support.
   backend:
     build: ./backend
     # No host port — only reachable via nginx on the internal network
@@ -86,8 +93,28 @@ services:
     environment:
       - EVENT_POLL_INTERVAL_MS=${EVENT_POLL_INTERVAL_MS:-15000}
       - DATABASE_PATH=/data/vaccichain.db
+      # Persistence strategy (#52): SQLite in WAL mode with busy timeout for
+      # single-writer concurrency; see docs/persistence-strategy.md.
+      - DATABASE_JOURNAL_MODE=${DATABASE_JOURNAL_MODE:-WAL}
+      - DATABASE_BUSY_TIMEOUT_MS=${DATABASE_BUSY_TIMEOUT_MS:-5000}
+      - DATABASE_SYNCHRONOUS=${DATABASE_SYNCHRONOUS:-NORMAL}
+      # Trust-proxy topology (#56): number of trusted proxy hops in front of
+      # the backend (nginx only = 1). Set to "false" to disable trust proxy.
+      - TRUST_PROXY=${TRUST_PROXY:-1}
+      # Public verification response/work bounds (#54).
+      - PUBLIC_RECORD_MAX_HISTORY=${PUBLIC_RECORD_MAX_HISTORY:-100}
+      - PUBLIC_RECORD_DEFAULT_PAGE_SIZE=${PUBLIC_RECORD_DEFAULT_PAGE_SIZE:-20}
+      - PUBLIC_RECORD_MAX_PAGE_SIZE=${PUBLIC_RECORD_MAX_PAGE_SIZE:-100}
+      - PUBLIC_BATCH_MAX_ITEMS=${PUBLIC_BATCH_MAX_ITEMS:-50}
+      # Tamper-evident, rotation-safe audit logging (#57).
+      - AUDIT_LOG_PATH=${AUDIT_LOG_PATH:-/data/audit/audit.log}
+      - AUDIT_LOG_MAX_SIZE_BYTES=${AUDIT_LOG_MAX_SIZE_BYTES:-10485760}
+      - AUDIT_LOG_MAX_FILES=${AUDIT_LOG_MAX_FILES:-5}
+      - AUDIT_LOG_RETENTION_DAYS=${AUDIT_LOG_RETENTION_DAYS:-90}
+      - AUDIT_LOG_HMAC_SECRET=${AUDIT_LOG_HMAC_SECRET:-}
     volumes:
       - vaccichain_db:/data
+      - vaccichain_audit:/data/audit
     depends_on:
       python-service:
         condition: service_healthy
@@ -103,14 +130,6 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    deploy:
-      resources:
-        limits:
-          cpus: "0.75"
-          memory: 256M
-        reservations:
-          cpus: "0.10"
-          memory: 128M
     logging:
       driver: json-file
       options:
@@ -122,6 +141,11 @@ services:
     build: ./python-service
     # No host port — only reachable via nginx on the internal network
     env_file: .env
+    environment:
+      # Resolve the backend via private service discovery (compose network DNS),
+      # never loopback, so this matches the ECS private endpoint pattern.
+      - BACKEND_URL=${BACKEND_URL:-http://backend:4000}
+      - ANALYTICS_BACKEND_URL=${ANALYTICS_BACKEND_URL:-http://backend:4000}
     networks:
       - vaccichain
     healthcheck:
@@ -152,11 +176,19 @@ services:
         max-file: "3"
     restart: unless-stopped
 
+  # Backup reads the same volume as the single backend writer. It must never
+  # write to the live DB; it only snapshots it (see ./backup). Keep this
+  # service singular as well so snapshots do not race each other.
   backup:
     build: ./backup
     env_file: .env
+    environment:
+      - DATABASE_PATH=/data/vaccichain.db
+      - BACKUP_DIR=/backups
+      - BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS:-30}
     volumes:
       - vaccichain_db:/data
+      - vaccichain_backups:/backups
     networks:
       - vaccichain
     healthcheck:
@@ -178,4 +210,6 @@ networks:
 
 volumes:
   vaccichain_db:
+  vaccichain_audit:
+  vaccichain_backups:
   certbot_webroot:

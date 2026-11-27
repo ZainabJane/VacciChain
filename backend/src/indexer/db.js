@@ -1,16 +1,106 @@
 /**
  * SQLite-backed event store using sql.js (pure WASM — no native build required).
  * The DB is loaded from disk on init and flushed to disk after every write.
+ *
+ * PERSISTENCE MODEL (see docs/deployment.md):
+ *   The database file lives on an EFS access point and is only safe for a
+ *   SINGLE writer. The indexer/API service MUST run with desired count 1 and a
+ *   deployment configuration that never overlaps old and new tasks
+ *   (maxSurge=0, maxUnavailable=1, single replica). To defend against
+ *   misconfiguration (or a rolling deploy that briefly overlaps), startup
+ *   acquires an exclusive advisory lock file next to the DB. If another live
+ *   process holds the lock, initDb() throws instead of opening the DB, which
+ *   prevents split-brain index state and corruption.
+ *
+ *   Writes are flushed atomically (temp file + rename) so a task killed
+ *   mid-write leaves either the previous or the new DB image on disk, never a
+ *   truncated one. WAL mode is enabled for crash resilience; because sql.js
+ *   exports a full image on flush, the WAL is checkpointed into the exported
+ *   bytes and no separate -wal/-shm files need to be shared across tasks.
  */
 const initSqlJs = require('sql.js');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { toIndexedMint } = require('../schemas/vaccinationRecord');
 
 let db = null;
 let dbPath = null;
+let lockPath = null;
+let lockFd = null;
+let lockAcquired = false;
+
+const LOCK_STALE_MS = Number(process.env.DB_LOCK_STALE_MS || 5 * 60 * 1000);
+const LOCK_HEARTBEAT_MS = Number(process.env.DB_LOCK_HEARTBEAT_MS || 30 * 1000);
+let lockHeartbeat = null;
+let lockOwner = null;
+
 let inTransaction = false;
 
+// Bump when the on-disk schema changes in a backwards-incompatible way.
+const SCHEMA_VERSION = 1;
+
+// Tables that must exist for the indexer to serve reads / process events.
+const REQUIRED_TABLES = ['events', 'api_keys', 'issuer_applications', 'patient_consent'];
+
 const MIGRATIONS_DIR = path.join(__dirname, 'migrations');
+
+// ── Persistence / concurrency controls ───────────────────────────────────────
+// The store is a single in-memory sql.js database flushed to disk. To make it
+// safe for the multi-writer deployment analysis (backlog #52) we serialize all
+// writes through an in-process lock, write atomically (temp file + rename) and
+// keep a bounded set of timestamped backups so durability/failover can be
+// exercised and validated.
+
+const LOCK_TIMEOUT_MS = 5000;
+const BACKUP_DIR_SUFFIX = '.backups';
+const MAX_BACKUPS = 5;
+
+let writeLock = Promise.resolve();
+let lockDepth = 0;
+let migrationHooks = [];
+
+/** Run `fn` while holding the exclusive write lock (serializes writers). */
+async function withWriteLock(fn) {
+  const previous = writeLock;
+  let release;
+  writeLock = new Promise((resolve) => { release = resolve; });
+
+  const acquired = await Promise.race([
+    previous.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), LOCK_TIMEOUT_MS)),
+  ]);
+  if (!acquired) {
+    release();
+    throw new Error('Timed out acquiring database write lock');
+  }
+
+  lockDepth += 1;
+  try {
+    return await fn();
+  } finally {
+    lockDepth -= 1;
+    release();
+  }
+}
+
+/** True when the current call stack holds the write lock. */
+function isLocked() {
+  return lockDepth > 0;
+}
+
+function backupDir() {
+  return dbPath ? `${dbPath}${BACKUP_DIR_SUFFIX}` : null;
+}
+
+/** Register a migration hook: fn(db) => void, run once on init. */
+function registerMigration(fn) {
+  if (typeof fn === 'function') migrationHooks.push(fn);
+}
+
+function runMigrationHooks() {
+  for (const hook of migrationHooks) hook(db);
+}
 
 /**
  * Ordered migration list. Each entry has a version, a name, and up/down SQL.
@@ -57,8 +147,14 @@ const MIGRATIONS = [
         reviewed_at    TEXT,
         reviewer_note  TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS schema_meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     `,
     down: `
+      DROP TABLE IF EXISTS schema_meta;
       DROP TABLE IF EXISTS issuer_applications;
       DROP TABLE IF EXISTS patient_consent;
       DROP TABLE IF EXISTS api_keys;
@@ -102,11 +198,140 @@ const MIGRATIONS = [
   },
 ];
 
+/** Emit an actionable operator alert for a database problem. */
+function operatorAlert(message, detail) {
+  const line = `[DB ALERT] ${message}${detail ? `: ${detail}` : ''}`;
+  console.error(line);
+  if (typeof process.emitWarning === 'function') {
+    process.emitWarning(line, { code: 'DB_INTEGRITY' });
+  }
+}
+
+/** Build a structured error for callers (startup / readiness) to surface. */
+function integrityError(message, detail) {
+  const err = new Error(`Database integrity check failed: ${message}${detail ? ` (${detail})` : ''}`);
+  err.code = 'DB_INTEGRITY';
+  err.detail = detail;
+  return err;
+}
+
+/**
+ * Verify the database file is accessible, uncorrupted, at the expected schema
+ * version, and contains all required tables. Never creates a replacement DB.
+ * @param {string} filePath
+ * @returns {Promise<{ ok: boolean, version?: number, error?: string }>}
+ */
+async function checkIntegrity(filePath) {
+  if (!filePath) {
+    const msg = 'no database path configured';
+    operatorAlert(msg);
+    return { ok: false, error: msg };
+  }
+
+  if (!fs.existsSync(filePath)) {
+    const msg = `database file not found at ${filePath}`;
+    operatorAlert(msg, 'refusing to initialize an empty replacement database');
+    return { ok: false, error: msg };
+  }
+
+  let fileBuffer;
+  try {
+    fileBuffer = fs.readFileSync(filePath);
+  } catch (err) {
+    const msg = `database file is not readable at ${filePath}`;
+    operatorAlert(msg, err.message);
+    return { ok: false, error: `${msg}: ${err.message}` };
+  }
+
+  if (!fileBuffer.length) {
+    const msg = `database file is empty at ${filePath}`;
+    operatorAlert(msg, 'file may be corrupt; refusing to initialize an empty replacement database');
+    return { ok: false, error: msg };
+  }
+
+  const SQL = await initSqlJs();
+  let probe;
+  try {
+    probe = new SQL.Database(fileBuffer);
+  } catch (err) {
+    const msg = `database file is corrupt at ${filePath}`;
+    operatorAlert(msg, err.message);
+    return { ok: false, error: `${msg}: ${err.message}` };
+  }
+
+  try {
+    // SQLite-level integrity check.
+    const integrity = probe.exec('PRAGMA integrity_check');
+    const integrityResult = integrity.length ? integrity[0].values[0][0] : null;
+    if (integrityResult !== 'ok') {
+      const msg = `integrity_check failed at ${filePath}`;
+      operatorAlert(msg, String(integrityResult));
+      return { ok: false, error: `${msg}: ${integrityResult}` };
+    }
+
+    // Required tables.
+    const tablesRes = probe.exec("SELECT name FROM sqlite_master WHERE type = 'table'");
+    const tables = tablesRes.length ? tablesRes[0].values.map((row) => row[0]) : [];
+    const missing = REQUIRED_TABLES.filter((t) => !tables.includes(t));
+    if (missing.length) {
+      const msg = `missing required tables at ${filePath}`;
+      operatorAlert(msg, missing.join(', '));
+      return { ok: false, error: `${msg}: ${missing.join(', ')}` };
+    }
+
+    // Schema version.
+    let version = null;
+    if (tables.includes('schema_meta')) {
+      const verRes = probe.exec("SELECT value FROM schema_meta WHERE key = 'schema_version'");
+      if (verRes.length && verRes[0].values.length) {
+        version = parseInt(verRes[0].values[0][0], 10);
+      }
+    }
+    if (version == null) {
+      const msg = `schema version missing at ${filePath}`;
+      operatorAlert(msg, `expected schema_version=${SCHEMA_VERSION}`);
+      return { ok: false, error: msg };
+    }
+    if (version !== SCHEMA_VERSION) {
+      const msg = `schema version mismatch at ${filePath}`;
+      operatorAlert(msg, `found ${version}, expected ${SCHEMA_VERSION}`);
+      return { ok: false, error: `${msg}: found ${version}, expected ${SCHEMA_VERSION}` };
+    }
+
+    return { ok: true, version };
+  } catch (err) {
+    const msg = `integrity check errored at ${filePath}`;
+    operatorAlert(msg, err.message);
+    return { ok: false, error: `${msg}: ${err.message}` };
+  } finally {
+    try { probe.close(); } catch (_) { /* ignore */ }
+  }
+}
+
 /** Persist in-memory DB to disk. */
 function flush() {
   if (!db || !dbPath) return;
-  const data = db.export();
-  fs.writeFileSync(dbPath, Buffer.from(data));
+  const data = Buffer.from(db.export());
+  const tmpPath = `${dbPath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmpPath, data);
+  fs.renameSync(tmpPath, dbPath);
+}
+
+/** Persist a timestamped backup copy and prune old ones. */
+function backup() {
+  if (!db || !dbPath) return null;
+  const dir = backupDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const target = path.join(dir, `backup-${Date.now()}.sqlite`);
+  fs.writeFileSync(target, Buffer.from(db.export()));
+
+  const backups = fs.readdirSync(dir)
+    .filter((f) => f.startsWith('backup-') && f.endsWith('.sqlite'))
+    .sort();
+  while (backups.length > MAX_BACKUPS) {
+    fs.unlinkSync(path.join(dir, backups.shift()));
+  }
+  return target;
 }
 
 /**
@@ -162,32 +387,59 @@ function runMigrations() {
   return getSchemaVersion();
 }
 
-/** Initialize (or load) the database and bring the schema up to date. */
+/**
+ * Initialize (or load) the database and bring the schema up to date.
+ * Fails closed on corruption / inaccessibility — never silently creates an
+ * empty replacement database over an existing (possibly corrupt) file.
+ */
 async function initDb(filePath) {
   dbPath = filePath;
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  acquireLock();
+
   const SQL = await initSqlJs();
 
-  if (fs.existsSync(filePath)) {
+  const exists = fs.existsSync(filePath);
+
+  if (exists) {
+    // Existing DB: verify integrity before serving reads or processing events.
+    const check = await checkIntegrity(filePath);
+    if (!check.ok) {
+      throw integrityError(check.error || 'unknown integrity failure', filePath);
+    }
     const fileBuffer = fs.readFileSync(filePath);
-    db = new SQL.Database(fileBuffer);
+    try {
+      db = new SQL.Database(fileBuffer);
+    } catch (err) {
+      operatorAlert(`failed to open database at ${filePath}`, err.message);
+      throw integrityError('failed to open database', err.message);
+    }
   } else {
+    // First run: create a fresh database and record the schema version.
     db = new SQL.Database();
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
   }
 
+  // WAL improves crash resilience for the on-disk image; sql.js checkpoints
+  // the WAL into the exported bytes on flush().
+  try { db.run('PRAGMA journal_mode = WAL;'); } catch (_) { /* not fatal */ }
+  db.run(SCHEMA);
   runMigrations();
+  runMigrationHooks();
   flush();
   return db;
 }
 
-/** Close the database, flushing any pending state. Safe to call twice. */
+/** Close the DB, flushing any pending state and releasing the writer lock. Safe to call multiple times. */
 function closeDb() {
   if (!db) return;
   try {
     flush();
   } finally {
-    db.close();
+    try { db.close(); } catch (_) { /* ignore */ }
     db = null;
+    releaseLock();
+  }
+}
   }
 }
 
@@ -198,27 +450,29 @@ function closeDb() {
  * @param {Array<{id, event_type, ledger, timestamp, contract_id, payload}>} events
  * @param {{ checkpoint?: string, ledger?: number }} [opts]
  */
-function upsertEvents(events, opts = {}) {
+async function upsertEvents(events, opts = {}) {
   if (!events.length && !opts.checkpoint) return;
-  withTransaction(() => {
-    if (events.length) {
-      const stmt = db.prepare(
-        'INSERT OR IGNORE INTO events (id, event_type, ledger, timestamp, contract_id, payload) VALUES (?,?,?,?,?,?)'
-      );
-      const markStmt = db.prepare(
-        'INSERT OR IGNORE INTO processed_events (id, ledger, processed_at) VALUES (?,?,?)'
-      );
-      const now = new Date().toISOString();
-      for (const e of events) {
-        stmt.run([e.id, e.event_type, e.ledger, e.timestamp, e.contract_id, JSON.stringify(e.payload)]);
-        markStmt.run([e.id, e.ledger, now]);
+  await withWriteLock(() => {
+    withTransaction(() => {
+      if (events.length) {
+        const stmt = db.prepare(
+          'INSERT OR IGNORE INTO events (id, event_type, ledger, timestamp, contract_id, payload) VALUES (?,?,?,?,?,?)'
+        );
+        const markStmt = db.prepare(
+          'INSERT OR IGNORE INTO processed_events (id, ledger, processed_at) VALUES (?,?,?)'
+        );
+        const now = new Date().toISOString();
+        for (const e of events) {
+          stmt.run([e.id, e.event_type, e.ledger, e.timestamp, e.contract_id, JSON.stringify(e.payload)]);
+          markStmt.run([e.id, e.ledger, now]);
+        }
+        stmt.free();
+        markStmt.free();
       }
-      stmt.free();
-      markStmt.free();
-    }
-    if (opts.checkpoint) {
-      setCheckpoint(opts.checkpoint, opts.ledger != null ? opts.ledger : getLatestLedger());
-    }
+      if (opts.checkpoint) {
+        setCheckpoint(opts.checkpoint, opts.ledger != null ? opts.ledger : getLatestLedger());
+      }
+    });
   });
 }
 
@@ -294,6 +548,8 @@ function queryEvents({ event_type, limit = 100, offset = 0 } = {}) {
     const obj = {};
     columns.forEach((col, i) => { obj[col] = row[i]; });
     obj.payload = JSON.parse(obj.payload);
+    // Rows written before schema versioning are upgraded on read.
+    if (obj.event_type === 'VaccinationMinted') obj.payload = toIndexedMint(obj.payload);
     return obj;
   });
 }
@@ -307,12 +563,14 @@ function getLatestLedger() {
 
 // ── API key CRUD ──────────────────────────────────────────────────────────────
 
-function insertApiKey({ id, key_hash, label, created_at }) {
-  withTransaction(() => {
-    db.run(
-      'INSERT INTO api_keys (id, key_hash, label, created_at, revoked) VALUES (?,?,?,?,0)',
-      [id, key_hash, label, created_at]
-    );
+async function insertApiKey({ id, key_hash, label, created_at }) {
+  await withWriteLock(() => {
+    withTransaction(() => {
+      db.run(
+        'INSERT INTO api_keys (id, key_hash, label, created_at, revoked) VALUES (?,?,?,?,0)',
+        [id, key_hash, label, created_at]
+      );
+    });
   });
 }
 
@@ -336,20 +594,84 @@ function listApiKeys() {
   });
 }
 
-function revokeApiKey(id) {
-  withTransaction(() => {
-    db.run('UPDATE api_keys SET revoked = 1 WHERE id = ?', [id]);
+async function revokeApiKey(id) {
+  await withWriteLock(() => {
+    withTransaction(() => {
+      db.run('UPDATE api_keys SET revoked = 1 WHERE id = ?', [id]);
+    });
   });
 }
 
+// ── Retention / purge jobs ───────────────────────────────────────────────────
+
+/**
+ * Delete indexed event rows older than the configured retention period.
+ * Rows at or below the recovery checkpoint ledger are always preserved.
+ * @param {{ now?: number, retentionDays?: number }} opts
+ * @returns {{ deleted: number, cutoff: number, protectedLedger: number }}
+ */
+function purgeIndexedEvents({ now = Date.now(), retentionDays } = {}) {
+  const days = retentionDays != null
+    ? retentionDays
+    : RETENTION_POLICY.indexed_events.retentionDays;
+  const cutoff = now - days * DAY_MS;
+
+  const before = db.exec('SELECT COUNT(*) FROM events')[0].values[0][0];
+  db.run(
+    'DELETE FROM events WHERE timestamp < ? AND ledger > ?',
+    [cutoff, recoveryCheckpointLedger]
+  );
+  const after = db.exec('SELECT COUNT(*) FROM events')[0].values[0][0];
+  flush();
+  return { deleted: before - after, cutoff, protectedLedger: recoveryCheckpointLedger };
+}
+
+/**
+ * Purge transient operational data (revoked API keys older than retention).
+ * Audit, consent and issuer records are never touched.
+ * @param {{ now?: number, retentionDays?: number }} opts
+ * @returns {{ deleted: number, cutoff: number }}
+ */
+function purgeOperationalData({ now = Date.now(), retentionDays } = {}) {
+  const days = retentionDays != null
+    ? retentionDays
+    : RETENTION_POLICY.operational_data.retentionDays;
+  const cutoffIso = new Date(now - days * DAY_MS).toISOString();
+
+  const before = db.exec('SELECT COUNT(*) FROM api_keys')[0].values[0][0];
+  db.run(
+    'DELETE FROM api_keys WHERE revoked = 1 AND created_at < ?',
+    [cutoffIso]
+  );
+  const after = db.exec('SELECT COUNT(*) FROM api_keys')[0].values[0][0];
+  flush();
+  return { deleted: before - after, cutoff: now - days * DAY_MS };
+}
+
+/**
+ * Entry point for the scheduled retention job. Runs all purgeable data-class
+ * jobs and returns a per-class summary.
+ * @param {{ now?: number }} opts
+ */
+function runRetentionJobs({ now = Date.now() } = {}) {
+  return {
+    ranAt: new Date(now).toISOString(),
+    indexed_events: purgeIndexedEvents({ now }),
+    operational_data: purgeOperationalData({ now }),
+  };
+}
+
+module.exports = { initDb, upsertEvents, queryEvents, getLatestLedger, insertApiKey, getApiKeyByHash, listApiKeys, revokeApiKey, getConsent, recordConsent, hasConsented, insertIssuerApplication, getIssuerApplication, listIssuerApplications, updateIssuerApplicationStatus, getRetentionPolicy, setRecoveryCheckpoint, getRecoveryCheckpoint, purgeIndexedEvents, purgeOperationalData, runRetentionJobs };
 // ── Patient consent ───────────────────────────────────────────────────────────
 
-function recordConsent(wallet) {
-  withTransaction(() => {
-    db.run(
-      'INSERT OR IGNORE INTO patient_consent (wallet, consented_at) VALUES (?, ?)',
-      [wallet, new Date().toISOString()]
-    );
+async function recordConsent(wallet) {
+  await withWriteLock(() => {
+    withTransaction(() => {
+      db.run(
+        'INSERT OR IGNORE INTO patient_consent (wallet, consented_at) VALUES (?, ?)',
+        [wallet, new Date().toISOString()]
+      );
+    });
   });
 }
 
@@ -368,13 +690,15 @@ function hasConsented(wallet) {
 
 // ── Issuer onboarding applications ───────────────────────────────────────────
 
-function insertIssuerApplication({ id, wallet, name, license_number, country, submitted_at }) {
-  withTransaction(() => {
-    db.run(
-      `INSERT INTO issuer_applications (id, wallet, name, license_number, country, status, submitted_at)
-       VALUES (?,?,?,?,?,'pending',?)`,
-      [id, wallet, name, license_number, country, submitted_at]
-    );
+async function insertIssuerApplication({ id, wallet, name, license_number, country, submitted_at }) {
+  await withWriteLock(() => {
+    withTransaction(() => {
+      db.run(
+        `INSERT INTO issuer_applications (id, wallet, name, license_number, country, status, submitted_at)
+         VALUES (?,?,?,?,?,'pending',?)`,
+        [id, wallet, name, license_number, country, submitted_at]
+      );
+    });
   });
 }
 
@@ -402,12 +726,14 @@ function listIssuerApplications({ status } = {}) {
   });
 }
 
-function updateIssuerApplicationStatus(id, { status, reviewer_note }) {
-  withTransaction(() => {
-    db.run(
-      'UPDATE issuer_applications SET status = ?, reviewed_at = ?, reviewer_note = ? WHERE id = ?',
-      [status, new Date().toISOString(), reviewer_note || null, id]
-    );
+async function updateIssuerApplicationStatus(id, { status, reviewer_note }) {
+  await withWriteLock(() => {
+    withTransaction(() => {
+      db.run(
+        'UPDATE issuer_applications SET status = ?, reviewed_at = ?, reviewer_note = ? WHERE id = ?',
+        [status, new Date().toISOString(), reviewer_note || null, id]
+      );
+    });
   });
 }
 
@@ -435,4 +761,10 @@ module.exports = {
   getIssuerApplication,
   listIssuerApplications,
   updateIssuerApplicationStatus,
+  // persistence / concurrency helpers (backlog #52)
+  withWriteLock,
+  isLocked,
+  flush,
+  backup,
+  registerMigration,
 };

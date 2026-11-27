@@ -6,6 +6,8 @@ This document outlines how VacciChain manages secrets in production environments
 
 Secrets (Stellar keys, JWT secret, API credentials) must never be stored in flat files, environment variables visible in `docker inspect`, or baked into container images. VacciChain supports multiple secrets management backends.
 
+This also applies to Terraform: AWS account IDs, region, state bucket names, and environment-specific values are supplied explicitly per environment (see `docs/terraform-backend.md`). Terraform state credentials (e.g. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) are **never** written into `.tf` files, committed `.tfvars` files, or backend configuration blocks. Backend configuration is passed at init time via a separate, uncommitted file (e.g. `-backend-config=backend.staging.hcl`) or environment variables, and those files are excluded via `.gitignore`.
+
 ## Supported Backends
 
 ### AWS Secrets Manager (Recommended)
@@ -138,6 +140,15 @@ cp .env.example .env
 
 2. Vault agent automatically reloads and restarts the application via the `command` hook.
 
+## Terraform State Credentials
+
+Terraform backend configuration and state credentials follow the same rules as application secrets:
+
+- **No credentials in Terraform files**: Never hardcode `access_key`, `secret_key`, `token`, or account/region values in `backend` blocks or `.tf` files.
+- **Separate backend config files**: Use per-environment files such as `backend.staging.hcl` / `backend.prod.hcl` that contain only non-secret values (bucket, key, region, dynamodb table). These are passed with `terraform init -backend-config=...` and are not committed if they contain account-specific identifiers.
+- **Credentials via environment or profile**: Provide state credentials through `AWS_PROFILE`, environment variables, or an assumed role — never through committed files.
+- **Validate per environment**: Run `terraform init -backend-config=backend.<env>.hcl` and `terraform plan` for each environment to confirm the correct state bucket is targeted before applying.
+
 ## Security Best Practices
 
 - **Never log secrets**: Ensure logging middleware redacts sensitive values
@@ -161,9 +172,12 @@ docker exec vaccichain-backend env | grep -E 'SECRET|KEY'
 
 # Check no secrets in logs
 docker logs vaccichain-backend | grep -E 'SECRET|KEY'
+
+# Check no state credentials or hardcoded backend values in Terraform files
+grep -rE 'access_key|secret_key|token|bucket\s*=' --include='*.tf' --include='*.tfvars' .
 ```
 
-All should return empty results.
+All should return empty results (the Terraform check should only match non-secret backend config files that are intentionally uncommitted).
 
 ## Troubleshooting
 
@@ -182,3 +196,5 @@ All should return empty results.
 - [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/)
 - [HashiCorp Vault](https://www.vaultproject.io/docs)
 - [ECS Secrets Integration](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/specifying-sensitive-data.html)
+- [Terraform Backend Configuration](https://developer.hashicorp.com/terraform/language/backend)
+- [Terraform Partial Configuration](https://developer.hashicorp.com/terraform/language/backend#partial-configuration)

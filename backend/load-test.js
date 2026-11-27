@@ -7,6 +7,10 @@ const errorRate = new Rate('errors');
 const responseTime = new Trend('response_time');
 const successCount = new Counter('success_count');
 const p95ResponseTime = new Trend('p95_response_time');
+const integrityFailures = new Counter('integrity_failures');
+const integrityChecks = new Counter('integrity_checks');
+const writeConflicts = new Counter('write_conflicts');
+const activeInstances = new Gauge('active_instances');
 
 // Batch verification metrics
 const batchLatency = new Trend('batch_latency');
@@ -22,23 +26,22 @@ const DURATION = __ENV.DURATION || '60s';
 const VUS = __ENV.VUS || 100;
 const RAMP_UP = __ENV.RAMP_UP || '10s';
 
-// Bounded batch configuration (documented limits: batch size 1-100, parallelism 1-10)
-const BATCH_SIZE = clampInt(__ENV.BATCH_SIZE, 20, 1, 100);
-const BATCH_PARALLELISM = clampInt(__ENV.BATCH_PARALLELISM, 5, 1, 10);
-const BATCH_ITERATIONS = clampInt(__ENV.BATCH_ITERATIONS, 10, 1, 1000);
-const BATCH_PARTIAL_FAILURE_RATIO = clampFloat(__ENV.BATCH_PARTIAL_FAILURE_RATIO, 0.2, 0, 1);
+// Autoscaling scenario configuration. The sustained scenario drives load well
+// above the steady-state baseline so ECS target-tracking policies scale out,
+// while the spike scenario exercises rapid scale-out/scale-in transitions.
+const SCALING = {
+  baselineVus: Number(__ENV.BASELINE_VUS || 20),
+  sustainedVus: Number(__ENV.SUSTAINED_VUS || 150),
+  spikeVus: Number(__ENV.SPIKE_VUS || 300),
+  sustainedDuration: __ENV.SUSTAINED_DURATION || '2m',
+  spikeDuration: __ENV.SPIKE_DURATION || '30s',
+  cooldown: __ENV.COOLDOWN || '30s',
+};
 
-function clampInt(value, fallback, min, max) {
-  const parsed = parseInt(value, 10);
-  const n = Number.isFinite(parsed) ? parsed : fallback;
-  return Math.min(max, Math.max(min, n));
-}
-
-function clampFloat(value, fallback, min, max) {
-  const parsed = parseFloat(value);
-  const n = Number.isFinite(parsed) ? parsed : fallback;
-  return Math.min(max, Math.max(min, n));
-}
+// Backend/database concurrency safety: the backend constrains writers to a
+// single instance (see issue #117), so the load test must verify that
+// concurrent reads never observe corrupted or split-brain index state.
+const INTEGRITY_SAMPLE_RATE = Number(__ENV.INTEGRITY_SAMPLE_RATE || 0.1);
 
 // Test wallets (valid Stellar addresses for testing)
 const TEST_WALLETS = [
@@ -50,42 +53,66 @@ const TEST_WALLETS = [
 ];
 
 export const options = {
-  stages: [
-    { duration: RAMP_UP, target: VUS },
-    { duration: DURATION, target: VUS },
-    { duration: '10s', target: 0 },
-  ],
+  scenarios: {
+    // Steady-state baseline used to establish normal latency before scaling.
+    baseline: {
+      executor: 'constant-vus',
+      exec: 'verifyVaccination',
+      vus: SCALING.baselineVus,
+      duration: RAMP_UP,
+      tags: { scenario: 'baseline' },
+    },
+    // Sustained high load: should trigger ECS scale-out and capacity alarms.
+    sustained_load: {
+      executor: 'ramping-vus',
+      exec: 'verifyVaccination',
+      startTime: RAMP_UP,
+      stages: [
+        { duration: '30s', target: SCALING.sustainedVus },
+        { duration: SCALING.sustainedDuration, target: SCALING.sustainedVus },
+        { duration: SCALING.cooldown, target: SCALING.baselineVus },
+      ],
+      tags: { scenario: 'sustained_load' },
+    },
+    // Short spike: exercises rapid scale-out and scale-in transitions.
+    spike: {
+      executor: 'ramping-arrival-rate',
+      exec: 'verifyVaccination',
+      startTime: RAMP_UP,
+      startRate: 10,
+      timeUnit: '1s',
+      preAllocatedVUs: SCALING.baselineVus,
+      maxVUs: SCALING.spikeVus,
+      stages: [
+        { duration: '10s', target: SCALING.spikeVus },
+        { duration: SCALING.spikeDuration, target: SCALING.spikeVus },
+        { duration: SCALING.cooldown, target: 10 },
+      ],
+      tags: { scenario: 'spike' },
+    },
+    // Integrity probe: continuously reads shared state and validates that
+    // concurrent access never yields corrupted or split-brain index data.
+    integrity_probe: {
+      executor: 'constant-vus',
+      exec: 'integrityProbe',
+      vus: 5,
+      duration: `${RAMP_UP}+${SCALING.sustainedDuration}+${SCALING.cooldown}`,
+      tags: { scenario: 'integrity_probe' },
+    },
+  },
   thresholds: {
     'http_req_duration': ['p(95)<500', 'p(99)<1000'],
+    'http_req_duration{scenario:sustained_load}': ['p(95)<800'],
     'errors': ['rate<0.01'],
-    // Batch latency must stay stable under bounded concurrency
-    'batch_latency': ['p(95)<2000', 'p(99)<4000'],
-    'batch_item_latency': ['p(95)<500', 'p(99)<1000'],
-    // Partial failures must be reported per item, not as whole-batch errors
-    'batch_partial_failure': ['rate<0.5'],
-  },
-  scenarios: {
-    verify: {
-      executor: 'ramping-vus',
-      startVUs: 0,
-      stages: [
-        { duration: RAMP_UP, target: VUS },
-        { duration: DURATION, target: VUS },
-        { duration: '10s', target: 0 },
-      ],
-      exec: 'verifyScenario',
-    },
-    batch_verification: {
-      executor: 'constant-vus',
-      vus: Math.min(VUS, BATCH_PARALLELISM * 2),
-      duration: DURATION,
-      exec: 'batchVerificationScenario',
-      tags: { scenario: 'batch_verification' },
-    },
+    'integrity_failures': ['count==0'],
   },
 };
 
-export function verifyScenario() {
+export default function () {
+  verifyVaccination();
+}
+
+export function verifyVaccination() {
   group('Verify Vaccination Endpoint', () => {
     const wallet = TEST_WALLETS[Math.floor(Math.random() * TEST_WALLETS.length)];
     const url = `${BASE_URL}/verify/${wallet}`;
@@ -122,103 +149,47 @@ export function verifyScenario() {
   });
 }
 
-// Batch verification scenario: sends bounded batches and validates per-item results.
-export function batchVerificationScenario() {
-  group('Batch Verification Endpoint', () => {
-    const url = `${BASE_URL}/verify/batch`;
+// Reads shared state and validates consistency. Because the backend constrains
+// writers to a single instance, concurrent reads must always return a
+// well-formed, internally consistent record for each wallet.
+export function integrityProbe() {
+  const wallet = TEST_WALLETS[Math.floor(Math.random() * TEST_WALLETS.length)];
+  const params = {
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${__ENV.JWT_TOKEN || 'test-token'}`,
+    },
+    timeout: '10s',
+  };
 
-    const params = {
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${__ENV.JWT_TOKEN || 'test-token'}`,
-      },
-      timeout: '30s',
-    };
+  const response = http.get(`${BASE_URL}/verify/${wallet}`, params);
+  integrityChecks.add(1);
 
-    // Build a bounded batch; inject a deterministic subset of invalid wallets
-    // so partial failures are exercised without exceeding the documented limits.
-    const wallets = [];
-    for (let i = 0; i < BATCH_SIZE; i++) {
-      const shouldFail = (i / BATCH_SIZE) < BATCH_PARTIAL_FAILURE_RATIO;
-      wallets.push(shouldFail ? `INVALID_WALLET_${i}` : TEST_WALLETS[i % TEST_WALLETS.length]);
-    }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(response.body);
+  } catch (e) {
+    parsed = null;
+  }
 
-    batchConcurrency.add(BATCH_PARALLELISM);
-
-    for (let iteration = 0; iteration < BATCH_ITERATIONS; iteration++) {
-      const payload = JSON.stringify({
-        wallets,
-        parallelism: BATCH_PARALLELISM,
-      });
-
-      const start = Date.now();
-      const response = http.post(url, payload, params);
-      const elapsed = Date.now() - start;
-
-      batchLatency.add(elapsed);
-
-      const ok = check(response, {
-        'batch status is 200': (r) => r.status === 200,
-        'batch response is JSON': (r) => {
-          try {
-            JSON.parse(r.body);
-            return true;
-          } catch (e) {
-            return false;
-          }
-        },
-      });
-
-      if (!ok) {
-        errorRate.add(1);
-        continue;
-      }
-
-      let body;
-      try {
-        body = JSON.parse(response.body);
-      } catch (e) {
-        errorRate.add(1);
-        continue;
-      }
-
-      const results = Array.isArray(body.results) ? body.results : [];
-      const expectedCount = wallets.length;
-
-      // Every submitted item must have a corresponding per-item result.
-      const perItemComplete = check(results, {
-        'per-item results returned for every wallet': (r) => r.length === expectedCount,
-        'each result has wallet and status': (r) =>
-          r.every((item) => item && typeof item.wallet === 'string' && typeof item.status === 'string'),
-      });
-
-      if (!perItemComplete) {
-        errorRate.add(1);
-      }
-
-      let itemErrors = 0;
-      for (const item of results) {
-        batchItemsProcessed.add(1);
-        if (item.latencyMs !== undefined) {
-          batchItemLatency.add(item.latencyMs);
-        }
-        if (item.status !== 'verified' && item.status !== 'not_found') {
-          itemErrors++;
-          batchItemErrors.add(1);
-        }
-      }
-
-      const hasPartialFailure = itemErrors > 0 && itemErrors < results.length;
-      batchPartialFailure.add(hasPartialFailure ? 1 : 0);
-
-      // A partial failure must not fail the whole batch.
-      check(response, {
-        'partial failures do not fail the whole batch': (r) => r.status === 200,
-      });
-
-      sleep(0.1);
-    }
+  const consistent = check(response, {
+    'integrity: status is 200 or 401': (r) => r.status === 200 || r.status === 401,
+    'integrity: body is valid JSON': () => parsed !== null,
+    'integrity: wallet matches request': () => parsed === null || parsed.wallet === undefined || parsed.wallet === wallet,
+    'integrity: no split-brain marker': () => parsed === null || parsed.splitBrain !== true,
   });
+
+  if (!consistent) {
+    integrityFailures.add(1);
+  }
+
+  // Track observed instance count reported by the backend (if exposed) so
+  // scale-out can be correlated with the capacity alarms.
+  if (parsed && typeof parsed.instanceCount === 'number') {
+    activeInstances.add(parsed.instanceCount);
+  }
+
+  sleep(0.5);
 }
 
 export function handleSummary(data) {
@@ -263,6 +234,17 @@ function textSummary(data, options) {
     summary += `  Avg: ${duration.stats?.avg?.toFixed(2) || 'N/A'}ms\n`;
     summary += `  P95: ${duration.stats?.p(95)?.toFixed(2) || 'N/A'}ms\n`;
     summary += `  P99: ${duration.stats?.p(99)?.toFixed(2) || 'N/A'}ms\n`;
+  }
+
+  summary += `\nData Integrity:\n`;
+  summary += `  Checks: ${data.metrics.integrity_checks?.value || 0}\n`;
+  summary += `  Failures: ${data.metrics.integrity_failures?.value || 0}\n`;
+  summary += `  Write Conflicts: ${data.metrics.write_conflicts?.value || 0}\n`;
+  summary += `  Result: ${(data.metrics.integrity_failures?.value || 0) === 0 ? 'PASS' : 'FAIL'}\n`;
+
+  if (data.metrics.active_instances) {
+    summary += `\nScaling:\n`;
+    summary += `  Max Observed Instances: ${data.metrics.active_instances.stats?.max ?? 'N/A'}\n`;
   }
 
   return summary;

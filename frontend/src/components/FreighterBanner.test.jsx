@@ -58,4 +58,53 @@ describe('FreighterBanner', () => {
     const banner = screen.getByText(/Freighter wallet not detected/i).closest('div');
     expect(banner).toHaveStyle({ background: '#7c3aed', color: '#fff' });
   });
+
+  it('shows banner again after wallet disconnect', () => {
+    useAuth.mockReturnValue({ freighterInstalled: true });
+    const { rerender } = render(<FreighterBanner />);
+    expect(screen.queryByText(/Freighter wallet not detected/i)).not.toBeInTheDocument();
+
+    // Wallet disconnects / extension becomes unavailable
+    useAuth.mockReturnValue({ freighterInstalled: false });
+    rerender(<FreighterBanner />);
+    expect(screen.getByText(/Freighter wallet not detected/i)).toBeInTheDocument();
+  });
+
+  it('hides banner after wallet reconnect', () => {
+    useAuth.mockReturnValue({ freighterInstalled: false });
+    const { rerender } = render(<FreighterBanner />);
+    expect(screen.getByText(/Freighter wallet not detected/i)).toBeInTheDocument();
+
+    useAuth.mockReturnValue({ freighterInstalled: true });
+    rerender(<FreighterBanner />);
+    expect(screen.queryByText(/Freighter wallet not detected/i)).not.toBeInTheDocument();
+  });
+
+  it('reflects current wallet state after account change', () => {
+    useAuth.mockReturnValue({ freighterInstalled: false, publicKey: 'GABC123' });
+    const { rerender } = render(<FreighterBanner />);
+    expect(screen.getByText(/Freighter wallet not detected/i)).toBeInTheDocument();
+
+    // Account changes while wallet remains unavailable
+    useAuth.mockReturnValue({ freighterInstalled: false, publicKey: 'GDEF456' });
+    rerender(<FreighterBanner />);
+    expect(screen.getByText(/Freighter wallet not detected/i)).toBeInTheDocument();
+
+    // Wallet becomes available for the new account
+    useAuth.mockReturnValue({ freighterInstalled: true, publicKey: 'GDEF456' });
+    rerender(<FreighterBanner />);
+    expect(screen.queryByText(/Freighter wallet not detected/i)).not.toBeInTheDocument();
+  });
+
+  it('resets dismissed state when wallet state changes', () => {
+    useAuth.mockReturnValue({ freighterInstalled: false });
+    const { rerender } = render(<FreighterBanner />);
+    fireEvent.click(screen.getByRole('button', { name: /Dismiss/i }));
+    expect(screen.queryByText(/Freighter wallet not detected/i)).not.toBeInTheDocument();
+
+    // Wallet disconnects again - banner should reflect the current state
+    useAuth.mockReturnValue({ freighterInstalled: false, publicKey: null });
+    rerender(<FreighterBanner />);
+    expect(screen.getByText(/Freighter wallet not detected/i)).toBeInTheDocument();
+  });
 });

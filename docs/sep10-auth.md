@@ -67,9 +67,23 @@ Two independent layers prevent a captured challenge from being reused:
 
 **Nonce store** ([`backend/src/stellar/nonceStore.js`](../backend/src/stellar/nonceStore.js))
 
-- On challenge creation, the nonce is stored in memory with a 5-minute TTL.
-- On verification, `consume()` atomically reads and deletes the nonce. A second attempt with the same nonce throws `"Invalid or already used nonce"`.
-- A background interval purges expired entries every 60 seconds.
+- On challenge creation, the nonce is persisted with a 5-minute TTL.
+- On verification, `consume()` performs an atomic read-and-delete (Redis `GETDEL` / in-memory compare-and-delete). Exactly one caller can ever win the race, so simultaneous verify requests for the same nonce result in a single success; every other attempt throws `"Invalid or already used nonce"`.
+- Expiry is enforced by the store itself (Redis key TTL / in-memory expiry timestamp), not only by the background sweeper, so a nonce can never be accepted after its TTL even if the sweeper is delayed.
+- A background interval purges expired in-memory entries every 60 seconds; Redis entries expire automatically.
+
+**Store backend selection**
+
+The backend is chosen with the `NONCE_STORE_BACKEND` environment variable:
+
+| Value | Behaviour |
+|---|---|
+| `redis` (default in production) | Nonces live in Redis via `REDIS_URL`, shared by every instance. Required for multi-instance / horizontally scaled deployments. |
+| `memory` | Process-local `Map`. Intended for local development and single-process tests only — challenges issued by one instance cannot be verified by another. |
+
+**Fail-closed behaviour**
+
+If the configured store is unavailable (Redis connection error, timeout, or misconfiguration), challenge creation and verification both fail with `503 Service Unavailable` and an explicit error code (`NONCE_STORE_UNAVAILABLE`). The server never falls back to in-memory storage, never treats a failed lookup as "nonce valid", and never issues a challenge it cannot later verify. Store errors are logged and counted in metrics so outages are visible.
 
 **Transaction time bounds**
 
@@ -84,7 +98,7 @@ Both checks must pass. Either one alone is sufficient to block replay, but both 
 
 `verifyChallenge` in [`backend/src/stellar/sep10.js`](../backend/src/stellar/sep10.js) performs these checks in order:
 
-1. **Consume nonce** — fails fast if unknown, expired, or already used.
+1. **Consume nonce** — fails fast if unknown, expired, or already used. If the nonce store is unreachable the request is rejected with `503` rather than being allowed through.
 2. **Parse with network passphrase** — rejects transactions built for a different network.
 3. **Sequence number is 0** — confirms the transaction was never submitted.
 4. **Time bounds** — rejects expired challenges.
@@ -120,7 +134,7 @@ Brute-force protection ([`backend/src/middleware/bruteForce.js`](../backend/src/
 | File | Purpose |
 |---|---|
 | `backend/src/stellar/sep10.js` | `buildChallenge` and `verifyChallenge` — core SEP-10 logic |
-| `backend/src/stellar/nonceStore.js` | In-memory nonce store with TTL and single-use enforcement |
+| `backend/src/stellar/nonceStore.js` | Nonce store (Redis or in-memory) with TTL, atomic single-use enforcement, and fail-closed error handling |
 | `backend/src/routes/auth.js` | `POST /v1/auth/sep10` and `POST /v1/auth/verify` route handlers |
 | `backend/src/middleware/auth.js` | JWT validation middleware used on protected routes |
 | `frontend/src/hooks/useFreighter.js` | Client-side wallet connect and SEP-10 signing flow |

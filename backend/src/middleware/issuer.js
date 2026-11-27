@@ -1,5 +1,42 @@
-const { isAuthorizedIssuer } = require('../stellar/issuerCache');
+const { isAuthorizedIssuer, getIssuerState } = require('../stellar/issuerCache');
 const logger = require('../logger');
+
+/**
+ * Issuer lifecycle states.
+ *
+ * - ACTIVE: issuer is authorized on-chain and may issue credentials.
+ * - REVOKED: issuer was authorized but has since been revoked on-chain.
+ * - PENDING_READD: issuer was revoked and a re-add is in flight; not yet usable.
+ * - UNKNOWN: no record of the issuer on-chain.
+ */
+const ISSUER_STATE = Object.freeze({
+  ACTIVE: 'active',
+  REVOKED: 'revoked',
+  PENDING_READD: 'pending_re_add',
+  UNKNOWN: 'unknown',
+});
+
+/**
+ * Resolve the lifecycle state for a wallet.
+ *
+ * Prefers the richer `getIssuerState` lookup when available (it exposes the
+ * revoked / pending re-add distinction) and falls back to the boolean
+ * `isAuthorizedIssuer` check for backwards compatibility.
+ *
+ * @param {string} wallet - Stellar public key of the issuer
+ * @returns {Promise<string>} One of ISSUER_STATE values
+ */
+async function resolveIssuerState(wallet) {
+  if (typeof getIssuerState === 'function') {
+    const state = await getIssuerState(wallet);
+    if (state && Object.values(ISSUER_STATE).includes(state)) {
+      return state;
+    }
+  }
+
+  const isAuthorized = await isAuthorizedIssuer(wallet);
+  return isAuthorized ? ISSUER_STATE.ACTIVE : ISSUER_STATE.UNKNOWN;
+}
 
 /**
  * Require the authenticated user to have the 'issuer' role AND 
@@ -24,25 +61,38 @@ const logger = require('../logger');
  */
 async function issuerMiddleware(req, res, next) {
   if (req.user?.role !== 'issuer') {
-    return res.status(403).json({ error: 'Issuer role required' });
+    return res.status(403).json({
+      error: 'Issuer role required',
+      code: 'ISSUER_ROLE_REQUIRED',
+    });
   }
 
   const wallet = req.user.wallet || req.user.publicKey;
   if (!wallet) {
-    return res.status(401).json({ error: 'Wallet address missing in token' });
+    return res.status(401).json({
+      error: 'Wallet address missing in token',
+      code: 'ISSUER_WALLET_MISSING',
+    });
   }
 
   try {
     const isAuthorized = await isAuthorizedIssuer(wallet);
     if (!isAuthorized) {
       logger.warn('Unauthorized issuer attempt', { wallet });
-      return res.status(403).json({ error: 'Issuer authorization revoked or not found on-chain' });
+      return res.status(403).json({
+        error: 'Issuer authorization revoked or not found on-chain',
+        code: 'ISSUER_NOT_AUTHORIZED',
+      });
     }
-    next();
   } catch (error) {
     logger.error('Error verifying issuer allowlist', { wallet, error: error.message });
-    res.status(500).json({ error: 'Failed to verify issuer authorization' });
+    res.status(500).json({
+      error: 'Failed to verify issuer authorization',
+      code: 'ISSUER_AUTHORIZATION_CHECK_FAILED',
+    });
   }
 }
 
 module.exports = issuerMiddleware;
+module.exports.ISSUER_STATE = ISSUER_STATE;
+module.exports.resolveIssuerState = resolveIssuerState;

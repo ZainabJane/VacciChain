@@ -80,9 +80,7 @@ async def batch_verify(request: Request, body: BatchVerifyRequest):
     async def verify_one(client: httpx.AsyncClient, wallet: str) -> WalletResult:
         async with semaphore:
             try:
-                res = await client.get(
-                    f"{BACKEND_URL}/verify/{wallet}", timeout=10, headers=headers
-                )
+                res = await client.get(f"{BACKEND_URL}/v1/verify/{wallet}", timeout=10)
                 data = res.json()
                 return WalletResult(
                     wallet=wallet,

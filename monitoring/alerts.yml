@@ -7,11 +7,13 @@ groups:
         for: 2m
         labels:
           severity: critical
+          owner: sre-oncall
         annotations:
           summary: "VacciChain service down: {{ $labels.instance }}"
           description: >
             {{ $labels.instance }} (env={{ $labels.env }}) has been unreachable
             for more than 2 minutes.
+          runbook_url: "monitoring/runbooks/service-down.md"
 
       # Warn if response time exceeds 3 seconds
       - alert: ServiceSlowResponse
@@ -19,11 +21,13 @@ groups:
         for: 5m
         labels:
           severity: warning
+          owner: sre-oncall
         annotations:
           summary: "Slow response: {{ $labels.instance }}"
           description: >
             {{ $labels.instance }} response time is {{ $value | humanizeDuration }},
             exceeding the 3s threshold.
+          runbook_url: "monitoring/runbooks/service-slow-response.md"
 
       # Alert if health endpoint returns degraded status (503)
       - alert: ServiceDegraded
@@ -31,11 +35,316 @@ groups:
         for: 2m
         labels:
           severity: warning
+          owner: sre-oncall
         annotations:
           summary: "VacciChain service degraded: {{ $labels.instance }}"
           description: >
             {{ $labels.instance }} is returning HTTP 503 (degraded).
             Soroban RPC may be unreachable.
+          runbook_url: "monitoring/runbooks/service-degraded.md"
+
+  - name: vaccichain_slo_recording
+    rules:
+      # SLI: backend latency p95 (seconds) over a 5m window
+      - record: slo:backend_latency:p95
+        expr: histogram_quantile(0.95, sum by (le, job, env) (rate(http_request_duration_seconds_bucket{job="vaccichain-backend"}[5m])))
+
+      # SLI: backend error rate (ratio of 5xx responses to total) over a 5m window
+      - record: slo:backend_error_rate
+        expr: >
+          sum by (job, env) (rate(http_requests_total{job="vaccichain-backend", status=~"5.."}[5m]))
+          /
+          sum by (job, env) (rate(http_requests_total{job="vaccichain-backend"}[5m]))
+
+      # SLI: poller lag in seconds (time since last successful poll)
+      - record: slo:poller_lag_seconds
+        expr: time() - max by (job, env) (vaccichain_poller_last_success_timestamp_seconds)
+
+      # SLI: data freshness in seconds (age of the most recent indexed ledger)
+      - record: slo:data_freshness_seconds
+        expr: time() - max by (job, env) (vaccichain_indexer_last_ledger_timestamp_seconds)
+
+  - name: vaccichain_slo_alerts
+    rules:
+      # Latency objective: p95 backend latency must stay under 1s
+      - alert: BackendLatencySLOBreach
+        expr: slo:backend_latency:p95 > 1
+        for: 10m
+        labels:
+          severity: warning
+          owner: backend-team
+        annotations:
+          summary: "Backend latency SLO breach (p95 > 1s)"
+          description: >
+            Backend p95 latency is {{ $value | humanizeDuration }} (env={{ $labels.env }}),
+            exceeding the 1s SLO objective for more than 10 minutes.
+          runbook_url: "monitoring/runbooks/backend-latency-slo.md"
+
+      # Latency objective (critical): p95 backend latency above 2s
+      - alert: BackendLatencySLOCritical
+        expr: slo:backend_latency:p95 > 2
+        for: 5m
+        labels:
+          severity: critical
+          owner: backend-team
+        annotations:
+          summary: "Backend latency SLO critical breach (p95 > 2s)"
+          description: >
+            Backend p95 latency is {{ $value | humanizeDuration }} (env={{ $labels.env }}),
+            exceeding the 2s critical threshold for more than 5 minutes.
+          runbook_url: "monitoring/runbooks/backend-latency-slo.md"
+
+      # Error-rate objective: 5xx ratio must stay under 1%
+      - alert: BackendErrorRateSLOBreach
+        expr: slo:backend_error_rate > 0.01
+        for: 10m
+        labels:
+          severity: warning
+          owner: backend-team
+        annotations:
+          summary: "Backend error rate SLO breach (> 1%)"
+          description: >
+            Backend 5xx error rate is {{ $value | humanizePercentage }} (env={{ $labels.env }}),
+            exceeding the 1% SLO objective for more than 10 minutes.
+          runbook_url: "monitoring/runbooks/backend-error-rate-slo.md"
+
+      # Error-rate objective (critical): 5xx ratio above 5%
+      - alert: BackendErrorRateSLOCritical
+        expr: slo:backend_error_rate > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          owner: backend-team
+        annotations:
+          summary: "Backend error rate SLO critical breach (> 5%)"
+          description: >
+            Backend 5xx error rate is {{ $value | humanizePercentage }} (env={{ $labels.env }}),
+            exceeding the 5% critical threshold for more than 5 minutes.
+          runbook_url: "monitoring/runbooks/backend-error-rate-slo.md"
+
+      # Poller-lag objective: lag must stay under 60s
+      - alert: PollerLagSLOBreach
+        expr: slo:poller_lag_seconds > 60
+        for: 5m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "Poller lag SLO breach (> 60s)"
+          description: >
+            Poller lag is {{ $value | humanizeDuration }} (env={{ $labels.env }}),
+            exceeding the 60s SLO objective for more than 5 minutes.
+          runbook_url: "monitoring/runbooks/poller-lag-slo.md"
+
+      # Poller-lag objective (critical): lag above 300s
+      - alert: PollerLagSLOCritical
+        expr: slo:poller_lag_seconds > 300
+        for: 2m
+        labels:
+          severity: critical
+          owner: indexer-team
+        annotations:
+          summary: "Poller lag SLO critical breach (> 300s)"
+          description: >
+            Poller lag is {{ $value | humanizeDuration }} (env={{ $labels.env }}),
+            exceeding the 300s critical threshold for more than 2 minutes.
+          runbook_url: "monitoring/runbooks/poller-lag-slo.md"
+
+      # Data-freshness objective: indexed data must be under 120s old
+      - alert: DataFreshnessSLOBreach
+        expr: slo:data_freshness_seconds > 120
+        for: 5m
+        labels:
+          severity: warning
+          owner: indexer-team
+        annotations:
+          summary: "Data freshness SLO breach (> 120s)"
+          description: >
+            Indexed data is {{ $value | humanizeDuration }} old (env={{ $labels.env }}),
+            exceeding the 120s SLO objective for more than 5 minutes.
+          runbook_url: "monitoring/runbooks/data-freshness-slo.md"
+
+      # Data-freshness objective (critical): indexed data above 600s old
+      - alert: DataFreshnessSLOCritical
+        expr: slo:data_freshness_seconds > 600
+        for: 2m
+        labels:
+          severity: critical
+          owner: indexer-team
+        annotations:
+          summary: "Data freshness SLO critical breach (> 600s)"
+          description: >
+            Indexed data is {{ $value | humanizeDuration }} old (env={{ $labels.env }}),
+            exceeding the 600s critical threshold for more than 2 minutes.
+          runbook_url: "monitoring/runbooks/data-freshness-slo.md"
+
+  # ---------------------------------------------------------------------------
+  # ECS capacity alarms (Backlog #116)
+  #
+  # These rules mirror the CloudWatch alarms defined in
+  # infrastructure/terraform/ecs_autoscaling.tf and are evaluated against the
+  # cloudwatch_exporter metrics (aws_ecs_*). Thresholds are aligned with the
+  # per-service scaling policies:
+  #
+  #   service        min  max  cpu_target  mem_target  scale_out_cooldown  scale_in_cooldown
+  #   api            2    10   60%         70%         60s                 300s
+  #   worker         1    6    70%         75%         120s                300s
+  #   scheduler      1    2    50%         60%         300s                600s
+  #
+  # Cost limits: max task counts above are the hard cost ceilings per service.
+  # ---------------------------------------------------------------------------
+
+  - name: vaccichain_ecs_capacity
+    rules:
+      # CPU utilization above the scale-out target for a sustained period.
+      # Indicates autoscaling is not keeping up (or has hit the max count).
+      - alert: ECSServiceHighCPU
+        expr: >
+          aws_ecs_cpuutilization_average{service=~"api|worker|scheduler"}
+            >
+          (aws_ecs_cpuutilization_average{service="api"}      * 0 + 60
+           or aws_ecs_cpuutilization_average{service="worker"}   * 0 + 70
+           or aws_ecs_cpuutilization_average{service="scheduler"} * 0 + 50)
+        for: 10m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "ECS high CPU: {{ $labels.service }} ({{ $labels.cluster }})"
+          description: >
+            {{ $labels.service }} CPU utilization is {{ $value | humanize }}%,
+            above its scale-out target for more than 10 minutes. Autoscaling
+            may be at max capacity or failing to scale.
+
+      # Memory utilization above the scale-out target for a sustained period.
+      - alert: ECSServiceHighMemory
+        expr: >
+          aws_ecs_memoryutilization_average{service=~"api|worker|scheduler"}
+            >
+          (aws_ecs_memoryutilization_average{service="api"}      * 0 + 70
+           or aws_ecs_memoryutilization_average{service="worker"}   * 0 + 75
+           or aws_ecs_memoryutilization_average{service="scheduler"} * 0 + 60)
+        for: 10m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "ECS high memory: {{ $labels.service }} ({{ $labels.cluster }})"
+          description: >
+            {{ $labels.service }} memory utilization is {{ $value | humanize }}%,
+            above its scale-out target for more than 10 minutes. Risk of OOM
+            task restarts.
+
+      # Task count pinned at the configured maximum (cost ceiling reached).
+      - alert: ECSServiceAtMaxCapacity
+        expr: >
+          aws_ecs_runningtaskcount_average{service=~"api|worker|scheduler"}
+            >=
+          (aws_ecs_runningtaskcount_average{service="api"}      * 0 + 10
+           or aws_ecs_runningtaskcount_average{service="worker"}   * 0 + 6
+           or aws_ecs_runningtaskcount_average{service="scheduler"} * 0 + 2)
+        for: 15m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "ECS at max tasks: {{ $labels.service }} ({{ $labels.cluster }})"
+          description: >
+            {{ $labels.service }} is running {{ $value | humanize }} tasks,
+            at its configured maximum (cost ceiling) for more than 15 minutes.
+            Investigate load or raise the limit deliberately.
+
+      # Task count below the configured minimum (scaling or deployment issue).
+      - alert: ECSServiceBelowMinCapacity
+        expr: >
+          aws_ecs_runningtaskcount_average{service=~"api|worker|scheduler"}
+            <
+          (aws_ecs_runningtaskcount_average{service="api"}      * 0 + 2
+           or aws_ecs_runningtaskcount_average{service="worker"}   * 0 + 1
+           or aws_ecs_runningtaskcount_average{service="scheduler"} * 0 + 1)
+        for: 5m
+        labels:
+          severity: critical
+          team: devops
+        annotations:
+          summary: "ECS below min tasks: {{ $labels.service }} ({{ $labels.cluster }})"
+          description: >
+            {{ $labels.service }} is running {{ $value | humanize }} tasks,
+            below its configured minimum for more than 5 minutes. Reduced
+            redundancy or failed task placements.
+
+      # No running tasks at all for a service.
+      - alert: ECSServiceNoRunningTasks
+        expr: aws_ecs_runningtaskcount_average{service=~"api|worker|scheduler"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: devops
+        annotations:
+          summary: "ECS no running tasks: {{ $labels.service }} ({{ $labels.cluster }})"
+          description: >
+            {{ $labels.service }} has had zero running tasks for more than
+            2 minutes. The service is effectively down.
+
+      # Autoscaling activity: frequent scale-in/scale-out churn (flapping).
+      - alert: ECSServiceScalingFlapping
+        expr: >
+          increase(aws_ecs_runningtaskcount_average{service=~"api|worker|scheduler"}[30m])
+            > 0
+          and
+          changes(aws_ecs_runningtaskcount_average{service=~"api|worker|scheduler"}[30m]) > 6
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "ECS scaling flapping: {{ $labels.service }} ({{ $labels.cluster }})"
+          description: >
+            {{ $labels.service }} task count changed more than 6 times in the
+            last 30 minutes. Scaling thresholds or cooldowns may need tuning.
+
+  # ---------------------------------------------------------------------------
+  # Backend / database concurrency guardrails (Backlog #116)
+  #
+  # Autoscaling must never push shared persistence past safe concurrency
+  # limits. These alarms fire when aggregate connection usage approaches the
+  # database max_connections budget.
+  # ---------------------------------------------------------------------------
+
+  - name: vaccichain_db_concurrency
+    rules:
+      # Aggregate DB connections approaching the safe budget.
+      - alert: DatabaseConnectionSaturation
+        expr: >
+          sum(aws_rds_database_connections_average{db=~"vaccichain.*"})
+            >
+          0.8 * max(aws_rds_max_connections{db=~"vaccichain.*"})
+        for: 5m
+        labels:
+          severity: critical
+          team: devops
+        annotations:
+          summary: "Database connection saturation: {{ $labels.db }}"
+          description: >
+            Aggregate database connections are above 80% of the configured
+            max_connections budget. Autoscaling may be exceeding safe backend
+            concurrency limits; scale-in or raise the DB budget deliberately.
+
+      # Per-service connection pool usage near its cap.
+      - alert: ServiceConnectionPoolNearLimit
+        expr: >
+          aws_ecs_connectionpool_used_average{service=~"api|worker|scheduler"}
+            >
+          0.85 * aws_ecs_connectionpool_max_average{service=~"api|worker|scheduler"}
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "Connection pool near limit: {{ $labels.service }}"
+          description: >
+            {{ $labels.service }} connection pool is above 85% of its maximum.
+            Additional tasks may not obtain connections safely.
 
   - name: vaccichain_backups
     rules:
