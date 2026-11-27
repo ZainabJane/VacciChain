@@ -27,7 +27,7 @@ async def _fetch_events(event_type: str, limit: int = 500) -> list:
     """
     async with httpx.AsyncClient() as client:
         res = await client.get(
-            f"{BACKEND_URL}/events",
+            f"{BACKEND_URL}/v1/events",
             params={"event_type": event_type, "limit": limit},
             timeout=10,
         )

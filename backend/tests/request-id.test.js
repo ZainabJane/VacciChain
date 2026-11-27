@@ -29,7 +29,7 @@ describe('X-Request-ID middleware', () => {
   });
 
   it('attaches requestId to req for every route', async () => {
-    const res = await request(app).get('/verify/invalid-address');
+    const res = await request(app).get('/v1/verify/invalid-address');
     expect(res.headers['x-request-id']).toBeDefined();
   });
 });

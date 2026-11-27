@@ -1,24 +1,85 @@
 name: Deploy to Staging
 
+# NOTE: This workflow is for the STAGING environment only. It is bound to the
+# 'staging' GitHub environment, which holds staging-scoped secrets and targets
+# staging AWS resources. Production/mainnet deployments are handled by a
+# separate workflow (deploy-production.yml) that requires deliberate approval
+# via the 'production' environment's required reviewers. Do not add production
+# secrets or mainnet resource names to this workflow.
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      rollback_only:
+        description: "Skip deployment and only run the rollback job"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+# Least privilege by default: read-only repository access for all jobs.
+permissions:
+  contents: read
 
 jobs:
+  policy-guard:
+    name: Enforce staging-only deployment policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Block unapproved branches and events
+        run: |
+          set -euo pipefail
+          echo "Event: ${{ github.event_name }}"
+          echo "Ref:   ${{ github.ref }}"
+
+          if [ "${{ github.event_name }}" != "push" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "::error::Staging deploys are only allowed from push or workflow_dispatch events."
+            exit 1
+          fi
+
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Staging deploys are only allowed from the main branch (got '${{ github.ref }}')."
+            exit 1
+          fi
+
+          echo "Policy guard passed: staging deploy from main via ${{ github.event_name }}."
+
+      - name: Assert no production/mainnet references
+        run: |
+          set -euo pipefail
+          # Fail if this workflow references production/mainnet secrets or resources.
+          if grep -nEi 'AWS_ROLE_TO_ASSUME_PROD|PRODUCTION_|MAINNET|vaccichain-prod|vaccichain-mainnet' .github/workflows/deploy-staging.yml; then
+            echo "::error::Production/mainnet references detected in the staging workflow."
+            exit 1
+          fi
+          echo "No production/mainnet references found."
+
   deploy-staging:
     name: Deploy to staging environment
+    needs: policy-guard
     runs-on: ubuntu-latest
     environment:
       name: staging
       url: https://staging.vaccichain.example.com
+    # Job-level permissions: read source, mint OIDC token for AWS and
+    # provenance attestation. No write access to repository or deployments.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e034513 # v4.0.2
         with:
+          # Staging-scoped secret only; never use a production role here.
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_STAGING }}
           aws-region: ${{ vars.AWS_REGION_STAGING }}
 
@@ -72,66 +133,323 @@ jobs:
       - name: Login to Amazon ECR
 =======
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@2fc7aceee09e9e4a7105c0d060c656fad0b4f63d # v1.7.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
 
       - name: Build and push backend image
-        uses: docker/build-push-action@v5
+        id: build-backend
+        uses: docker/build-push-action@4a13e500e55cf31b7a5d59a38ab2403e0e5c6e45 # v5.1.0
         with:
           context: ./backend
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/vaccichain-backend:${{ github.sha }}
             ${{ steps.login-ecr.outputs.registry }}/vaccichain-backend:staging-latest
+          provenance: true
+          sbom: true
 
       - name: Build and push frontend image
-        uses: docker/build-push-action@v5
+        id: build-frontend
+        uses: docker/build-push-action@4a13e500e55cf31b7a5d59a38ab2403e0e5c6e45 # v5.1.0
         with:
           context: ./frontend
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/vaccichain-frontend:${{ github.sha }}
             ${{ steps.login-ecr.outputs.registry }}/vaccichain-frontend:staging-latest
+          provenance: true
+          sbom: true
 
       - name: Build and push python-service image
-        uses: docker/build-push-action@v5
+        id: build-python
+        uses: docker/build-push-action@4a13e500e55cf31b7a5d59a38ab2403e0e5c6e45 # v5.1.0
         with:
           context: ./python-service
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/vaccichain-python:${{ github.sha }}
             ${{ steps.login-ecr.outputs.registry }}/vaccichain-python:staging-latest
+          provenance: true
+          sbom: true
+
+      - name: Generate build provenance attestation — backend
+        uses: actions/attest-build-provenance@173725a1209d09b31f9d30e610e717a93e3b5f0c # v1.1.0
+        with:
+          subject-name: ${{ steps.login-ecr.outputs.registry }}/vaccichain-backend
+          subject-digest: ${{ steps.build-backend.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate build provenance attestation — frontend
+        uses: actions/attest-build-provenance@173725a1209d09b31f9d30e610e717a93e3b5f0c # v1.1.0
+        with:
+          subject-name: ${{ steps.login-ecr.outputs.registry }}/vaccichain-frontend
+          subject-digest: ${{ steps.build-frontend.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate build provenance attestation — python-service
+        uses: actions/attest-build-provenance@173725a1209d09b31f9d30e610e717a93e3b5f0c # v1.1.0
+        with:
+          subject-name: ${{ steps.login-ecr.outputs.registry }}/vaccichain-python
+          subject-digest: ${{ steps.build-python.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify artifact provenance and hashes
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          EXPECTED_REVISION: ${{ github.sha }}
+          BACKEND_DIGEST: ${{ steps.build-backend.outputs.digest }}
+          FRONTEND_DIGEST: ${{ steps.build-frontend.outputs.digest }}
+          PYTHON_DIGEST: ${{ steps.build-python.outputs.digest }}
+        run: |
+          set -euo pipefail
+          fail=0
+          verify() {
+            local name="$1" digest="$2"
+            local ref="${REGISTRY}/${name}@${digest}"
+            echo "::group::Verifying ${ref}"
+            if ! gh attestation verify "oci://${ref}" \
+                 --repo "${GITHUB_REPOSITORY}" \
+                 --source-digest "${EXPECTED_REVISION}" \
+                 --source-ref "${GITHUB_REF}"; then
+              echo "::error::Provenance verification failed for ${ref}"
+              fail=1
+            fi
+            # Confirm the immutable digest resolves and matches the built digest.
+            local resolved
+            resolved="$(aws ecr describe-images \
+              --repository-name "${name}" \
+              --image-ids imageDigest="${digest}" \
+              --query 'imageDetails[0].imageDigest' --output text)"
+            if [ "${resolved}" != "${digest}" ]; then
+              echo "::error::Digest mismatch for ${name}: expected ${digest}, got ${resolved}"
+              fail=1
+            fi
+            echo "::endgroup::"
+          }
+          verify vaccichain-backend "${BACKEND_DIGEST}"
+          verify vaccichain-frontend "${FRONTEND_DIGEST}"
+          verify vaccichain-python "${PYTHON_DIGEST}"
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::Artifact provenance verification failed; refusing to deploy."
+            exit 1
+          fi
 
       - name: Update ECS task definition — backend
         id: task-def-backend
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        uses: aws-actions/amazon-ecs-render-task-definition@a6f6c3f4b0e8f0e6c4b0f6c8e0a2b4c6d8e0f2a4 # v1.6.1
         with:
           task-definition: staging/task-definition-backend.json
           container-name: backend
-          image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-backend:${{ github.sha }}
+          image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-backend@${{ steps.build-backend.outputs.digest }}
 
       - name: Update ECS task definition — frontend
         id: task-def-frontend
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        uses: aws-actions/amazon-ecs-render-task-definition@a6f6c3f4b0e8f0e6c4b0f6c8e0a2b4c6d8e0f2a4 # v1.6.1
         with:
           task-definition: ${{ steps.task-def-backend.outputs.task-definition }}
           container-name: frontend
-          image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-frontend:${{ github.sha }}
+          image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-frontend@${{ steps.build-frontend.outputs.digest }}
 
       - name: Update ECS task definition — python-service
         id: task-def-final
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        uses: aws-actions/amazon-ecs-render-task-definition@a6f6c3f4b0e8f0e6c4b0f6c8e0a2b4c6d8e0f2a4 # v1.6.1
         with:
           task-definition: ${{ steps.task-def-frontend.outputs.task-definition }}
           container-name: python-service
-          image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-python:${{ github.sha }}
+          image: ${{ steps.login-ecr.outputs.registry }}/vaccichain-python@${{ steps.build-python.outputs.digest }}
 
-      - name: Deploy to ECS and wait for stability
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
-        with:
-          task-definition: ${{ steps.task-def-final.outputs.task-definition }}
-          service: ${{ vars.ECS_SERVICE_STAGING }}
-          cluster: ${{ vars.ECS_CLUSTER_STAGING }}
-          wait-for-service-stability: true
+      # ---------------------------------------------------------------------
+      # Blue/green (canary) deployment via CodeDeploy + ALB weighted target groups
+      #
+      # Traffic shift is defined in the CodeDeploy deployment config
+      # (staging/codedeploy-canary-config.json): 10% -> 50% -> 100%, with a
+      # configurable bake time between steps. CodeDeploy automatically rolls
+      # back to the previous (blue) task set if any health check or smoke test
+      # fails during the shift.
+      #
+      # ROLLBACK DRILL PROCEDURE (exercised with a deliberately failing release):
+      #   1. Push a commit that makes the backend health endpoint return 500
+      #      (e.g. set HEALTHCHECK_FORCE_FAIL=true in the image) to `main`.
+      #   2. Watch this workflow: the canary should shift 10% -> 50%, the ALB
+      #      health check / smoke test should fail, and CodeDeploy should
+      #      automatically roll back to the previous task set.
+      #   3. Confirm the `rollback` job below ran (triggered by `needs` failure)
+      #      and that the ALB is serving 100% traffic from the previous version.
+      #   4. Verify the alert webhook fired and the deployment summary shows
+      #      the rollback. Revert the failing commit afterwards.
+      # A manual rollback can be triggered via workflow_dispatch with
+      # `rollback_only: true`, or by re-running the `rollback` job.
+      # ---------------------------------------------------------------------
+
+      - name: Register new task definition (green)
+        id: register-task-def
+        run: |
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://${{ steps.task-def-final.outputs.task-definition }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "task-def-arn=${NEW_TASK_DEF_ARN}" >> "$GITHUB_OUTPUT"
+          echo "Registered new task definition: ${NEW_TASK_DEF_ARN}"
+
+      - name: Create CodeDeploy deployment (canary 10% -> 50% -> 100%)
+        id: codedeploy
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name vaccichain-staging \
+            --deployment-group-name vaccichain-staging \
+            --deployment-config-name vaccichain-staging-canary \
+            --revision '{
+              "revisionType": "AppSpecContent",
+              "appSpecContent": {
+                "content": "{\"version\":0.0,\"Resources\":[{\"TargetService\":{\"Type\":\"AWS::ECS::Service\",\"Properties\":{\"TaskDefinition\":\"${{ steps.register-task-def.outputs.task-def-arn }}\",\"LoadBalancerInfo\":{\"ContainerName\":\"backend\",\"ContainerPort\":8080}}}}]}"
+              }
+            }' \
+            --query 'deploymentId' \
+            --output text)
+          echo "deployment-id=${DEPLOYMENT_ID}" >> "$GITHUB_OUTPUT"
+          echo "Started CodeDeploy deployment: ${DEPLOYMENT_ID}"
+
+      - name: Wait for CodeDeploy traffic shift and health checks
+        run: |
+          aws deploy wait deployment-successful \
+            --deployment-id "${{ steps.codedeploy.outputs.deployment-id }}"
+
+      - name: Smoke test green environment
+        run: |
+          for i in $(seq 1 10); do
+            if curl -sf --max-time 10 https://staging.vaccichain.example.com/health; then
+              echo "Smoke test passed"
+              exit 0
+            fi
+            echo "Smoke test attempt ${i} failed, retrying..."
+            sleep 15
+          done
+          echo "Smoke test failed after retries" >&2
+          exit 1
+
+      - name: Validate network-specific contract configuration
+        env:
+          STELLAR_NETWORK: testnet
+          STELLAR_RPC_URL: ${{ secrets.STELLAR_TESTNET_RPC_URL }}
+          STELLAR_NETWORK_PASSPHRASE: ${{ secrets.STELLAR_TESTNET_NETWORK_PASSPHRASE }}
+          CONTRACT_ID: ${{ secrets.STELLAR_TESTNET_CONTRACT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STELLAR_NETWORK:-}" ]; then
+            echo "::error::Explicit STELLAR_NETWORK must be set (expected: testnet)"
+            exit 1
+          fi
+          if [ "$STELLAR_NETWORK" != "testnet" ]; then
+            echo "::error::Staging deployment requires STELLAR_NETWORK=testnet, got '$STELLAR_NETWORK'"
+            exit 1
+          fi
+          for var in STELLAR_RPC_URL STELLAR_NETWORK_PASSPHRASE CONTRACT_ID; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::Missing required network-specific configuration: $var"
+              exit 1
+            fi
+          done
+          echo "Network configuration validated for $STELLAR_NETWORK"
+
+      - name: Smoke test deployed contract ID and artifact hash
+        env:
+          STELLAR_NETWORK: testnet
+          STELLAR_RPC_URL: ${{ secrets.STELLAR_TESTNET_RPC_URL }}
+          STELLAR_NETWORK_PASSPHRASE: ${{ secrets.STELLAR_TESTNET_NETWORK_PASSPHRASE }}
+          CONTRACT_ID: ${{ secrets.STELLAR_TESTNET_CONTRACT_ID }}
+          EXPECTED_ARTIFACT_HASH: ${{ secrets.STELLAR_TESTNET_ARTIFACT_HASH }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EXPECTED_ARTIFACT_HASH:-}" ]; then
+            echo "::error::Missing expected artifact hash (STELLAR_TESTNET_ARTIFACT_HASH)"
+            exit 1
+          fi
+          # Confirm the contract ID is deployed on the expected network
+          if ! stellar contract inspect --id "$CONTRACT_ID" --network "$STELLAR_NETWORK" --rpc-url "$STELLAR_RPC_URL" --network-passphrase "$STELLAR_NETWORK_PASSPHRASE" > /tmp/contract-inspect.json; then
+            echo "::error::Contract $CONTRACT_ID not found on network $STELLAR_NETWORK"
+            exit 1
+          fi
+          # Confirm the deployed artifact hash matches the expected build artifact
+          ACTUAL_HASH=$(jq -r '.wasm_hash // .wasmHash // empty' /tmp/contract-inspect.json)
+          if [ -z "$ACTUAL_HASH" ]; then
+            echo "::error::Could not determine deployed artifact hash for $CONTRACT_ID"
+            exit 1
+          fi
+          if [ "$ACTUAL_HASH" != "$EXPECTED_ARTIFACT_HASH" ]; then
+            echo "::error::Artifact hash mismatch for $CONTRACT_ID: expected $EXPECTED_ARTIFACT_HASH, got $ACTUAL_HASH"
+            exit 1
+          fi
+          echo "Smoke test passed: contract $CONTRACT_ID on $STELLAR_NETWORK matches artifact hash $ACTUAL_HASH"
+
+      - name: Smoke test — analytics-to-backend via private service discovery
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECS_CLUSTER: vaccichain-staging
+          BACKEND_SERVICE_DISCOVERY_URL: ${{ vars.STAGING_BACKEND_SERVICE_DISCOVERY_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BACKEND_SERVICE_DISCOVERY_URL:-}" ]; then
+            echo "::error::STAGING_BACKEND_SERVICE_DISCOVERY_URL is not set; refusing to smoke test against an unknown endpoint."
+            exit 1
+          fi
+
+          case "$BACKEND_SERVICE_DISCOVERY_URL" in
+            *localhost*|*127.0.0.1*|*0.0.0.0*|*"[::1]"*)
+              echo "::error::Backend URL resolves to loopback ($BACKEND_SERVICE_DISCOVERY_URL); analytics must use private service discovery."
+              exit 1
+              ;;
+          esac
+
+          echo "Running isolated analytics smoke test against: $BACKEND_SERVICE_DISCOVERY_URL"
+
+          # Launch a one-off task from the analytics task definition in the private
+          # subnets so it resolves the backend via Cloud Map private DNS.
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --task-definition vaccichain-analytics-staging \
+            --launch-type FARGATE \
+            --network-configuration 'awsvpcConfiguration={subnets='"${{ vars.STAGING_PRIVATE_SUBNETS }}"',securityGroups='"${{ vars.STAGING_ANALYTICS_SMOKE_SG }}"',assignPublicIp=DISABLED}' \
+            --overrides '{
+              "containerOverrides": [{
+                "name": "analytics",
+                "command": ["python", "-m", "analytics.smoke_test", "--backend-url", "'"$BACKEND_SERVICE_DISCOVERY_URL"'"],
+                "environment": [{"name": "BACKEND_URL", "value": "'"$BACKEND_SERVICE_DISCOVERY_URL"'"}]
+              }]
+            }' \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "::error::Failed to launch analytics smoke test task."
+            exit 1
+          fi
+
+          echo "Waiting for smoke test task $TASK_ARN to stop..."
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN"
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          STOPPED_REASON=$(aws ecs describe-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].stoppedReason' \
+            --output text)
+
+          echo "Smoke test exit code: $EXIT_CODE (reason: $STOPPED_REASON)"
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "::error::Analytics smoke test failed: analytics could not reach backend at $BACKEND_SERVICE_DISCOVERY_URL (exit $EXIT_CODE)."
+            exit 1
+          fi
+
+          echo "Analytics-to-backend connectivity verified via private service discovery."
 
       - name: Post deployment summary
         run: |
@@ -140,6 +458,7 @@ jobs:
           echo "- **Deployed by:** \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **URL:** https://staging.vaccichain.example.com" >> $GITHUB_STEP_SUMMARY
           echo "- **Timestamp:** $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Note:** Production deploys are handled by a separate approval-gated workflow." >> $GITHUB_STEP_SUMMARY
 
       - name: Alert on deployment failure
         if: failure()
@@ -148,6 +467,76 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{
               "text": "🚨 Staging deployment failed for commit `${{ github.sha }}` by `${{ github.actor }}`. See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }'
+
+  rollback:
+    name: Roll back staging deployment
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    # Runs automatically when the canary deployment fails its health/smoke
+    # checks, or manually via workflow_dispatch with rollback_only: true.
+    if: >-
+      always() && (
+        needs.deploy-staging.result == 'failure' ||
+        github.event.inputs.rollback_only == 'true'
+      )
+    environment:
+      name: staging
+      url: https://staging.vaccichain.example.com
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_STAGING }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Stop in-progress CodeDeploy deployment (triggers rollback)
+        run: |
+          DEPLOYMENT_ID=$(aws deploy list-deployments \
+            --application-name vaccichain-staging \
+            --deployment-group-name vaccichain-staging \
+            --include-only-statuses InProgress \
+            --query 'deployments[0]' \
+            --output text)
+          if [ -n "${DEPLOYMENT_ID}" ] && [ "${DEPLOYMENT_ID}" != "None" ]; then
+            echo "Stopping deployment ${DEPLOYMENT_ID} to trigger rollback"
+            aws deploy stop-deployment \
+              --deployment-id "${DEPLOYMENT_ID}" \
+              --auto-rollback-enabled
+            aws deploy wait deployment-successful --deployment-id "${DEPLOYMENT_ID}" || true
+          else
+            echo "No in-progress deployment found; nothing to stop."
+          fi
+
+      - name: Verify rollback restored previous version
+        run: |
+          for i in $(seq 1 10); do
+            if curl -sf --max-time 10 https://staging.vaccichain.example.com/health; then
+              echo "Rollback verified: previous version is healthy"
+              exit 0
+            fi
+            echo "Health check attempt ${i} failed, retrying..."
+            sleep 15
+          done
+          echo "Rollback verification failed" >&2
+          exit 1
+
+      - name: Post rollback summary
+        run: |
+          echo "### Staging Rollback" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by:** \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reason:** ${{ needs.deploy-staging.result == 'failure' && 'deployment failure' || 'manual rollback' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp:** $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_STEP_SUMMARY
+
+      - name: Alert on rollback
+        if: always()
+        run: |
+          curl -sf -X POST "${{ secrets.ALERT_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "⚠️ Staging rollback executed for commit `${{ github.sha }}` by `${{ github.actor }}`. See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }'
 
   smoke-tests:

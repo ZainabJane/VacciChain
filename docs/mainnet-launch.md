@@ -5,6 +5,48 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 **Last Updated**: April 28, 2026  
 **Status**: Ready for Review
 
+> **Related**: The per-release contract release checklist (security, resource, compatibility, and artifact-integrity gates) lives in [Contract Release Checklist](./contract-release-checklist.md). Every contract release must satisfy those gates before the mainnet gates below can be signed off.
+
+---
+
+## Mandatory Mainnet Release Gate
+
+No mainnet deployment may proceed unless **all** of the following are recorded and approved. This gate is enforced by the release-gate check (`make release-gate-check` / `scripts/release-gate-check.sh`), which fails the release if any required gate is missing or unapproved.
+
+### Required Gates
+
+| Gate | Requirement | Evidence | Status |
+|------|-------------|----------|--------|
+| Security gate | Audit sign-off; all critical/high findings resolved | Audit report + remediation log | ⬜ |
+| Resource gate | Contract resource limits (CPU, memory, ledger entries) within budget | Resource test results | ⬜ |
+| Compatibility gate | Contract ABI/interface compatible with deployed backend and clients | Compatibility test results | ⬜ |
+| Artifact-integrity gate | Deployed WASM hash matches the reviewed, checksummed build artifact | Artifact checksum + hash comparison | ⬜ |
+
+### Expected Contract and Network Identifiers
+
+These identifiers must be recorded and match the deployment target exactly. A mismatch is an automatic **No-Go**.
+
+| Identifier | Expected Value | Recorded Value | Verified |
+|------------|----------------|----------------|----------|
+| Network | `mainnet` | _______________ | ⬜ |
+| Network passphrase | `Public Global Stellar Network ; September 2015` | _______________ | ⬜ |
+| Horizon URL | `https://horizon.stellar.org` | _______________ | ⬜ |
+| Soroban RPC URL | _______________ (official mainnet RPC) | _______________ | ⬜ |
+| Contract ID | _______________ (reviewed release artifact) | _______________ | ⬜ |
+| WASM artifact hash | _______________ (from artifact-integrity gate) | _______________ | ⬜ |
+
+### Recorded Approval
+
+Mainnet release cannot proceed without recorded approval from the required approvers below.
+
+| Approver Role | Name | Date | Approval |
+|---------------|------|------|----------|
+| Security Lead | _______________ | _______________ | ⬜ |
+| Dev Lead | _______________ | _______________ | ⬜ |
+| DevOps Lead | _______________ | _______________ | ⬜ |
+
+**Go/No-Go Criteria**: All four gates pass, all identifiers match the expected values, and all approvals are recorded. Otherwise the release is **No-Go**.
+
 ---
 
 ## Pre-Launch Phase (2-4 weeks before)
@@ -13,14 +55,22 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 
 | Item | Owner | Status | Notes |
 |------|-------|--------|-------|
+| Record audit scope | Security Lead | ⬜ | Document in-scope contracts, modules, and out-of-scope items (auth, storage, lifecycle, upgrade, privacy) |
+| Pin audited source revision | Dev Lead | ⬜ | Record the exact git commit SHA reviewed by the auditor |
+| Record audited WASM hash | Dev Lead | ⬜ | Record SHA-256 of the built WASM; must match the deployed artifact |
 | Contract code review by external auditor | Security Lead | ⬜ | Engage third-party auditor; allow 2-3 weeks |
+| Record audit findings | Security Lead | ⬜ | Log all findings with severity, status, and remediation links |
 | Audit report remediation | Dev Lead | ⬜ | Address all critical and high findings |
+| Independent verification of critical/high fixes | Security Lead | ⬜ | Auditor re-verifies each critical/high fix before mainnet approval |
 | Audit sign-off | Security Lead | ⬜ | Obtain written approval from auditor |
+| Privacy review sign-off | Security Lead | ⬜ | Approve minimized on-chain schema; document residual linkability risks |
+| Soulbound enforcement review | Security Lead | ⬜ | Threat model covers every ownership-changing operation; tests prove prohibited actions fail without storage mutation or misleading events |
+| Input-bound boundary tests | QA Lead | ⬜ | Zero, maximum valid, and one-over-limit tests for every public argument and stored collection |
 | Internal security review | Tech Lead | ⬜ | Review auth, key management, rate limiting |
 | Dependency vulnerability scan | DevOps | ⬜ | Run `npm audit`, `cargo audit`, `pip audit` |
 | Penetration testing (optional) | Security Lead | ⬜ | Consider for high-value deployments |
 
-**Go/No-Go Criteria**: All critical findings resolved; audit report approved.
+**Go/No-Go Criteria**: Audit scope, pinned source revision, WASM hash, and findings are recorded; all critical and high findings are fixed and independently verified; privacy review and soulbound enforcement review signed off; input-bound boundary tests pass; audit report approved.
 
 ---
 
@@ -47,17 +97,18 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 | Item | Owner | Status | Notes |
 |------|-------|--------|-------|
 | Create mainnet `.env` file | DevOps | ⬜ | Use mainnet Horizon and Soroban RPC URLs |
-| Set `STELLAR_NETWORK=mainnet` | DevOps | ⬜ | Verify network passphrase matches Stellar mainnet |
+| Set `STELLAR_NETWORK=mainnet` | DevOps | ⬜ | Explicit network selection is **required**; deployment tooling must reject missing or ambiguous network values |
 | Set `HORIZON_URL` to mainnet endpoint | DevOps | ⬜ | Use official Stellar Horizon: https://horizon.stellar.org |
 | Set `SOROBAN_RPC_URL` to mainnet endpoint | DevOps | ⬜ | Use official Soroban RPC endpoint |
 | Set `STELLAR_NETWORK_PASSPHRASE` | DevOps | ⬜ | Must be: `Public Global Stellar Network ; September 2015` |
+| Validate network-specific configuration | DevOps | ⬜ | Run the deployment tooling's network validation; it must confirm Horizon URL, Soroban RPC URL, and network passphrase all match the selected network |
 | Set admin and issuer keys in `.env` | DevOps | ⬜ | Use keys from key ceremony |
 | Set JWT_SECRET to strong random value | DevOps | ⬜ | Min 32 characters; rotate before launch |
 | Configure rate limits for production | DevOps | ⬜ | Adjust based on expected traffic |
 | Set up audit logging | DevOps | ⬜ | Configure `AUDIT_LOG_PATH` to persistent storage |
 | Verify all required env vars are set | DevOps | ⬜ | Run backend startup check |
 
-**Go/No-Go Criteria**: All environment variables configured; backend starts without errors.
+**Go/No-Go Criteria**: Network explicitly selected; network-specific configuration validated (Horizon URL, Soroban RPC URL, and passphrase all match the selected network); all environment variables configured; backend starts without errors.
 
 ---
 
@@ -67,9 +118,11 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 
 | Item | Owner | Status | Notes |
 |------|-------|--------|-------|
-| Deploy contract to mainnet | Dev Lead | ⬜ | Use `make deploy` with mainnet config |
+| Deploy contract to mainnet | Dev Lead | ⬜ | Use `make deploy` with an **explicit** network argument (e.g., `NETWORK=mainnet`); deployment must fail if the network is omitted |
+| Confirm deployment tooling validated network config | Dev Lead | ⬜ | Tooling must verify Horizon URL, Soroban RPC URL, and passphrase match the selected network before submitting |
 | Record contract ID | Dev Lead | ⬜ | Store in version control and `.env` |
 | Record deployment transaction hash | Dev Lead | ⬜ | Store in the verification package (see below) |
+| Record deployed artifact hash | Dev Lead | ⬜ | Capture the WASM hash of the deployed artifact for later verification |
 | Record reproducible WASM hash | Dev Lead | ⬜ | Rebuild from the tagged commit; hashes must match |
 | Verify contract on Stellar Expert | Dev Lead | ⬜ | Check https://stellar.expert/explorer/public |
 | Test contract functions on mainnet | QA Lead | ⬜ | Call mint, verify, revoke with test data |
@@ -79,7 +132,7 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 | Publish contract verification package | Dev Lead | ⬜ | See [Contract Verification Package](#contract-verification-package) |
 | Independent reviewer executes verification instructions | Independent Reviewer | ⬜ | Reviewer must not be the deployer; record sign-off below |
 
-**Go/No-Go Criteria**: Contract deployed; all functions callable; issuer allowlist configured; verification package published and independently verified.
+**Go/No-Go Criteria**: Network explicitly specified and validated; contract deployed; all functions callable; issuer allowlist configured; verification package published and independently verified.
 
 ---
 
@@ -107,7 +160,9 @@ The release package must be published alongside the deployment and contain:
 |------|-------|--------|-------|
 | Build backend Docker image | DevOps | ⬜ | Tag with version (e.g., `v1.0.0-mainnet`) |
 | Push image to container registry | DevOps | ⬜ | Use private registry or Docker Hub |
-| Deploy to production infrastructure | DevOps | ⬜ | Use Kubernetes, ECS, or similar |
+| Review Terraform plan | DevOps | ⬜ | CI runs `terraform fmt -check` and `terraform validate` for all environment and module directories; review the plan artifact from the isolated-credentials plan job |
+| Approve Terraform apply | DevOps | ⬜ | Apply requires manual approval of the `production` GitHub environment; plan and apply use separate scoped credentials |
+| Deploy to production infrastructure | DevOps | ⬜ | Use Kubernetes, ECS, or similar; production deploys only from approved branches/events |
 | Verify backend health endpoint | DevOps | ⬜ | `GET /health` should return `{"status":"ok"}` |
 | Verify Swagger UI is accessible | QA Lead | ⬜ | `GET /docs` should load OpenAPI spec |
 | Test SEP-10 auth flow | QA Lead | ⬜ | Generate challenge, sign, verify JWT |
@@ -159,12 +214,14 @@ The release package must be published alongside the deployment and contain:
 | End-to-end issuer flow | QA Lead | ⬜ | Issue vaccination → verify on-chain |
 | End-to-end verifier flow | QA Lead | ⬜ | Verify wallet status via public endpoint |
 | Test with real mainnet wallet | QA Lead | ⬜ | Use funded testnet wallet (if available) |
+| Contract-ID/network smoke test | QA Lead | ⬜ | Confirm the deployed contract ID exists on the expected network (query Horizon/Soroban RPC for the selected network) |
+| Contract-ID/artifact-hash smoke test | QA Lead | ⬜ | Confirm the on-chain WASM hash for the contract ID matches the recorded deployed artifact hash |
 | Verify audit logs are being written | QA Lead | ⬜ | Check audit log file for entries |
 | Test rate limiting | QA Lead | ⬜ | Verify rate limits are enforced |
 | Test error handling | QA Lead | ⬜ | Trigger errors; verify graceful responses |
 | Load test (optional) | QA Lead | ⬜ | Simulate expected traffic volume |
 
-**Go/No-Go Criteria**: All smoke tests pass; no critical errors; performance acceptable.
+**Go/No-Go Criteria**: All smoke tests pass, including confirmation that the deployed contract ID belongs to the expected network and its artifact hash matches the recorded deployment; no critical errors; performance acceptable.
 
 ---
 
@@ -178,9 +235,12 @@ The release package must be published alongside the deployment and contain:
 | Verify CORS is properly configured | Security Lead | ⬜ | Only allow trusted origins |
 | Verify rate limits are active | Security Lead | ⬜ | Test with excessive requests |
 | Verify contract is immutable | Security Lead | ⬜ | Confirm no upgrade path exists |
-| Verify soulbound enforcement | Security Lead | ⬜ | Attempt transfer; should fail |
+| Verify deployed WASM hash matches audited hash | Security Lead | ⬜ | Compare on-chain WASM hash to the hash recorded in the audit |
+| Verify soulbound enforcement | Security Lead | ⬜ | Attempt transfer, approval, clawback, and alternate entry points; all should fail without storage mutation or misleading events |
+| Verify input bounds are enforced | Security Lead | ⬜ | Confirm one-over-limit inputs are rejected for every public argument and stored collection |
+| Verify privacy-safe on-chain fields | Security Lead | ⬜ | Confirm no patient names, contact data, or unnecessary clinical details are stored on-chain |
 
-**Go/No-Go Criteria**: All security checks pass; no vulnerabilities found.
+**Go/No-Go Criteria**: All security checks pass; no vulnerabilities found; deployed WASM matches the audited revision; privacy review and soulbound enforcement verification complete.
 
 ---
 
@@ -191,13 +251,15 @@ The release package must be published alongside the deployment and contain:
 | Item | Owner | Status | Notes |
 |------|-------|--------|-------|
 | Verify all systems are running | DevOps | ⬜ | Backend, frontend, analytics, contract |
+| Confirm production environment approvals | DevOps | ⬜ | `production` GitHub environment has required reviewers and separate scoped secrets from `staging` |
+| Confirm pre-deploy policy gate passed | DevOps | ⬜ | Policy check blocks production deploys from unapproved branches and events; staging cannot reach mainnet resources |
 | Check monitoring and alerting | DevOps | ⬜ | Ensure alerts are configured |
 | Verify backup systems are in place | DevOps | ⬜ | Database backups, key backups |
 | Notify stakeholders | Product Lead | ⬜ | Send launch notification to team |
 | Prepare rollback plan | DevOps | ⬜ | Document rollback steps |
 | Have incident response team on standby | DevOps | ⬜ | Team available for 24 hours post-launch |
 
-**Go/No-Go Criteria**: All systems operational; team ready; rollback plan documented.
+**Go/No-Go Criteria**: All systems operational; team ready; rollback plan documented. Confirm the Mandatory Mainnet Release Gate is fully approved and the release-gate check passes before proceeding.
 
 ---
 
@@ -291,8 +353,20 @@ The reviewer below must be independent of the deployer and must have executed th
 
 ---
 
+## Deployment Approval and Policy Gates
+
+Production deployments are gated by the following controls:
+
+- **Separate GitHub environments** — `staging` and `production` have distinct scoped secrets. The `production` environment requires reviewer approval; staging credentials cannot access mainnet resources.
+- **Pre-deploy policy gate** — A workflow policy check blocks production deploys from unapproved branches and events (e.g., only `main` pushes and tagged releases may deploy to production).
+- **Idempotent contract deployment** — The `deploy-contracts` workflow distinguishes `deploy`, `upgrade`, and `no-op` paths. Upgrades require an explicit target contract, and the deployment manifest prevents re-runs from silently creating a second production contract.
+- **Terraform plan review** — CI runs `terraform fmt -check` and `terraform validate` for all environment and module directories, publishes a reviewable plan using isolated credentials, and requires approval before apply.
+
+---
+
 ## References
 
+- [Contract Release Checklist](./contract-release-checklist.md)
 - [Stellar Documentation](https://developers.stellar.org/)
 - [Soroban Smart Contracts](https://soroban.stellar.org/)
 - [VacciChain Architecture](../README.md)

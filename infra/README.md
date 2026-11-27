@@ -19,44 +19,140 @@ infra/
 
 - [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.6
 - AWS credentials configured (`aws configure` or environment variables)
-- AWS CLI v2 (for the bootstrap script below)
+- An S3 bucket named `vaccichain-tfstate` for remote state (create once):
+  ```bash
+  aws s3api create-bucket --bucket vaccichain-tfstate --region us-east-1
+  aws s3api put-bucket-versioning --bucket vaccichain-tfstate \
+    --versioning-configuration Status=Enabled
+  aws s3api put-bucket-encryption --bucket vaccichain-tfstate \
+    --server-side-encryption-configuration \
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}'
+  aws s3api put-public-access-block --bucket vaccichain-tfstate \
+    --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+  ```
+- A DynamoDB table for state locking (create once):
+  ```bash
+  aws dynamodb create-table \
+    --table-name vaccichain-tfstate-lock \
+    --attribute-definitions AttributeName=LockID,AttributeType=S \
+    --key-schema AttributeName=LockID,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST
+  ```
 
-### Bootstrap (once per AWS account/region)
+## Remote state backend
 
-State buckets, lock tables, and KMS keys are **not** hardcoded. Each
-environment has its own backend config file:
+Each environment uses an S3 backend with encryption, versioning and DynamoDB
+locking. The backend block in `envs/<env>/backend.tf` looks like:
 
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "vaccichain-tfstate"
+    key            = "envs/<env>/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    kms_key_id     = "alias/vaccichain-tfstate"
+    dynamodb_table = "vaccichain-tfstate-lock"
+  }
+}
 ```
-infra/envs/staging/backend.hcl
-infra/envs/production/backend.hcl
+
+- **Encryption** — state is encrypted at rest with SSE-KMS (`encrypt = true`).
+- **Versioning** — every state write creates a new S3 object version, enabling
+  rollback after corruption or accidental deletion.
+- **Locking** — DynamoDB (`vaccichain-tfstate-lock`) prevents concurrent writes;
+  `terraform plan`/`apply` acquire and release the lock automatically.
+
+### Least-privilege IAM
+
+The CI/CD role and human operators should be granted only the permissions the
+backend needs. Example policy (scope `Resource` ARNs to the state bucket and
+lock table):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketVersioning"],
+      "Resource": "arn:aws:s3:::vaccichain-tfstate"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::vaccichain-tfstate/envs/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:DeleteItem"
+      ],
+      "Resource": "arn:aws:dynamodb:us-east-1:*:table/vaccichain-tfstate-lock"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"],
+      "Resource": "<kms-key-arn>"
+    }
+  ]
+}
 ```
 
-Each file declares `bucket`, `key`, `region`, `dynamodb_table`, and
-`kms_key_id` for that environment. Copy the matching `backend.hcl.example`
-and fill in real values (never commit credentials or secret values):
+Do not grant `s3:*` or `dynamodb:*` on `*`; the state bucket must never be
+public and should deny non-TLS access via a bucket policy.
+
+## State recovery
+
+If state is lost or corrupted, restore a previous S3 object version. This
+procedure is exercised in the staging environment as part of the release
+checklist.
+
+1. **Stop concurrent runs.** Ensure no `terraform apply` is in flight, then
+   clear any stale lock (only after confirming no run is active):
+   ```bash
+   terraform force-unlock <LOCK_ID>
+   ```
+2. **List available state versions:**
+   ```bash
+   aws s3api list-object-versions \
+     --bucket vaccichain-tfstate \
+     --prefix envs/staging/terraform.tfstate \
+     --query 'Versions[].{VersionId:VersionId,LastModified:LastModified,IsLatest:IsLatest}' \
+     --output table
+   ```
+3. **Restore a known-good version** (copy it back as the current object):
+   ```bash
+   aws s3api copy-object \
+     --bucket vaccichain-tfstate \
+     --key envs/staging/terraform.tfstate \
+     --copy-source "vaccichain-tfstate/envs/staging/terraform.tfstate?versionId=<VERSION_ID>" \
+     --server-side-encryption aws:kms
+   ```
+4. **Verify** the restored state matches reality before applying:
+   ```bash
+   cd infra/envs/staging
+   terraform init -reconfigure
+   terraform state list
+   terraform plan   # expect no unexpected destroys
+   ```
+5. **Recover from total loss** (no usable version): re-import resources with
+   `terraform import` or recreate the environment from scratch, then commit the
+   recovered state via a normal `terraform apply`.
+
+### Verifying lock table integrity
 
 ```bash
-cp infra/envs/staging/backend.hcl.example infra/envs/staging/backend.hcl
-cp infra/envs/production/backend.hcl.example infra/envs/production/backend.hcl
-```
+# Confirm the table exists and is ACTIVE
+aws dynamodb describe-table --table-name vaccichain-tfstate-lock \
+  --query 'Table.TableStatus'
 
-Then create the prerequisites for the target environment (idempotent):
-
-```bash
-# Usage: ./infra/scripts/bootstrap.sh <env> <aws-account-id> <region>
-./infra/scripts/bootstrap.sh staging 111122223333 us-east-1
-./infra/scripts/bootstrap.sh production 111122223333 us-east-1
-```
-
-The script creates the versioned, encrypted S3 state bucket, the DynamoDB
-lock table, and the KMS key referenced by that environment's
-`backend.hcl`. It refuses to run if the bucket already belongs to a
-different account. Validate the config before planning:
-
-```bash
-cd infra/envs/staging
-terraform init -backend-config=backend.hcl -reconfigure
-terraform validate
+# Inspect any outstanding locks (should be empty when idle)
+aws dynamodb scan --table-name vaccichain-tfstate-lock \
+  --query 'Items[].LockID'
 ```
 
 ## Deploy staging
@@ -90,47 +186,26 @@ terraform plan \
 terraform apply
 ```
 
-## Network egress
+## CI: format, validate, and plan review
 
-ECS tasks run in private subnets with no public IPs. Outbound traffic
-leaves only through NAT gateways. The allow-list (see
-`modules/vpc/egress.tf`) is:
+Terraform changes are checked in CI before any deployment:
 
-| Destination | Port | Purpose |
-|---|---|---|
-| Stellar Horizon / RPC endpoints | 443 | Chain polling |
-| Internal ALB / service DNS | 443 | Service-to-service APIs |
-| ECR, S3, CloudWatch Logs, Secrets Manager (via VPC endpoints) | 443 | Pull images, logs, secrets |
-| DNS resolver | 53 | Name resolution |
+1. **Format** — `terraform fmt -check -recursive` runs over `infra/` and fails on
+   any unformatted file.
+2. **Validate** — `terraform init -backend=false` followed by `terraform validate`
+   runs for every module (`modules/vpc`, `modules/ecs`, `modules/secrets`) and
+   every environment (`envs/staging`, `envs/production`).
+3. **Plan** — a `terraform plan` is generated for each environment and posted to
+   the pull request as a reviewable artifact.
 
-All other egress is denied by the security group egress rules; tasks
-cannot reach administrative or unrelated public endpoints. Update the
-`egress_allowlist` variable per environment when providers change.
+Plans run with **isolated, read-only credentials** (a dedicated CI IAM role with
+no apply permissions) so a plan can never mutate infrastructure. The plan job
+does not have access to the deployment role.
 
-## Autoscaling
-
-Per-service autoscaling is configured in `modules/ecs/autoscaling.tf`:
-
-| Service | Metric | Min | Max | Scale-out cooldown | Scale-in cooldown |
-|---|---|---|---|---|---|
-| backend | ALB requests/target (target 70%) | 1 | 4 | 60s | 300s |
-| frontend | ALB requests/target (target 70%) | 1 | 4 | 60s | 300s |
-| analytics | CPU utilization (target 70%) | 1 | 2 | 120s | 600s |
-
-CloudWatch alarms fire when any service stays at max capacity or when
-CPU/memory exceeds 85% for 10 minutes. Maximum counts are capped to
-protect shared persistence (see below) and to bound cost.
-
-## Persistence and write safety
-
-The backend uses SQLite on EFS. SQLite does not support safe concurrent
-writers across tasks, so the backend service is constrained to a
-**single writer** (`desired_count = 1`, autoscaling max = 1 for the
-writer task). The analytics service is read-only against the index and
-may scale independently. Do not raise the backend max above 1 until a
-networked database replaces SQLite. EFS access points and the task
-replacement lifecycle are covered by the failure/recovery tests in
-`infra/tests/`.
+**Apply requires manual approval.** The apply job is gated behind a protected
+GitHub Environment (`staging` / `production`) with required reviewers; it only
+runs after a reviewer approves the plan, and it uses the separate deployment
+role. Production additionally requires approval from a second reviewer.
 
 ## Secrets
 

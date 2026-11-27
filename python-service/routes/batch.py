@@ -58,7 +58,7 @@ async def batch_verify(request: Request, body: BatchVerifyRequest):
     async with httpx.AsyncClient() as client:
         for wallet in body.wallets:
             try:
-                res = await client.get(f"{BACKEND_URL}/verify/{wallet}", timeout=10)
+                res = await client.get(f"{BACKEND_URL}/v1/verify/{wallet}", timeout=10)
                 data = res.json()
                 results.append(WalletResult(
                     wallet=wallet,

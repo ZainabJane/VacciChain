@@ -9,7 +9,7 @@ async function exportCertificate(record, locale, t) {
     import('qrcode'),
   ]);
 
-  const verifyUrl = `${window.location.origin}/verify/${record.issuer}`;
+  const verifyUrl = `${window.location.origin}/verify?wallet=${encodeURIComponent(record.patient ?? '')}&token=${encodeURIComponent(String(record.token_id ?? ''))}`;
   const qrDataUrl = await QRCode.toDataURL(verifyUrl, { width: 128, margin: 1 });
 
   const doc = new jsPDF();
@@ -19,21 +19,30 @@ async function exportCertificate(record, locale, t) {
   const formattedDate = formatDate(record.date_administered, locale, t('nftCard.invalidDate', 'Date unavailable'));
 
   doc.setFontSize(12);
-  doc.text(`Vaccine: ${record.vaccine_name}`, 20, 45);
+  doc.text(`Vaccine: ${record.vaccine_name ?? 'N/A'}`, 20, 45);
   doc.text(`Date Administered: ${formattedDate}`, 20, 57);
-  doc.text(`Issuer: ${record.issuer?.slice(0, 8)}…${record.issuer?.slice(-4)}`, 20, 69);
-  doc.text(`Wallet: ${record.patient?.slice(0, 8) ?? 'N/A'}…${record.patient?.slice(-4) ?? ''}`, 20, 81);
-  doc.text(`Token ID: #${record.token_id}`, 20, 93);
+  doc.text(`Issuer: ${record.issuer ? record.issuer.slice(0, 8) + '…' + record.issuer.slice(-4) : 'N/A'}`, 20, 69);
+  doc.text(`Wallet: ${record.patient ? record.patient.slice(0, 8) + '…' + record.patient.slice(-4) : 'N/A'}`, 20, 81);
+  doc.text(`Token ID: #${record.token_id ?? 'N/A'}`, 20, 93);
+
+  if (record.dose_number != null || record.dose_series != null) {
+    doc.setFontSize(12);
+    const doseText = record.dose_series != null
+      ? `Dose: ${record.dose_number ?? 'N/A'}/${record.dose_series}`
+      : `Dose: ${record.dose_number ?? 'N/A'}`;
+    doc.text(doseText, 20, 105);
+  }
 
   doc.addImage(qrDataUrl, 'PNG', 150, 40, 40, 40);
   doc.setFontSize(8);
   doc.text('Scan to verify on-chain', 155, 84);
 
-  const safeName = record.vaccine_name.replace(/\s+/g, '_');
-  doc.save(`VacciChain_${safeName}_${formattedDate}.pdf`);
+  const safeName = (record.vaccine_name ?? 'vaccination').replace(/\s+/g, '_');
+  const datePart = record.date_administered ?? 'unknown';
+  doc.save(`VacciChain_${safeName}_${datePart}.pdf`);
 }
 
-export default function NFTCard({ record, onClick, loading = false }) {
+export default function NFTCard({ record, patientWallet, onClick, loading = false }) {
   const { t, i18n } = useTranslation();
   const locale = i18n.language;
 
@@ -72,8 +81,12 @@ export default function NFTCard({ record, onClick, loading = false }) {
           💉 {record.vaccine_name}
         </span>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          {record.dose_number == null && record.dose_series != null && (
+            <span style={{ fontSize: '0.72rem', color: '#93c5fd' }}>{record.dose_series}-dose series</span>
+          )}
           {record.dose_number != null && (
             <span
+              role="img"
               aria-label={
                 record.dose_series != null
                   ? t('nftCard.doseOfSeries', {

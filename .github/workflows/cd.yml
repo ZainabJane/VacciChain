@@ -6,24 +6,172 @@ on:
       - main
     paths:
       - "contracts/**"
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Stellar network to deploy to (explicitly required)"
+        type: choice
+        required: true
+        default: testnet
+        options:
+          - testnet
+          - mainnet
+
+# Least privilege by default: the workflow token is read-only unless a job
+# explicitly opts in to additional scopes below.
+permissions:
+  contents: read
 
 jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.decide.outputs.action }}
+      target_contract: ${{ steps.decide.outputs.target_contract }}
+      manifest_contract_id: ${{ steps.decide.outputs.manifest_contract_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine changed paths
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            BASE="${{ github.event.before }}"
+            if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+              BASE="HEAD~1"
+            fi
+            CHANGED=$(git diff --name-only "$BASE" HEAD || true)
+          else
+            CHANGED=""
+          fi
+          echo "changed<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Read deployment manifest
+        id: manifest
+        run: |
+          MANIFEST="contracts/deployments.json"
+          if [ -f "$MANIFEST" ]; then
+            ID=$(jq -r '.production.contract_id // empty' "$MANIFEST")
+          else
+            ID=""
+          fi
+          echo "contract_id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Decide deploy / upgrade / no-op
+        id: decide
+        env:
+          CHANGED: ${{ steps.changes.outputs.changed }}
+          MANIFEST_ID: ${{ steps.manifest.outputs.contract_id }}
+          TARGET_INPUT: ${{ github.event.inputs.target_contract }}
+          OVERRIDE: ${{ github.event.inputs.override_existing }}
+        run: |
+          set -euo pipefail
+          ACTION="no-op"
+          TARGET=""
+
+          if [ -n "$TARGET_INPUT" ]; then
+            ACTION="upgrade"
+            TARGET="$TARGET_INPUT"
+          elif [ -n "$MANIFEST_ID" ]; then
+            if echo "$CHANGED" | grep -qE '^contracts/'; then
+              ACTION="upgrade"
+              TARGET="$MANIFEST_ID"
+            else
+              ACTION="no-op"
+            fi
+          else
+            if echo "$CHANGED" | grep -qE '^contracts/'; then
+              ACTION="deploy"
+            else
+              ACTION="no-op"
+            fi
+          fi
+
+          if [ "$ACTION" = "upgrade" ] && [ -z "$TARGET" ]; then
+            echo "::error::Upgrade requested but no target contract was provided."
+            exit 1
+          fi
+
+          if [ "$ACTION" = "deploy" ] && [ -n "$MANIFEST_ID" ] && [ "$OVERRIDE" != "true" ]; then
+            echo "::error::Manifest already records production contract $MANIFEST_ID; refusing to create a second one. Set override_existing=true to proceed."
+            exit 1
+          fi
+
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "target_contract=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "manifest_contract_id=$MANIFEST_ID" >> "$GITHUB_OUTPUT"
+          echo "Resolved action: $ACTION (target: ${TARGET:-none})"
+
+  policy:
+    runs-on: ubuntu-latest
+    needs: decide
+    steps:
+      - name: Enforce production deployment policy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          ACTION: ${{ needs.decide.outputs.action }}
+        run: |
+          set -euo pipefail
+          if [ "$ACTION" = "no-op" ]; then
+            echo "No deployment action required; policy check skipped."
+            exit 0
+          fi
+          case "$EVENT_NAME" in
+            workflow_dispatch|release) ;;
+            *)
+              echo "::error::Production deploys are only allowed from workflow_dispatch or release events (got: $EVENT_NAME)."
+              exit 1
+              ;;
+          esac
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Production deploys from workflow_dispatch must run on main (got: $REF)."
+            exit 1
+          fi
+          echo "Policy check passed for $EVENT_NAME on $REF."
+
   deploy:
     runs-on: ubuntu-latest
+    needs:
+      - decide
+      - policy
+    if: needs.decide.outputs.action != 'no-op'
+    environment: production
     defaults:
       run:
         working-directory: contracts
 
     steps:
+      - name: Validate network input
+        run: |
+          NETWORK="${{ github.event.inputs.network }}"
+          if [ -z "$NETWORK" ]; then
+            echo "::error::An explicit network (testnet or mainnet) must be provided."
+            exit 1
+          fi
+          case "$NETWORK" in
+            testnet|mainnet) ;;
+            *)
+              echo "::error::Unsupported network '$NETWORK'. Expected testnet or mainnet."
+              exit 1
+              ;;
+          esac
+          echo "NETWORK=$NETWORK" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.84.0"
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             ~/.cargo/registry
@@ -34,21 +182,63 @@ jobs:
 
       - name: Install Stellar CLI
         run: |
-          cargo install --locked stellar-cli --features opt
+          cargo install --locked stellar-cli --version 22.0.1 --features opt
 
       - name: Build WASM
         run: make build
+
+      - name: Generate and record WASM artifact hash
+        id: wasm_hash
+        run: |
+          WASM=target/wasm32-unknown-unknown/release/vaccichain.wasm
+          SHA256=$(sha256sum "$WASM" | awk '{print $1}')
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "WASM SHA-256: $SHA256"
+          echo "$SHA256  vaccichain.wasm" > vaccichain.wasm.sha256
+          echo "### WASM artifact hash" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$SHA256  vaccichain.wasm" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload WASM artifact and hash
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaccichain-wasm-${{ github.sha }}
+          path: |
+            contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm
+            contracts/vaccichain.wasm.sha256
+          if-no-files-found: error
 
       - name: Deploy to Stellar Testnet
         id: deploy
         env:
           ADMIN_SECRET_KEY: ${{ secrets.ADMIN_SECRET_KEY }}
+          EXPECTED_WASM_SHA256: ${{ steps.wasm_hash.outputs.sha256 }}
         run: |
+          WASM=target/wasm32-unknown-unknown/release/vaccichain.wasm
+          ACTUAL_SHA256=$(sha256sum "$WASM" | awk '{print $1}')
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_WASM_SHA256" ]; then
+            echo "WASM hash mismatch: expected $EXPECTED_WASM_SHA256, got $ACTUAL_SHA256" >&2
+            exit 1
+          fi
+          echo "Verified WASM SHA-256: $ACTUAL_SHA256"
           CONTRACT_ID=$(stellar contract deploy \
             --wasm target/wasm32-unknown-unknown/release/vaccichain.wasm \
             --source "$ADMIN_SECRET_KEY" \
             --network testnet)
           echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test deployed contract
+        env:
+          ADMIN_SECRET_KEY: ${{ secrets.ADMIN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          make smoke-test \
+            NETWORK="$NETWORK" \
+            CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}" \
+            EXPECTED_CONTRACT_ID="$EXPECTED_CONTRACT_ID" \
+            RPC_URL="$RPC_URL" \
+            NETWORK_PASSPHRASE="$NETWORK_PASSPHRASE"
 
       - name: Store contract ID as secret
         env:
@@ -59,7 +249,7 @@ jobs:
             --repo "${{ github.repository }}"
 
       - name: Print contract ID
-        run: echo "Deployed contract ID ${{ steps.deploy.outputs.contract_id }}"
+        run: echo "Deployed contract ID ${{ steps.deploy.outputs.contract_id }} on $NETWORK"
 
   restore-drill:
     # Scheduled restore drills are defined in .github/workflows/restore-drill.yml

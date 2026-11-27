@@ -1,73 +1,25 @@
 const StellarSdk = require('@stellar/stellar-sdk');
 const config = require('../config');
 const logger = require('../logger');
+const {
+  withTimeout,
+  withRetry,
+  classifyError,
+  getCorrelationId,
+  SorobanError,
+  SorobanRpcError,
+  SorobanTransactionError,
+  SorobanSimulationError,
+  SorobanTimeoutError,
+  SorobanTransientError,
+  SorobanPermanentError,
+} = require('./client');
 
 const {
   SOROBAN_RPC_URL,
   STELLAR_NETWORK_PASSPHRASE: NETWORK_PASSPHRASE,
   VACCINATIONS_CONTRACT_ID: CONTRACT_ID,
-  SOROBAN_RPC_MAX_RETRIES,
-  SOROBAN_RPC_TIMEOUT_MS,
 } = config;
-
-class SorobanError extends Error {
-  constructor(message, originalError) {
-    super(message);
-    this.name = 'SorobanError';
-    this.original = originalError;
-  }
-}
-
-class SorobanRpcError extends SorobanError {
-  constructor(message, originalError) {
-    super(message, originalError);
-    this.name = 'SorobanRpcError';
-  }
-}
-
-class SorobanTransactionError extends SorobanError {
-  constructor(message, originalError) {
-    super(message, originalError);
-    this.name = 'SorobanTransactionError';
-  }
-}
-
-class SorobanSimulationError extends SorobanError {
-  constructor(message, originalError) {
-    super(message, originalError);
-    this.name = 'SorobanSimulationError';
-  }
-}
-
-class SorobanTimeoutError extends SorobanError {
-  constructor(context, elapsedMs) {
-    super(`RPC timeout after ${elapsedMs}ms (context: ${context})`);
-    this.name = 'SorobanTimeoutError';
-    this.context = context;
-    this.elapsedMs = elapsedMs;
-  }
-}
-
-/**
- * Race an async fn against a timeout. Cleans up the timer on resolution.
- * Throws SorobanTimeoutError if the timeout fires first.
- */
-async function withTimeout(fn, context) {
-  const start = Date.now();
-  let timer;
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      const elapsed = Date.now() - start;
-      logger.warn('Soroban RPC timeout', { context, rpcUrl: SOROBAN_RPC_URL, elapsedMs: elapsed });
-      reject(new SorobanTimeoutError(context, elapsed));
-    }, SOROBAN_RPC_TIMEOUT_MS);
-  });
-  try {
-    return await Promise.race([fn(), timeoutPromise]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 // Fee in stroops (1 XLM = 10_000_000 stroops). Minimum is 100.
 const TX_FEE = String(process.env.SOROBAN_FEE || 100);
@@ -79,55 +31,20 @@ function getRpcServer() {
 }
 
 /**
- * Helper to retry RPC calls with exponential backoff.
- * @param {Function} fn - The RPC call to execute
- * @param {string} context - Context for logging
+ * Execute a single-attempt RPC call (used for non-idempotent operations such as
+ * transaction submission). Applies a bounded timeout but never retries, so a
+ * transaction is never submitted twice.
  */
-async function withRetry(fn, context = '') {
-  let lastError;
-  for (let attempt = 0; attempt <= SOROBAN_RPC_MAX_RETRIES; attempt++) {
-    try {
-      if (attempt > 0) {
-        const backoff = Math.pow(2, attempt - 1) * 100; // 100ms, 200ms, 400ms
-        logger.info(`Retrying Soroban RPC call`, {
-          context,
-          attempt,
-          maxRetries: SOROBAN_RPC_MAX_RETRIES,
-          backoffMs: backoff,
-        });
-        await new Promise((resolve) => setTimeout(resolve, backoff));
-      }
-      return await withTimeout(fn, context);
-    } catch (error) {
-      lastError = error;
+async function callOnce(fn, context) {
+  return withTimeout(fn, context);
+}
 
-      // Don't retry 4xx errors as they are likely client-side/contract logic errors
-      const status = error.response?.status;
-      if (status && status >= 400 && status < 500) {
-        logger.warn(`Non-retryable Soroban RPC error`, {
-          context,
-          status,
-          message: error.message,
-        });
-        throw error;
-      }
-
-      if (attempt === SOROBAN_RPC_MAX_RETRIES) {
-        logger.error(`Soroban RPC call failed after maximum retries`, {
-          context,
-          attempt,
-          message: error.message,
-        });
-      } else {
-        logger.debug(`Soroban RPC call transient failure`, {
-          context,
-          attempt,
-          message: error.message,
-        });
-      }
-    }
-  }
-  throw lastError;
+/**
+ * Execute an idempotent read-only RPC call with bounded timeout and retries.
+ * Only safe-to-retry operations should use this.
+ */
+async function callRead(fn, context) {
+  return withRetry(fn, context, { idempotent: true });
 }
 
 /**
@@ -137,9 +54,11 @@ async function withRetry(fn, context = '') {
  * @param {StellarSdk.xdr.ScVal[]} args - Method arguments
  */
 async function invokeContract(secretKey, method, args) {
+  // Guard against invoking against the wrong network or contract.
+  validateDeploymentConfig();
   const rpc = getRpcServer();
   const keypair = StellarSdk.Keypair.fromSecret(secretKey);
-  const account = await withRetry(() => rpc.getAccount(keypair.publicKey()), 'getAccount');
+  const account = await callRead(() => rpc.getAccount(keypair.publicKey()), 'getAccount');
 
   const contract = new StellarSdk.Contract(CONTRACT_ID);
 
@@ -154,33 +73,34 @@ async function invokeContract(secretKey, method, args) {
     .setTimeout(30)
     .build();
 
-  const prepared = await withRetry(() => rpc.prepareTransaction(tx), 'prepareTransaction');
+  const prepared = await callRead(() => rpc.prepareTransaction(tx), 'prepareTransaction');
   prepared.sign(keypair);
 
-  const response = await withRetry(() => rpc.sendTransaction(prepared), 'sendTransaction');
+  // Submission is NOT idempotent: single attempt only, bounded by timeout.
+  const response = await callOnce(() => rpc.sendTransaction(prepared), 'sendTransaction');
   if (response.status === 'ERROR') {
     const errDetail = JSON.stringify(response.errorResult);
     if (errDetail.includes('txINSUFFICIENT_FEE') || errDetail.includes('fee')) {
-      throw new Error(
+      throw new SorobanPermanentError(
         `Transaction rejected: fee too low (current: ${TX_FEE} stroops). ` +
         `Increase SOROBAN_FEE in your environment. Details: ${errDetail}`
       );
     }
-    const error = new Error(`Contract invocation failed: ${errDetail}`);
+    const error = new SorobanTransactionError(`Contract invocation failed: ${errDetail}`);
     error.sorobanErrorResult = response.errorResult;
     throw error;
   }
 
-  // Poll for result
+  // Poll for result (read-only, safe to retry)
   let result;
   for (let i = 0; i < 10; i++) {
     await new Promise((r) => setTimeout(r, 2000));
-    result = await withRetry(() => rpc.getTransaction(response.hash), 'getTransaction');
+    result = await callRead(() => rpc.getTransaction(response.hash), 'getTransaction');
     if (result.status !== 'NOT_FOUND') break;
   }
 
   if (result.status !== 'SUCCESS') {
-    const error = new Error(`Transaction failed: ${result.status}`);
+    const error = new SorobanTransactionError(`Transaction failed: ${result.status}`);
     error.sorobanResultXdr = result.resultXdr;
     error.sorobanStatus = result.status;
     throw error;
@@ -305,6 +225,8 @@ async function verifyVaccination(wallet) {
  * Read-only contract call (no signing needed).
  */
 async function simulateContract(method, args) {
+  // Guard against simulating against the wrong network or contract.
+  validateDeploymentConfig();
   const rpc = getRpcServer();
   const contract = new StellarSdk.Contract(CONTRACT_ID);
 
@@ -320,9 +242,9 @@ async function simulateContract(method, args) {
     .setTimeout(30)
     .build();
 
-  const sim = await withRetry(() => rpc.simulateTransaction(tx), 'simulateTransaction');
+  const sim = await callRead(() => rpc.simulateTransaction(tx), 'simulateTransaction');
   if (StellarSdk.SorobanRpc.Api.isSimulationError(sim)) {
-    const error = new Error(`Simulation failed: ${sim.error}`);
+    const error = new SorobanSimulationError(`Simulation failed: ${sim.error}`);
     error.simulationError = sim.error;
     throw error;
   }
@@ -334,7 +256,128 @@ async function simulateContract(method, args) {
  * Send a 503 RPC timeout response. Use in route catch blocks when err is SorobanTimeoutError.
  */
 function sendRpcTimeout(res) {
-  return res.status(503).json({ error: 'RPC timeout', retryAfter: 5 });
+  return res.status(503).json({
+    error: 'RPC timeout',
+    retryAfter: 5,
+    correlationId: getCorrelationId(),
+  });
+}
+
+/**
+ * Map known contract error codes/messages to descriptive Soroban errors.
+ * Contract errors surface either as simulation errors (read paths) or as
+ * errorResult XDR strings (write paths). We normalize both into a stable
+ * shape so callers can branch on `error.contractError`.
+ */
+const CONTRACT_ERROR_MAP = {
+  // Admin rotation / recovery
+  AdminAlreadyProposed: 'An admin rotation proposal is already pending',
+  NoPendingAdmin: 'No pending admin rotation proposal exists',
+  ProposalExpired: 'Admin rotation proposal has expired',
+  ProposalNotYetValid: 'Admin rotation proposal delay has not elapsed',
+  Unauthorized: 'Caller is not authorized for this admin operation',
+  InvalidAdmin: 'Proposed admin address is invalid',
+  SelfRotation: 'Cannot propose the current admin as the new admin',
+  // Duplicate detection
+  DuplicateRecord: 'A matching vaccination record already exists',
+  DuplicateDose: 'This dose number has already been recorded for the series',
+};
+
+function mapContractError(rawMessage) {
+  if (!rawMessage) return null;
+  const text = String(rawMessage);
+  for (const [code, description] of Object.entries(CONTRACT_ERROR_MAP)) {
+    if (text.includes(code)) {
+      return { code, description };
+    }
+  }
+  return null;
+}
+
+function buildContractError(rawMessage, fallbackMessage) {
+  const mapped = mapContractError(rawMessage);
+  const message = mapped
+    ? `${fallbackMessage}: ${mapped.description} (${mapped.code})`
+    : `${fallbackMessage}: ${rawMessage}`;
+  const error = new SorobanTransactionError(message);
+  error.contractError = mapped ? mapped.code : null;
+  error.rawContractError = rawMessage;
+  return error;
+}
+
+/**
+ * Propose a new admin for the contract (current admin-signed).
+ * Starts the rotation delay window; the proposal must be accepted by the
+ * proposed admin after the delay and before expiry.
+ * @param {string} newAdminWallet - Stellar public key of the proposed admin
+ * @param {Object} [options]
+ * @param {string} [options.adminSecret] - Override for ADMIN_SECRET_KEY
+ */
+async function proposeAdmin(newAdminWallet, options = {}) {
+  const adminSecret = options.adminSecret || process.env.ADMIN_SECRET_KEY;
+  if (!adminSecret) throw new Error('ADMIN_SECRET_KEY not configured');
+  try {
+    const args = [
+      StellarSdk.xdr.ScVal.scvAddress(
+        StellarSdk.Address.fromString(newAdminWallet).toScAddress()
+      ),
+    ];
+    return await invokeContract(adminSecret, 'propose_admin', args);
+  } catch (error) {
+    if (error instanceof SorobanError) throw error;
+    throw buildContractError(error.message, 'Failed to propose admin rotation');
+  }
+}
+
+/**
+ * Accept a pending admin rotation (signed by the proposed admin).
+ * @param {string} newAdminSecret - Secret key of the proposed admin
+ */
+async function acceptAdmin(newAdminSecret) {
+  if (!newAdminSecret) throw new Error('Proposed admin secret key required');
+  try {
+    return await invokeContract(newAdminSecret, 'accept_admin', []);
+  } catch (error) {
+    if (error instanceof SorobanError) throw error;
+    throw buildContractError(error.message, 'Failed to accept admin rotation');
+  }
+}
+
+/**
+ * Cancel a pending admin rotation (current admin-signed).
+ * @param {Object} [options]
+ * @param {string} [options.adminSecret] - Override for ADMIN_SECRET_KEY
+ */
+async function cancelAdmin(options = {}) {
+  const adminSecret = options.adminSecret || process.env.ADMIN_SECRET_KEY;
+  if (!adminSecret) throw new Error('ADMIN_SECRET_KEY not configured');
+  try {
+    return await invokeContract(adminSecret, 'cancel_admin', []);
+  } catch (error) {
+    if (error instanceof SorobanError) throw error;
+    throw buildContractError(error.message, 'Failed to cancel admin rotation');
+  }
+}
+
+/**
+ * Read the pending admin rotation proposal, if any (read-only).
+ * Returns { pendingAdmin, proposedAt, expiresAt } or null.
+ */
+async function getPendingAdmin() {
+  try {
+    const rawResult = await simulateContract('get_pending_admin', []);
+    if (rawResult == null) return null;
+    const native = StellarSdk.scValToNative(rawResult);
+    if (!native) return null;
+    return {
+      pendingAdmin: native.pending_admin ?? native.pendingAdmin ?? null,
+      proposedAt: native.proposed_at ?? native.proposedAt ?? null,
+      expiresAt: native.expires_at ?? native.expiresAt ?? null,
+    };
+  } catch (error) {
+    if (error instanceof SorobanError) throw error;
+    throw new SorobanSimulationError('Failed to read pending admin', error);
+  }
 }
 
 module.exports = {
@@ -345,13 +388,21 @@ module.exports = {
   verifyVaccination,
   addIssuer,
   revokeIssuer,
+  proposeAdmin,
+  acceptAdmin,
+  cancelAdmin,
+  getPendingAdmin,
+  mapContractError,
   sendRpcTimeout,
+  classifyError,
   VerificationStatus,
   SorobanError,
   SorobanRpcError,
   SorobanTransactionError,
   SorobanSimulationError,
   SorobanTimeoutError,
+  SorobanTransientError,
+  SorobanPermanentError,
 };
 
 /**

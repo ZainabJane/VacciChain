@@ -12,7 +12,7 @@
   "containerDefinitions": [
     {
       "name": "frontend",
-      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-frontend:staging-latest",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-frontend:${GITHUB_SHA}",
       "portMappings": [
         {
           "containerPort": 80,
@@ -47,7 +47,7 @@
     },
     {
       "name": "backend",
-      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-backend:staging-latest",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-backend:${GITHUB_SHA}",
       "portMappings": [
         {
           "containerPort": 4000,
@@ -89,43 +89,48 @@
           "value": "4000"
         },
         {
-          "name": "DEPLOYMENT_ENV",
-          "value": "staging"
-        },
-        {
-          "name": "BACKEND_WRITER_MODE",
-          "value": "single-writer"
-        },
-        {
-          "name": "SQLITE_DB_PATH",
-          "value": "/mnt/efs/vaccichain/staging/vaccichain.db"
+          "name": "PERSISTENCE_STRATEGY",
+          "value": "sqlite"
         },
         {
           "name": "SQLITE_BUSY_TIMEOUT_MS",
           "value": "5000"
         },
         {
-          "name": "EFS_MOUNT_PATH",
-          "value": "/mnt/efs"
+          "name": "SQLITE_JOURNAL_MODE",
+          "value": "WAL"
         },
         {
-          "name": "AUTOSCALING_MIN_TASKS",
+          "name": "TRUST_PROXY",
           "value": "1"
         },
         {
-          "name": "AUTOSCALING_MAX_TASKS",
-          "value": "1"
+          "name": "PUBLIC_VERIFICATION_MAX_RECORDS",
+          "value": "100"
         },
         {
-          "name": "EGRESS_MODE",
-          "value": "nat-gateway"
-        }
-      ],
-      "mountPoints": [
+          "name": "PUBLIC_VERIFICATION_MAX_BATCH_SIZE",
+          "value": "50"
+        },
         {
-          "sourceVolume": "efs-vaccichain-staging",
-          "containerPath": "/mnt/efs",
-          "readOnly": false
+          "name": "PUBLIC_VERIFICATION_DEFAULT_PAGE_SIZE",
+          "value": "20"
+        },
+        {
+          "name": "AUDIT_LOG_ENABLED",
+          "value": "true"
+        },
+        {
+          "name": "AUDIT_LOG_RETENTION_DAYS",
+          "value": "90"
+        },
+        {
+          "name": "AUDIT_LOG_MAX_FILE_SIZE_MB",
+          "value": "100"
+        },
+        {
+          "name": "AUDIT_LOG_INTEGRITY_ALGORITHM",
+          "value": "sha256"
         }
       ],
       "secrets": [
@@ -181,7 +186,7 @@
     },
     {
       "name": "python-service",
-      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-python:staging-latest",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-python:${GITHUB_SHA}",
       "portMappings": [
         {
           "containerPort": 8001,
@@ -192,7 +197,7 @@
       "environment": [
         {
           "name": "BACKEND_URL",
-          "value": "http://backend:4000"
+          "value": "http://backend.vaccichain-staging.local:4000"
         }
       ],
       "healthCheck": {

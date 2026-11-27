@@ -9,6 +9,35 @@ const { registerSchema } = require('./schemas/patient.schemas');
 
 const router = express.Router();
 
+/**
+ * @swagger
+ * /v1/patient/register:
+ *   post:
+ *     summary: Self-register a wallet into the on-chain patient allowlist
+ *     tags:
+ *       - Patient
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               wallet:
+ *                 type: string
+ *             required:
+ *               - wallet
+ *     responses:
+ *       200:
+ *         description: Patient registered
+ *       401:
+ *         description: Unauthorized
+ *       500:
+ *         description: Contract invocation failed
+ */
+
 // POST /patient/register — self-register wallet into the on-chain allowlist.
 // Requires a valid patient JWT (SEP-10 authenticated).
 router.post('/register', authMiddleware, validate(registerSchema), async (req, res) => {

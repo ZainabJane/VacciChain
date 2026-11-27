@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import DarkModeToggle from './DarkModeToggle';
+import ExternalLink from './ExternalLink';
 import { useAuth } from '../hooks/useFreighter';
 
 const NAV_LINKS = [
@@ -11,6 +12,13 @@ const NAV_LINKS = [
   { to: '/admin', label: 'Admin' },
   { to: '/apply', label: 'Apply as Issuer' },
   { to: '/analytics', label: 'Analytics' },
+];
+
+const EXTERNAL_LINKS = [
+  {
+    href: 'https://stellar.org',
+    label: 'Stellar network (opens in a new tab)',
+  },
 ];
 
 function truncate(addr) {
@@ -289,9 +297,39 @@ export default function NavBar({ dark, onToggleDark }) {
             {label}
           </Link>
         ))}
+        {EXTERNAL_LINKS.map(({ href, label }) => (
+          <ExternalLink key={href} href={href} onClick={close}>
+            {label}
+          </ExternalLink>
+        ))}
         <DarkModeToggle dark={dark} onToggle={onToggleDark} />
         <WalletIndicator />
       </div>
+
+      <style>{`
+        @media (max-width: 639px) {
+          .nav-hamburger { display: block !important; }
+          .nav-links {
+            display: ${open ? 'flex' : 'none'} !important;
+            flex-direction: column;
+            align-items: flex-start;
+            width: 100%;
+            padding: 0.5rem 0;
+            gap: 0.75rem;
+          }
+        }
+
+        /* Reduced motion: disable any nav transitions/animations (menu open/close, focus) */
+        @media (prefers-reduced-motion: reduce) {
+          .nav-hamburger,
+          .nav-links,
+          .nav-links a,
+          .nav-links button {
+            transition: none !important;
+            animation: none !important;
+          }
+        }
+      `}</style>
     </nav>
   );
 }

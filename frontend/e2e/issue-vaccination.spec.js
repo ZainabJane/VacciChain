@@ -56,8 +56,10 @@ test('issuer connects wallet, issues vaccination, patient sees record', async ({
     })
   );
 
-  await context.route('**/v1/vaccination/issue', (route) =>
-    route.fulfill({
+  let issueRequestCount = 0;
+  await context.route('**/v1/vaccination/issue', (route) => {
+    issueRequestCount += 1;
+    return route.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({
@@ -67,8 +69,8 @@ test('issuer connects wallet, issues vaccination, patient sees record', async ({
         date_administered: DATE_ADM,
         issuer: ISSUER_KEY,
       }),
-    })
-  );
+    });
+  });
 
   // Patient records — return the newly issued record
   await context.route(`**/v1/vaccination/${PATIENT_KEY}**`, (route) =>
@@ -116,16 +118,32 @@ test('issuer connects wallet, issues vaccination, patient sees record', async ({
   await page.getByLabel('Vaccine Name').fill(VACCINE_NAME);
   await page.getByLabel('Date Administered').fill(DATE_ADM);
 
-  // ── 6. Submit ─────────────────────────────────────────────────────────────
+  // ── 6. Submit opens the confirmation dialog ──────────────────────────────
   await page.getByRole('button', { name: /issue vaccination nft/i }).click();
 
-  // ── 7. Verify success toast ───────────────────────────────────────────────
+  // The confirmation dialog must show the normalized record details
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText(PATIENT_KEY);
+  await expect(dialog).toContainText(VACCINE_NAME);
+  await expect(dialog).toContainText(DATE_ADM);
+
+  // No request should be sent before confirming
+  expect(issueRequestCount).toBe(0);
+
+  // ── 7. Confirm the mint ──────────────────────────────────────────────────
+  await page.getByRole('button', { name: /confirm.*mint/i }).click();
+
+  // ── 8. Verify success toast ───────────────────────────────────────────────
   // Toast renders as role="alert" with green background; text from useVaccination:
   // "Vaccination NFT minted! Token ID: ..."
   const toast = page.getByRole('alert').filter({ hasText: /vaccination nft minted/i });
   await expect(toast).toBeVisible({ timeout: 8_000 });
 
-  // ── 8. Switch to patient wallet and navigate to patient dashboard ─────────
+  // Exactly one submission should have been sent (single-submission guard)
+  expect(issueRequestCount).toBe(1);
+
+  // ── 9. Switch to patient wallet and navigate to patient dashboard ─────────
   await page.evaluate((patientKey) => {
     window.freighter.getPublicKey = () => Promise.resolve(patientKey);
   }, PATIENT_KEY);
@@ -141,6 +159,78 @@ test('issuer connects wallet, issues vaccination, patient sees record', async ({
 
   await page.goto('/patient');
 
-  // ── 9. Verify the new record appears ─────────────────────────────────────
+  // ── 10. Verify the new record appears ────────────────────────────────────
   await expect(page.getByText(VACCINE_NAME)).toBeVisible({ timeout: 10_000 });
+});
+
+test('cancelling the confirmation dialog does not send a request', async ({ page, context }) => {
+  // ── 1. Mock Freighter extension ──────────────────────────────────────────
+  await context.addInitScript((issuerKey) => {
+    window.freighter = {
+      isConnected:      () => Promise.resolve({ isConnected: true }),
+      getPublicKey:     () => Promise.resolve(issuerKey),
+      signTransaction:  (_xdr, _opts) => Promise.resolve('SIGNED_XDR_MOCK'),
+      getNetwork:       () => Promise.resolve({ network: 'TESTNET', networkUrl: '' }),
+      getNetworkDetails: () => Promise.resolve({ network: 'TESTNET', networkPassphrase: 'Test SDF Network ; September 2015', networkUrl: '' }),
+    };
+  }, ISSUER_KEY);
+
+  // ── 2. Intercept backend API calls ───────────────────────────────────────
+  await context.route('**/v1/auth/sep10', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ transaction: 'MOCK_XDR', nonce: 'mock-nonce' }),
+    })
+  );
+
+  await context.route('**/v1/auth/verify', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ token: 'mock.jwt.issuer', role: 'issuer' }),
+    })
+  );
+
+  await context.route('**/v1/vaccination/issuer/status**', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ authorized: true }),
+    })
+  );
+
+  let issueRequestCount = 0;
+  await context.route('**/v1/vaccination/issue', (route) => {
+    issueRequestCount += 1;
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ tokenId: MOCK_TOKEN_ID }),
+    });
+  });
+
+  // ── 3. Navigate and connect ──────────────────────────────────────────────
+  await page.goto('/issuer');
+  await page.getByRole('button', { name: /connect.*wallet/i }).click();
+
+  const form = page.getByRole('form');
+  await expect(form).toBeVisible({ timeout: 10_000 });
+
+  // ── 4. Fill the form ─────────────────────────────────────────────────────
+  await page.getByLabel('Patient Stellar Address').fill(PATIENT_KEY);
+  await page.getByLabel('Vaccine Name').fill(VACCINE_NAME);
+  await page.getByLabel('Date Administered').fill(DATE_ADM);
+
+  // ── 5. Open the dialog and cancel ────────────────────────────────────────
+  await page.getByRole('button', { name: /issue vaccination nft/i }).click();
+
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+
+  await page.getByRole('button', { name: /cancel/i }).click();
+  await expect(dialog).toBeHidden();
+
+  // No request should have been sent
+  expect(issueRequestCount).toBe(0);
 });

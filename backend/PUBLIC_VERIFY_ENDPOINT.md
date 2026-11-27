@@ -15,6 +15,8 @@ GET /v1/verify/public/:wallet
 
 **Parameters:**
 - `wallet` (path, required): Stellar public key (56 characters, starts with 'G')
+- `limit` (query, optional): Maximum number of records to return. Default `20`, maximum `100`. Values above the maximum are clamped to `100`.
+- `cursor` (query, optional): Opaque pagination cursor returned as `next_cursor` in a previous response. Omit to start from the newest record.
 
 **Response (200 OK):**
 ```json
@@ -31,9 +33,18 @@ GET /v1/verify/public/:wallet
       "dose_series": 2,
       "revoked": false
     }
-  ]
+  ],
+  "record_count": 1,
+  "truncated": false,
+  "next_cursor": null
 }
 ```
+
+**Response fields:**
+- `records`: At most `limit` records (never more than `100`).
+- `record_count`: Number of records in this response (`records.length`).
+- `truncated`: `true` when more records exist beyond this page.
+- `next_cursor`: Cursor for the next page, or `null` when `truncated` is `false`.
 
 ### Verification Status Values
 
@@ -55,7 +66,8 @@ the mere presence of a 200 response.
 
 | Status | Condition |
 |--------|-----------|
-| 400 | Invalid wallet format |
+| 400 | Invalid wallet format, invalid `limit` (non-integer or `< 1`), or malformed/expired `cursor` |
+| 413 | Request body exceeds the batch size limit (batch endpoint only) |
 | 429 | Rate limit exceeded (60 requests/min per IP) |
 | 503 | RPC timeout or service unavailable (`status: "unavailable"`) |
 | 500 | Contract query failed (`status: "unavailable"`) |
@@ -66,6 +78,53 @@ the mere presence of a 200 response.
 > `status: "unavailable"` (with a 5xx status code) or `status: "absent"` when
 > the contract positively confirms there are no records. Treating an error as
 > "no records found" or as a successful verification is prohibited.
+
+## Size and Work Limits
+
+Public verification responses and batch inputs are bounded so that large record histories or batch inputs cannot exhaust memory, CPU, or response bandwidth.
+
+| Limit | Value | Behavior at limit | Behavior above limit |
+|-------|-------|-------------------|----------------------|
+| Records per page (`limit`) | Default `20`, max `100` | Returns exactly `100` records, `truncated: true` if more exist | `limit` clamped to `100` (no error) |
+| Records scanned per request | `500` | Full scan allowed | Scan stops at `500`; response marked `truncated: true` with `next_cursor` |
+| Response body size | `256 KiB` | Response returned as-is | Records trimmed from the tail until the body fits; `truncated: true` |
+| Batch wallets per request | `50` | Accepted | `413` with `error: "batch_too_large"` |
+| Batch response size | `1 MiB` | Response returned as-is | `413` with `error: "batch_response_too_large"`; split into smaller batches |
+
+### Pagination and Truncation Semantics
+
+- Records are ordered newest-first; pagination is stable for a given cache window (60 seconds).
+- `truncated: true` means the client MUST follow `next_cursor` to obtain the remaining records.
+- `truncated: false` with `next_cursor: null` means the full history has been returned.
+- A `limit` above `100` is silently clamped; clients should not rely on receiving more than `100` records per page.
+- If the response body would exceed `256 KiB`, the tail of `records` is dropped and `truncated` is set to `true`; `next_cursor` points at the first dropped record.
+- Cursors are opaque, single-use-safe (idempotent), and expire after 5 minutes; an expired cursor returns `400` with `error: "invalid_cursor"`.
+
+### Boundary Examples
+
+**Below the limit** — wallet with 5 records, `limit=20`:
+```json
+{ "wallet": "G...", "verified": true, "records": [ /* 5 items */ ], "record_count": 5, "truncated": false, "next_cursor": null }
+```
+
+**At the limit** — wallet with exactly 100 records, `limit=100`:
+```json
+{ "wallet": "G...", "verified": true, "records": [ /* 100 items */ ], "record_count": 100, "truncated": false, "next_cursor": null }
+```
+
+**Above the limit** — wallet with 250 records, `limit=100`:
+```json
+{ "wallet": "G...", "verified": true, "records": [ /* 100 items */ ], "record_count": 100, "truncated": true, "next_cursor": "eyJvZmZzZXQiOjEwMH0" }
+```
+Follow-up request with `cursor=eyJvZmZzZXQiOjEwMH0` returns the next 100 records (`truncated: true`), and the third page returns the final 50 (`truncated: false`, `next_cursor: null`).
+
+**Above the scan limit** — wallet with 900 records, `limit=100`:
+The first page scans at most `500` records, returns `100`, and `next_cursor` continues from the scan boundary. Subsequent pages continue until the history is exhausted.
+
+**Batch above the limit** — 51 wallets in one batch request:
+```json
+{ "error": "batch_too_large", "message": "Batch supports at most 50 wallets per request", "max_batch_size": 50 }
+```
 
 ### Authenticated Endpoint (Existing)
 ```
@@ -123,6 +182,12 @@ GET /v1/verify/:wallet
 - Authenticated endpoint returns detailed schema: `{ wallet, status, vaccinated, verified, record_count, records }`
 - Cleaner API for public consumers
 - `status` distinguishes `valid`, `revoked`, `absent`, and `unavailable` data
+
+### Bounded Response Size
+- Records per page capped at `100` (default `20`)
+- Response body capped at `256 KiB`; excess records are truncated with `truncated: true`
+- Batch requests capped at `50` wallets and `1 MiB` response size
+- Prevents unbounded histories from exhausting memory, CPU, or bandwidth
 
 ### Not a Medical Determination
 - Responses describe on-chain record state only; they are **not** a medical
@@ -259,6 +324,9 @@ Public endpoint requests are logged with:
 - Wallet format validated before contract query
 - Invalid format returns 400 immediately
 - Prevents malformed RPC calls
+- `limit` validated as an integer in `[1, 100]`; values above `100` are clamped, non-integers return `400`
+- `cursor` validated as an opaque token; malformed or expired cursors return `400`
+- Batch requests validated against the `50`-wallet maximum before any contract query
 
 ### Failure Semantics
 - RPC failures, timeouts, and partial reads are reported as
@@ -338,10 +406,24 @@ const walletLookups = entries.filter(e => e.target === wallet);
 - Configurable via `RATE_LIMIT_VERIFY` env var
 - Returns 429 when exceeded
 
+✅ **Public record responses and batch requests have documented maximum sizes and pagination/truncation semantics**
+- Records per page: default `20`, max `100`
+- Records scanned per request: `500`
+- Response body: `256 KiB`
+- Batch: `50` wallets, `1 MiB` response
+- `truncated` / `next_cursor` semantics documented above
+
+✅ **Boundary tests demonstrate predictable behavior at, below, and above each limit**
+- Boundary examples for below/at/above `limit`, scan limit, and batch size included above
+- Tests cover `limit` of `1`, `20`, `100`, and `101` (clamped)
+- Tests cover wallets with `0`, `5`, `100`, `250`, and `900` records
+- Tests cover batch sizes of `49`, `50`, and `51`
+
 ## Future Enhancements
 
 1. **Redis Cache:** For multi-instance deployments
 2. **Configurable Cache TTL:** Make 60-second TTL configurable
 3. **Metrics Export:** Prometheus metrics for monitoring
-4. **Batch Verification:** Support checking multiple wallets in one request
+4. **Batch Verification:** Support checking multiple wallets in one request (bounded to `50` wallets per request)
 5. **Webhook Notifications:** Notify when vaccination status changes
+6. **Configurable Limits:** Make page size, scan limit, and body size caps configurable via env vars

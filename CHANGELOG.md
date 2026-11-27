@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 - Placeholder for changes that will be included in the next release.
+- Explicit network and contract-ID validation in deployment tooling: deployment commands now require an explicit network, validate network-specific configuration, and reject mismatched or missing network settings before any deployment or invocation.
+- Deployment smoke tests that confirm the deployed contract ID belongs to the expected network and matches the expected artifact hash.
+- Contract function and error-code compatibility documentation covering public methods, authorization requirements, error semantics, and version-specific behavior, with backend mapping tests verifying contract errors become stable API responses.
+- Contract dependency and toolchain policy defining supported Rust, Soroban SDK, and CLI versions, CI verification of the declared toolchain and dependency advisories, and a dependency upgrade procedure requiring tests, resource comparison, and release-note updates.
+- Explicit consent and allowlist semantics at the contract/API boundary, documenting state transitions and API behavior for absent, granted, revoked, and changed consent, along with tests proving unauthorized issuance is rejected and public verification does not reveal prohibited fields.
 
 ## [0.1.0] - 2026-05-29
 

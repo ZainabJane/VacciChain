@@ -68,10 +68,10 @@ beforeEach(() => {
 
 
 
-describe('Wallet validation — POST /vaccination/issue', () => {
+describe('Wallet validation — POST /v1/vaccination/issue', () => {
   it('rejects malformed patient_address', async () => {
     const res = await request(app)
-      .post('/vaccination/issue')
+      .post('/v1/vaccination/issue')
       .set('Authorization', `Bearer ${issuerToken}`)
       .send({
         patient_address: 'not-a-wallet',
@@ -86,7 +86,7 @@ describe('Wallet validation — POST /vaccination/issue', () => {
 
   it('rejects checksum-invalid patient_address (correct length, bad checksum)', async () => {
     const res = await request(app)
-      .post('/vaccination/issue')
+      .post('/v1/vaccination/issue')
       .set('Authorization', `Bearer ${issuerToken}`)
       .send({
         patient_address: checksumInvalidWallet,
@@ -104,7 +104,7 @@ describe('Wallet validation — POST /vaccination/issue', () => {
     mintVaccination.mockResolvedValue({ tokenId: 'token-1', hash: 'abc', ledger: 1 });
 
     const res = await request(app)
-      .post('/vaccination/issue')
+      .post('/v1/vaccination/issue')
       .set('Authorization', `Bearer ${issuerToken}`)
       .send({
         patient_address: validPatientWallet,
@@ -121,7 +121,7 @@ describe('Wallet validation — POST /vaccination/issue', () => {
 describe('Wallet validation — GET /vaccination/:wallet', () => {
   it('rejects malformed wallet param', async () => {
     const res = await request(app)
-      .get('/vaccination/not-a-wallet')
+      .get('/v1/vaccination/not-a-wallet')
       .set('Authorization', `Bearer ${patientToken}`);
 
     expect(res.status).toBe(400);
@@ -131,7 +131,7 @@ describe('Wallet validation — GET /vaccination/:wallet', () => {
 
   it('rejects checksum-invalid wallet param (correct length, bad checksum)', async () => {
     const res = await request(app)
-      .get(`/vaccination/${checksumInvalidWallet}`)
+      .get(`/v1/vaccination/${checksumInvalidWallet}`)
       .set('Authorization', `Bearer ${patientToken}`);
 
     expect(res.status).toBe(400);
@@ -142,7 +142,7 @@ describe('Wallet validation — GET /vaccination/:wallet', () => {
 
 describe('Wallet validation — GET /verify/:wallet', () => {
   it('rejects malformed wallet param', async () => {
-    const res = await request(app).get('/verify/not-a-wallet');
+    const res = await request(app).get('/v1/verify/not-a-wallet');
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('Invalid Stellar public key');
@@ -150,7 +150,7 @@ describe('Wallet validation — GET /verify/:wallet', () => {
   });
 
   it('rejects checksum-invalid wallet param (correct length, bad checksum)', async () => {
-    const res = await request(app).get(`/verify/${checksumInvalidWallet}`);
+    const res = await request(app).get(`/v1/verify/${checksumInvalidWallet}`);
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('Invalid Stellar public key');
@@ -163,7 +163,7 @@ describe('Wallet validation — GET /verify/:wallet', () => {
     verifyVaccination.mockResolvedValue({ vaccinated: true, records: [{ vaccine: record.vaccine_name }] });
 
     const res = await request(app)
-      .get(`/verify/${validPatientWallet}`)
+      .get(`/v1/verify/${validPatientWallet}`)
       .set('Authorization', `Bearer ${patientToken}`);
 
     expect(res.status).toBe(200);

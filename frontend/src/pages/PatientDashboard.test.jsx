@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import PatientDashboard from './PatientDashboard';
 
 jest.mock('../hooks/useFreighter', () => ({ useAuth: jest.fn() }));
@@ -98,6 +98,21 @@ describe('PatientDashboard', () => {
       expect(screen.getByText(/2 records/i)).toBeInTheDocument();
     });
 
+    it.each([[1, 'Previous', 'Next'], [3, 'Next', 'Previous']])('paginates from page %i', (page, off, on) => {
+      const setPage = jest.fn();
+      useVaccination.mockReturnValue({ records: [{ token_id: '1', vaccine_name: 'Flu' }], loading: false, error: null, refetch: jest.fn(), page, totalPages: 3, total: 24, setPage });
+      render(<PatientDashboard />);
+      expect(screen.getByText(`Page ${page} of 3`)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: off })).toBeDisabled();
+      screen.getByRole('button', { name: on }).click();
+      expect(setPage).toHaveBeenCalledWith(2);
+    });
+
+    it('hides pagination when empty', () => {
+      render(<PatientDashboard />);
+      expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
+    });
+
     it('shows singular record count when exactly one record exists', () => {
       const records = [
         { token_id: '1', vaccine_name: 'COVID-19', date_administered: '2024-01-15', issuer: 'G123' },
@@ -124,6 +139,78 @@ describe('PatientDashboard', () => {
       render(<PatientDashboard />);
       expect(screen.getByText(/Network error/i)).toBeInTheDocument();
       expect(screen.getByRole('button', { name: /Retry/i })).toBeInTheDocument();
+    });
+
+    it('calls refetch when retry button is clicked', () => {
+      const refetch = jest.fn();
+      useVaccination.mockReturnValue({ records: [], loading: false, error: 'Network error', refetch });
+      render(<PatientDashboard />);
+      fireEvent.click(screen.getByRole('button', { name: /Retry/i }));
+      expect(refetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not show empty state when there is an error', () => {
+      useVaccination.mockReturnValue({ records: [], loading: false, error: 'Network error', refetch: jest.fn() });
+      render(<PatientDashboard />);
+      expect(screen.queryByText(/No vaccination records have been issued yet/i)).not.toBeInTheDocument();
+    });
+
+    it('shows partial state when some records fail to load', () => {
+      const records = [
+        { token_id: '1', vaccine_name: 'COVID-19', date_administered: '2024-01-15', issuer: 'G123' },
+      ];
+      useVaccination.mockReturnValue({
+        records,
+        loading: false,
+        error: null,
+        partial: true,
+        refetch: jest.fn(),
+      });
+      render(<PatientDashboard />);
+      expect(screen.getByText(/1 record/i)).toBeInTheDocument();
+      expect(screen.getByText(/some records could not be loaded/i)).toBeInTheDocument();
+    });
+  });
+
+  describe('when the wallet account changes', () => {
+    it('does not show the prior account records after an account change', () => {
+      const refetch = jest.fn();
+      useAuth.mockReturnValue({ publicKey: WALLET, connect: mockConnect, disconnect: mockDisconnect });
+      useVaccination.mockReturnValue({
+        records: [{ token_id: '1', vaccine_name: 'COVID-19', date_administered: '2024-01-15', issuer: 'G123' }],
+        loading: false,
+        error: null,
+        refetch,
+      });
+      const { rerender } = render(<PatientDashboard />);
+      expect(screen.getByText(/1 record/i)).toBeInTheDocument();
+
+      const NEW_WALLET = 'G98765432109876543210987654321098765432109876543210987654';
+      useAuth.mockReturnValue({ publicKey: NEW_WALLET, connect: mockConnect, disconnect: mockDisconnect });
+      useVaccination.mockReturnValue({ records: [], loading: true, error: null, refetch });
+      rerender(<PatientDashboard />);
+
+      expect(screen.queryByText(/1 record/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/COVID-19/)).not.toBeInTheDocument();
+    });
+
+    it('clears wallet-specific state on disconnect', () => {
+      useAuth.mockReturnValue({ publicKey: WALLET, connect: mockConnect, disconnect: mockDisconnect });
+      useVaccination.mockReturnValue({
+        records: [{ token_id: '1', vaccine_name: 'COVID-19', date_administered: '2024-01-15', issuer: 'G123' }],
+        loading: false,
+        error: null,
+        refetch: jest.fn(),
+      });
+      const { rerender } = render(<PatientDashboard />);
+      expect(screen.getByText(/Wallet:/i)).toBeInTheDocument();
+
+      useAuth.mockReturnValue({ publicKey: null, connect: mockConnect, disconnect: mockDisconnect });
+      rerender(<PatientDashboard />);
+
+      expect(screen.queryByText(/Wallet:/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/COVID-19/)).not.toBeInTheDocument();
+      expect(screen.getByText(/Connect your wallet to view records/i)).toBeInTheDocument();
     });
   });
 });

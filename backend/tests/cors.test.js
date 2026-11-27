@@ -97,7 +97,7 @@ describe('CORS', () => {
 
   it('allows POST requests with explicit method', async () => {
     const res = await request(app)
-      .post('/auth/sep10')
+      .post('/v1/auth/sep10')
       .set('Origin', ALLOWED)
       .send({ public_key: 'invalid' });
 

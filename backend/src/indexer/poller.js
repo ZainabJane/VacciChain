@@ -5,14 +5,10 @@
  * Indexed event types: VaccinationMinted, IssuerAdded, IssuerRevoked
  */
 const StellarSdk = require('@stellar/stellar-sdk');
-const {
-  upsertEvents,
-  getLatestLedger,
-  acquirePollerLock,
-  releasePollerLock,
-  refreshPollerLock,
-} = require('./db');
+const { upsertEvents, getLatestLedger, checkDatabaseIntegrity } = require('./db');
+const { toIndexedMint } = require('../schemas/vaccinationRecord');
 const { invalidateCache } = require('../stellar/issuerCache');
+const { setGauge } = require('../metrics');
 const config = require('../config');
 
 
@@ -43,30 +39,105 @@ const RPC_BACKOFF_MAX_MS = Number.isFinite(config.SOROBAN_RPC_BACKOFF_MAX_MS)
   ? config.SOROBAN_RPC_BACKOFF_MAX_MS
   : 30_000;
 
-let isLeader = false;
-let lockRefreshTimer = null;
-let leaderRetryTimer = null;
-let pollInFlight = false;
-let stopping = false;
-
-// Map Soroban symbol_short event topic names to our internal event_type strings
+// Map Soroban symbol_short event topic names to our internal event_type strings.
+// Versioned symbols (e.g. minted_v1, minted_v2) map to the same internal
+// event_type; the version is preserved in the payload as `schema_version`.
 const TOPIC_MAP = {
-  minted:  'VaccinationMinted',
-  iss_add: 'IssuerAdded',
-  iss_rev: 'IssuerRevoked',
+  minted:     'VaccinationMinted',
+  minted_v1:  'VaccinationMinted',
+  minted_v2:  'VaccinationMinted',
+  iss_add:    'IssuerAdded',
+  iss_add_v1: 'IssuerAdded',
+  iss_add_v2: 'IssuerAdded',
+  iss_rev:    'IssuerRevoked',
+  iss_rev_v1: 'IssuerRevoked',
+  iss_rev_v2: 'IssuerRevoked',
 };
 
+// Default schema version for unversioned (legacy) topic symbols.
+const DEFAULT_SCHEMA_VERSION = 1;
+
+/** Extract the schema version encoded in a topic symbol, or the default. */
+function extractSchemaVersion(topicStr) {
+  const match = /_v(\d+)$/.exec(topicStr ?? '');
+  return match ? Number(match[1]) : DEFAULT_SCHEMA_VERSION;
+}
+
 let timer = null;
+let running = false;
 let inFlight = null;
 let stopped = true;
 let lastCommittedLedger = null;
+
+// Retry configuration for lock contention / transient DB failures.
+// Multiple backend tasks may poll concurrently; SQLite serialises writers, so
+// a contended write surfaces as SQLITE_BUSY. We retry with backoff instead of
+// dropping the batch (which would leave gaps in the index).
+const MAX_WRITE_RETRIES = Number(process.env.INDEXER_WRITE_RETRIES || 5);
+const BASE_RETRY_DELAY_MS = Number(process.env.INDEXER_RETRY_BASE_MS || 100);
 
 function getRpc() {
   return new StellarSdk.SorobanRpc.Server(SOROBAN_RPC_URL);
 }
 
+/** Yield control back to the event loop so other handlers are not starved. */
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Persist a batch of events with retry-on-lock-contention.
+ * Returns true if the batch was written, false if it was abandoned.
+ */
+async function persistEventsWithRetry(events) {
+  for (let attempt = 0; attempt <= MAX_WRITE_RETRIES; attempt++) {
+    try {
+      upsertEvents(events);
+      return true;
+    } catch (err) {
+      const contention = isLockContentionError(err);
+      if (!contention || attempt === MAX_WRITE_RETRIES) {
+        if (process.env.NODE_ENV !== 'test') {
+          console.error(
+            `[indexer] Failed to persist ${events.length} event(s) after ${attempt + 1} attempt(s):`,
+            err.message
+          );
+        }
+        return false;
+      }
+      // Exponential backoff with jitter to de-synchronise competing writers.
+      const delay = BASE_RETRY_DELAY_MS * 2 ** attempt + Math.floor(Math.random() * BASE_RETRY_DELAY_MS);
+      if (process.env.NODE_ENV !== 'test') {
+        console.warn(
+          `[indexer] Lock contention writing events (attempt ${attempt + 1}/${MAX_WRITE_RETRIES}); retrying in ${delay}ms`
+        );
+      }
+      await sleep(delay);
+    }
+  }
+  return false;
+}
+
+/** Log the current schema/migration state so operators can detect drift after failover. */
+function logMigrationState() {
+  if (process.env.NODE_ENV === 'test') return;
+  try {
+    const state = getMigrationState();
+    console.log(
+      `[indexer] DB migration state: version=${state.version} applied=${state.applied} pending=${state.pending}`
+    );
+    if (state.pending > 0) {
+      console.warn(
+        `[indexer] ${state.pending} pending migration(s) detected — run migrations before scaling backend tasks`
+      );
+    }
+  } catch (err) {
+    console.error('[indexer] Unable to read migration state:', err.message);
+  }
 }
 
 /** Compute bounded exponential backoff delay for a given attempt (0-based). */
@@ -133,8 +204,12 @@ function parseEvent(raw) {
         ? Math.floor(new Date(raw.ledgerClosedAt).getTime() / 1000)
         : 0,
       contract_id: raw.contractId ?? CONTRACT_ID,
-      payload: raw.value ?? {},
+      payload: event_type === 'VaccinationMinted' ? toIndexedMint(raw.value) : (raw.value ?? {}),
     };
+
+    // Preserve the event schema version so indexers can distinguish payloads
+    // emitted before and after contract upgrades.
+    parsed.payload.schema_version = extractSchemaVersion(topicStr);
 
     // Extract issuer address from topics for IssuerAdded/Revoked events
     if (parsed.event_type === 'IssuerAdded' || parsed.event_type === 'IssuerRevoked') {
@@ -157,11 +232,20 @@ function logInfo(...args) {
   }
 }
 
-function logWarn(...args) {
-  if (process.env.NODE_ENV !== 'test') {
-    console.warn(...args);
+  // Refuse to process new events if the database failed its integrity check.
+  // Never silently initialize an empty replacement database over a corrupt one.
+  const integrity = checkDatabaseIntegrity();
+  if (!integrity.ok) {
+    console.error(
+      '[indexer] OPERATOR ALERT: database integrity check failed — refusing to process events. ' +
+      'Investigate and repair the index database before restarting the poller. ' +
+      `Reason: ${integrity.reason}`
+    );
+    return;
   }
-}
+
+  const rpc = getRpc();
+  const startLedger = getCheckpoint() + 1;
 
 /**
  * Attempt to become the single polling writer.
@@ -169,31 +253,22 @@ function logWarn(...args) {
  */
 function tryAcquireLeadership() {
   try {
-    const acquired = acquirePollerLock(POLLER_ID, LOCK_TTL_MS);
-    if (acquired && !isLeader) {
-      isLeader = true;
-      logInfo(`[indexer] Acquired poller lock as leader (id=${POLLER_ID})`);
-      startLockRefresh();
-      stopLeaderRetry();
-    }
-    return isLeader;
+    // Read-only call: safe to retry. The shared client applies bounded
+    // timeouts and a retry policy, and classifies exhausted failures.
+    response = await getEvents({
+      startLedger,
+      filters: [{ contractIds: [CONTRACT_ID] }],
+    });
   } catch (err) {
-    logWarn('[indexer] Failed to acquire poller lock:', err.message);
-    return false;
-  }
-}
-
-function startLockRefresh() {
-  if (lockRefreshTimer) return;
-  lockRefreshTimer = setInterval(() => {
-    try {
-      const stillLeader = refreshPollerLock(POLLER_ID, LOCK_TTL_MS);
-      if (!stillLeader && isLeader) {
-        loseLeadership('lock refresh failed');
-      }
-    } catch (err) {
-      logWarn('[indexer] Poller lock refresh error:', err.message);
-      loseLeadership('lock refresh error');
+    // Do NOT advance the checkpoint on RPC failure — the next poll retries
+    // from the same startLedger so no ledger events are silently skipped.
+    if (process.env.NODE_ENV !== 'test') {
+      const correlationId = err.correlationId || 'n/a';
+      const classification = err.classification || 'unknown';
+      console.error(
+        `[indexer] Poll error (classification=${classification}, correlationId=${correlationId}):`,
+        err.message,
+      );
     }
   }, LOCK_REFRESH_MS);
   if (lockRefreshTimer.unref) lockRefreshTimer.unref();
@@ -206,83 +281,31 @@ function stopLockRefresh() {
   }
 }
 
-function startLeaderRetry() {
-  if (leaderRetryTimer || stopping) return;
-  leaderRetryTimer = setInterval(() => {
-    if (!isLeader) tryAcquireLeadership();
-  }, LEADER_RETRY_MS);
-  if (leaderRetryTimer.unref) leaderRetryTimer.unref();
-}
-
-function stopLeaderRetry() {
-  if (leaderRetryTimer) {
-    clearInterval(leaderRetryTimer);
-    leaderRetryTimer = null;
-  }
-}
-
-function loseLeadership(reason) {
-  if (!isLeader) return;
-  isLeader = false;
-  stopLockRefresh();
-  logWarn(`[indexer] Lost poller leadership (${reason}); entering standby mode`);
-  startLeaderRetry();
-}
-
-/**
- * Release leadership on shutdown so a replacement task can take over quickly.
- */
-function releaseLeadership() {
-  stopLockRefresh();
-  stopLeaderRetry();
-  if (isLeader) {
-    try {
-      releasePollerLock(POLLER_ID);
-      logInfo(`[indexer] Released poller lock (id=${POLLER_ID})`);
-    } catch (err) {
-      logWarn('[indexer] Failed to release poller lock:', err.message);
-    }
-  }
-  isLeader = false;
-}
-
-async function runPoll() {
-  if (!CONTRACT_ID) {
-    logWarn('[indexer] VACCINATIONS_CONTRACT_ID not set — skipping poll');
-    return;
-  }
-
-  // Respect the single-writer constraint: only the leader may poll and write.
-  if (!isLeader && !tryAcquireLeadership()) {
-    logInfo(`[indexer] Not the leader (id=${POLLER_ID}) — skipping poll`);
-    return;
-  }
-
-  // Guard against overlapping polls within the same task.
-  if (pollInFlight) {
-    logInfo('[indexer] Previous poll still in flight — skipping this tick');
-    return;
-  }
-  pollInFlight = true;
+  running = true;
+  const runStart = Date.now();
+  jobStatus.lastRunAt = new Date(runStart).toISOString();
+  jobStatus.lastEventCount = 0;
+  jobStatus.lastBatchCount = 0;
 
   try {
     const rpc = getRpc();
     const startLedger = getCheckpoint() + 1;
 
-    let response;
-    try {
-      response = await fetchEventsWithRetry(rpc, {
-        startLedger,
-        filters: [{ contractIds: [CONTRACT_ID] }],
-      });
-    } catch (err) {
-      // Do NOT advance the checkpoint on RPC failure — the next poll retries
-      // from the same startLedger so no ledger events are silently skipped.
-      if (process.env.NODE_ENV !== 'test') {
-        console.error('[indexer] Poll error (checkpoint unchanged):', err.message);
-      }
+  // Record successful poll timestamp and latest indexed ledger for SLO alerting
+  // (poller lag / data freshness).
+  setGauge('indexer_last_successful_poll_timestamp_seconds', Math.floor(Date.now() / 1000));
+  setGauge('indexer_latest_indexed_ledger', getLatestLedger());
+
+  if (valid.length) {
+    const stored = await persistEventsWithRetry(valid);
+    if (!stored) {
+      // Do not advance past this batch: the next poll re-reads from the same
+      // startLedger so no events are lost when a write is abandoned.
       return;
     }
+    jobStatus.lastGetEventsMs = Date.now() - getStart;
+
+    setGauge('indexer_latest_indexed_ledger', getLatestLedger());
 
     const rawEvents = response.events ?? [];
 
@@ -312,34 +335,57 @@ async function runPoll() {
       console.warn(`[indexer] Quarantined ${malformed} malformed event(s) at ledger ${startLedger}`);
     }
 
+    jobStatus.lastEventCount = valid.length;
+
     if (valid.length) {
-      // Re-verify leadership immediately before writing to avoid split-brain
-      // writes if the lock was lost while the RPC call was in flight.
-      if (!refreshPollerLock(POLLER_ID, LOCK_TTL_MS)) {
-        loseLeadership('lock lost before write');
-        return;
-      }
+      let upsertMs = 0;
 
-      try {
-        upsertEvents(valid);
-      } catch (err) {
-        // Persistence failed — leave the checkpoint untouched so events are
-        // retried on the next poll instead of being lost.
-        if (process.env.NODE_ENV !== 'test') {
-          console.error('[indexer] Persistence error (checkpoint unchanged):', err.message);
+      // Process events in bounded batches, yielding between batches so the
+      // event loop stays responsive for request handlers.
+      for (let i = 0; i < valid.length; i += BATCH_SIZE) {
+        const batch = valid.slice(i, i + BATCH_SIZE);
+
+        const upsertStart = Date.now();
+        try {
+          upsertEvents(batch);
+        } catch (err) {
+          // Persistence failed — leave the checkpoint untouched so events are
+          // retried on the next poll instead of being lost.
+          jobStatus.errors += 1;
+          jobStatus.lastError = err.message;
+          jobStatus.lastErrorAt = new Date().toISOString();
+          if (process.env.NODE_ENV !== 'test') {
+            console.error('[indexer] Persistence error (checkpoint unchanged):', err.message);
+          }
+          return;
         }
-        return;
-      }
+        upsertMs += Date.now() - upsertStart;
 
-      logInfo(`[indexer] Stored ${valid.length} new event(s) from ledger ${startLedger}`);
+        // Invalidate issuer cache on relevant events
+        for (const e of batch) {
+          if ((e.event_type === 'IssuerRevoked' || e.event_type === 'IssuerAdded') && e.payload.issuer) {
+            invalidateCache(e.payload.issuer);
+            if (process.env.NODE_ENV !== 'test') {
+              console.log(`[indexer] Invalidated cache for issuer: ${e.payload.issuer}`);
+            }
+          }
+        }
 
-      // Invalidate issuer cache on relevant events
-      for (const e of valid) {
-        if ((e.event_type === 'IssuerRevoked' || e.event_type === 'IssuerAdded') && e.payload.issuer) {
-          invalidateCache(e.payload.issuer);
-          logInfo(`[indexer] Invalidated cache for issuer: ${e.payload.issuer}`);
+        jobStatus.lastBatchCount += 1;
+
+        // Yield to the event loop between batches (skip after the last one).
+        if (i + BATCH_SIZE < valid.length) {
+          await yieldToEventLoop();
         }
       }
+
+      jobStatus.lastUpsertMs = upsertMs;
+
+      if (process.env.NODE_ENV !== 'test') {
+        console.log(`[indexer] Stored ${valid.length} new event(s) from ledger ${startLedger} in ${jobStatus.lastBatchCount} batch(es)`);
+      }
+    } else {
+      jobStatus.lastUpsertMs = 0;
     }
 
     // Advance the checkpoint only after successful persistence. When malformed
@@ -347,8 +393,18 @@ async function runPoll() {
     if (malformed === 0 && maxLedger >= startLedger) {
       lastCommittedLedger = maxLedger;
     }
+
+    jobStatus.runs += 1;
+  } catch (err) {
+    jobStatus.errors += 1;
+    jobStatus.lastError = err.message;
+    jobStatus.lastErrorAt = new Date().toISOString();
+    if (process.env.NODE_ENV !== 'test') {
+      console.error('[indexer] Poll error:', err.message);
+    }
   } finally {
-    pollInFlight = false;
+    jobStatus.lastDurationMs = Date.now() - runStart;
+    running = false;
   }
 }
 
@@ -372,6 +428,7 @@ function startPoller(intervalMs) {
   if (timer) return;
   stopping = false;
   stopped = false;
+  logMigrationState();
   loadCheckpoint();
 
   // Attempt to become the leader; if another task holds the lock we run as a
@@ -423,10 +480,11 @@ module.exports = {
   stopPoller,
   poll,
   parseEvent,
-  tryAcquireLeadership,
-  releaseLeadership,
-  isLeader: () => isLeader,
+  TOPIC_MAP,
+  extractSchemaVersion,
   loadCheckpoint,
   getCheckpoint,
   backoffDelay,
+  persistEventsWithRetry,
+  logMigrationState,
 };

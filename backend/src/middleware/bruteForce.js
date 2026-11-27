@@ -11,6 +11,7 @@
 
 const { audit } = require('./auditLog');
 const logger = require('../logger');
+const { getTrustedClientIp } = require('../utils/clientIdentity');
 
 const MAX_ATTEMPTS     = parseInt(process.env.BRUTE_FORCE_MAX_ATTEMPTS   || '5',      10);
 const WINDOW_MS        = parseInt(process.env.BRUTE_FORCE_WINDOW_MS      || '600000', 10); // 10 min
@@ -72,19 +73,27 @@ function recordSuccess(key) {
  * Returns 429 with retryAfter if either is blocked.
  */
 function bruteForceGuard(req, res, next) {
-  const ip     = req.ip || req.socket?.remoteAddress || 'unknown';
+  // Resolve the client identity via the trusted-proxy helper so that spoofed
+  // X-Forwarded-For / Forwarded headers cannot be used to bypass or poison the
+  // block store. Only trusted proxies contribute to the resolved address.
+  const ip = getTrustedClientIp(req) || 'unknown';
   // wallet may not be in body yet — we check again after body parse
   const wallet = req.body?.public_key || req.body?.wallet || null;
 
-  const ipBlocked     = isBlocked(`ip:${ip}`);
-  const walletBlocked = wallet && isBlocked(`wallet:${wallet}`);
+  const ipKey     = `ip:${ip}`;
+  const walletKey = wallet ? `wallet:${wallet}` : null;
+
+  const ipBlocked     = isBlocked(ipKey);
+  const walletBlocked = walletKey && isBlocked(walletKey);
 
   if (ipBlocked || walletBlocked) {
-    const entry = store.get(ipBlocked ? `ip:${ip}` : `wallet:${wallet}`);
-    const retryAfter = Math.ceil((entry.blockedUntil - Date.now()) / 1000);
+    const entry = store.get(ipBlocked ? ipKey : walletKey);
+    const retryAfter = Math.max(1, Math.ceil((entry.blockedUntil - Date.now()) / 1000));
+    res.set('Retry-After', String(retryAfter));
     return res.status(429).json({
       error: 'Too many failed attempts. Try again later or contact support.',
       retryAfter,
+      retry_after: retryAfter,
     });
   }
 

@@ -1,12 +1,14 @@
 const express = require('express');
+const { ERROR_CODES, sendError } = require('../errors');
 const jwt = require('jsonwebtoken');
 const StellarSdk = require('@stellar/stellar-sdk');
 const { buildChallenge, verifyChallenge } = require('../stellar/sep10');
-const { sep10Limiter } = require('../middleware/rateLimiter');
+const { sep10Limiter, verifyLimiter } = require('../middleware/rateLimiter');
 const { audit } = require('../middleware/auditLog');
 const validate = require('../middleware/validate');
 const { bruteForceGuard, recordFailure, recordSuccess } = require('../middleware/bruteForce');
-const { getSigningKey } = require('../jwtKeys');
+const { getSigningKey, signOptions } = require('../jwtKeys');
+const { isAuthorizedIssuer } = require('../stellar/issuerCache');
 const { sep10Schema, verifySchema } = require('./schemas/auth.schemas');
 
 const router = express.Router();
@@ -47,18 +49,30 @@ const router = express.Router();
  *       400:
  *         description: Invalid Stellar public key format
  *       429:
- *         description: Rate limit exceeded (max 10 requests per IP per minute)
+ *         description: >
+ *           Rate limit exceeded (max 10 requests per trusted client per minute).
+ *           The response body is `{ "error": "...", "retryAfter": <seconds> }`
+ *           and the `RateLimit` and `Retry-After` headers are set.
+ *         headers:
+ *           RateLimit:
+ *             description: Rate limit policy and remaining quota
+ *             schema:
+ *               type: string
+ *           Retry-After:
+ *             description: Seconds until the client may retry
+ *             schema:
+ *               type: integer
  *       500:
  *         description: Internal server error
  */
-router.post('/sep10', sep10Limiter, validate(sep10Schema), async (req, res) => {
+router.post('/sep10', sep10Limiter, validate(sep10Schema), async (req, res, next) => {
   const { public_key } = req.body;
 
   try {
     const { transaction, nonce } = await buildChallenge(public_key);
     res.json({ transaction, nonce });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendError(req, res, 500, ERROR_CODES.INTERNAL_ERROR, err.message);
   }
 });
 
@@ -105,35 +119,61 @@ router.post('/sep10', sep10Limiter, validate(sep10Schema), async (req, res) => {
  *                   description: Authenticated Stellar public key
  *                 role:
  *                   type: string
- *                   enum: [admin, patient]
+ *                   enum: [admin, issuer, patient]
  *                   description: Role derived from the authenticated key
  *       400:
  *         description: Missing or malformed parameters
  *       401:
  *         description: Invalid signature or nonce mismatch
+ *       429:
+ *         description: >
+ *           Rate limit exceeded (max 10 verification attempts per trusted
+ *           client per minute). The response body is
+ *           `{ "error": "...", "retryAfter": <seconds> }` and the `RateLimit`
+ *           and `Retry-After` headers are set.
+ *         headers:
+ *           RateLimit:
+ *             description: Rate limit policy and remaining quota
+ *             schema:
+ *               type: string
+ *           Retry-After:
+ *             description: Seconds until the client may retry
+ *             schema:
+ *               type: integer
  */
-router.post('/verify', validate(verifySchema), bruteForceGuard, (req, res) => {
+router.post('/verify', verifyLimiter, validate(verifySchema), bruteForceGuard, async (req, res) => {
   const { transaction, nonce } = req.body;
   const ip = req.ip || req.socket?.remoteAddress || 'unknown';
 
   try {
     const publicKey = verifyChallenge(transaction, nonce);
 
-    const role = publicKey === process.env.ADMIN_PUBLIC_KEY ? 'admin' : 'patient';
+    // #47: the role is derived only from server-side sources — the configured
+    // admin key and the on-chain issuer allowlist — never from client input.
+    let role = 'patient';
+    if (publicKey === process.env.ADMIN_PUBLIC_KEY) {
+      role = 'admin';
+    } else {
+      try {
+        if (await isAuthorizedIssuer(publicKey)) role = 'issuer';
+      } catch (_) {
+        // Allowlist unavailable: fall back to the least-privileged role.
+      }
+    }
     const now = Math.floor(Date.now() / 1000);
     const signingKey = getSigningKey();
 
+    // iss/aud/alg/exp/kid come from jwtKeys.signOptions() so issuing and
+    // verifying share one policy (see docs/jwt-key-rotation.md).
     const token = jwt.sign(
       {
         sub: publicKey,
-        iss: process.env.HOME_DOMAIN || 'localhost',
         iat: now,
         wallet: publicKey,
-        publicKey,
         role,
       },
       signingKey.secret,
-      { expiresIn: '1h', keyid: signingKey.kid }
+      signOptions()
     );
 
     audit({ actor: publicKey, action: 'auth.login', result: 'success', meta: { role } });
@@ -152,7 +192,7 @@ router.post('/verify', validate(verifySchema), bruteForceGuard, (req, res) => {
     if (wallet) recordFailure(`wallet:${wallet}`, { ip, wallet });
 
     audit({ actor: wallet || 'unknown', action: 'auth.login', result: 'failure', meta: { error: err.message } });
-    res.status(401).json({ error: err.message });
+    next(new AppError('unauthorized', 'Invalid signature or nonce mismatch', 401));
   }
 });
 
