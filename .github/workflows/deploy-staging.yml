@@ -101,3 +101,87 @@ jobs:
             -d '{
               "text": "🚨 Staging deployment failed for commit `${{ github.sha }}` by `${{ github.actor }}`. See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }'
+
+  smoke-tests:
+    name: Staging smoke tests
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.vaccichain.example.com
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Frontend route load
+        run: |
+          set -euo pipefail
+          for route in "/" "/verify" "/login"; do
+            echo "Checking frontend route: ${route}"
+            status=$(curl -s -o /dev/null -w "%{http_code}" \
+              --retry 5 --retry-delay 5 --retry-connrefused --max-time 30 \
+              "https://staging.vaccichain.example.com${route}")
+            if [ "${status}" -lt 200 ] || [ "${status}" -ge 400 ]; then
+              echo "::error::Frontend route ${route} returned HTTP ${status}"
+              exit 1
+            fi
+          done
+
+      - name: Backend API health
+        run: |
+          set -euo pipefail
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            --retry 5 --retry-delay 5 --retry-connrefused --max-time 30 \
+            "https://staging.vaccichain.example.com/api/health")
+          if [ "${status}" -ne 200 ]; then
+            echo "::error::API health endpoint returned HTTP ${status}"
+            exit 1
+          fi
+          body=$(curl -sf --max-time 30 "https://staging.vaccichain.example.com/api/health")
+          echo "Health response: ${body}"
+          echo "${body}" | grep -qi '"status"[[:space:]]*:[[:space:]]*"ok"' || {
+            echo "::error::API health response did not report status ok"
+            exit 1
+          }
+
+      - name: Analytics reachability
+        run: |
+          set -euo pipefail
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            --retry 5 --retry-delay 5 --retry-connrefused --max-time 30 \
+            "https://staging.vaccichain.example.com/api/analytics/health")
+          if [ "${status}" -lt 200 ] || [ "${status}" -ge 400 ]; then
+            echo "::error::Analytics endpoint returned HTTP ${status}"
+            exit 1
+          fi
+
+      - name: Public verification (safe test case)
+        run: |
+          set -euo pipefail
+          test_wallet="${STAGING_TEST_WALLET:-0x0000000000000000000000000000000000000000}"
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            --retry 5 --retry-delay 5 --retry-connrefused --max-time 30 \
+            "https://staging.vaccichain.example.com/verify/public/${test_wallet}")
+          if [ "${status}" -lt 200 ] || [ "${status}" -ge 400 ]; then
+            echo "::error::Public verification endpoint returned HTTP ${status}"
+            exit 1
+          fi
+        env:
+          STAGING_TEST_WALLET: ${{ secrets.STAGING_TEST_WALLET }}
+
+      - name: Post smoke test summary
+        if: always()
+        run: |
+          echo "### Staging Smoke Tests" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Result:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp:** $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_STEP_SUMMARY
+
+      - name: Alert on smoke test failure
+        if: failure()
+        run: |
+          curl -sf -X POST "${{ secrets.ALERT_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "🚨 Staging smoke tests failed for commit `${{ github.sha }}` by `${{ github.actor }}`. Production promotion is blocked. See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }'

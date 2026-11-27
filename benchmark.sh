@@ -59,6 +59,32 @@ if [ "$BENCHMARK_TYPE" = "contract" ] || [ "$BENCHMARK_TYPE" = "all" ]; then
   echo "Running gas benchmarks..."
   cargo test --release -- --nocapture --test-threads=1 2>&1 | tee "../$RESULTS_DIR/gas_${TIMESTAMP}.txt"
   
+  # Resource baselines for representative mint, verify, revoke, and batch operations
+  echo "Running resource baseline tests..."
+  mkdir -p benchmarks
+  cargo test --release --test resource_baseline -- --nocapture --test-threads=1 \
+    2>&1 | tee "../$RESULTS_DIR/resource_${TIMESTAMP}.txt"
+  
+  # Publish machine-readable baseline for CI and local comparison
+  BASELINE_FILE="benchmarks/resource-baseline.json"
+  if [ -f "$BASELINE_FILE" ]; then
+    cp "$BASELINE_FILE" "../$RESULTS_DIR/resource-baseline_${TIMESTAMP}.json"
+    echo "Baseline written to contracts/$BASELINE_FILE"
+  else
+    echo "❌ Expected baseline file contracts/$BASELINE_FILE was not produced"
+    exit 1
+  fi
+  
+  # Enforce regression thresholds (same comparison CI runs)
+  echo "Comparing against documented thresholds..."
+  if [ -x "./scripts/compare-resources.sh" ]; then
+    ./scripts/compare-resources.sh "$BASELINE_FILE" \
+      2>&1 | tee "../$RESULTS_DIR/resource-comparison_${TIMESTAMP}.txt"
+  else
+    echo "❌ Missing contracts/scripts/compare-resources.sh"
+    exit 1
+  fi
+  
   echo "✅ Contract benchmarks complete"
   cd ..
 fi

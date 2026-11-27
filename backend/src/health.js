@@ -5,6 +5,7 @@ const logger = require('./logger');
 let sorobanHealthy = true;
 let lastProbeAt = null;
 let ready = false;
+let dbInitialized = false;
 
 function getHealthStatus() {
   const status = sorobanHealthy ? 'ok' : 'degraded';
@@ -21,6 +22,21 @@ function setReady(value) {
 
 function isReady() {
   return ready;
+}
+
+function getReadinessStatus() {
+  const checks = {
+    db: dbInitialized ? 'ok' : 'unavailable',
+    soroban: sorobanHealthy ? 'ok' : 'unavailable',
+  };
+  const ready = dbInitialized && sorobanHealthy;
+  return {
+    status: ready ? 'ready' : 'not_ready',
+    ready,
+    checks,
+    uptime: Number(process.uptime().toFixed(3)),
+    lastProbeAt: lastProbeAt ? lastProbeAt.toISOString() : null,
+  };
 }
 
 async function probeSorobanHealth() {
@@ -58,11 +74,17 @@ function setSorobanHealthy(value) {
   lastProbeAt = new Date();
 }
 
+function setDbInitialized(value) {
+  dbInitialized = Boolean(value);
+}
+
 module.exports = {
   getHealthStatus,
+  getReadinessStatus,
   startHealthProbe,
   setSorobanHealthy,
   setReady,
   isReady,
+  setDbInitialized,
   _getLastProbeAt: () => lastProbeAt,
 };

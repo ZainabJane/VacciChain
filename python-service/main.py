@@ -4,8 +4,10 @@ import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 
+import httpx
 import structlog
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -93,3 +95,24 @@ async def log_requests(request: Request, call_next):
 @app.get("/health")
 def health():
     return HealthResponse(status="ok")
+
+
+@app.get("/ready")
+async def ready():
+    backend_url = os.getenv("BACKEND_URL", "http://backend:3000")
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(f"{backend_url}/health")
+        if response.status_code != 200:
+            logger.warning("readiness_failed", dependency="backend", status=response.status_code)
+            return JSONResponse(
+                status_code=503,
+                content={"status": "not_ready", "dependency": "backend"},
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("readiness_failed", dependency="backend", error=str(exc))
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "dependency": "backend"},
+        )
+    return {"status": "ready"}

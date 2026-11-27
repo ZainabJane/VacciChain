@@ -275,25 +275,76 @@ async function mintVaccination(patient, vaccineName, dateAdministered, issuerSec
 }
 
 /**
+ * Explicit verification statuses. These MUST NOT be collapsed into a boolean:
+ * a missing, revoked, or unavailable record is never a positive verification.
+ */
+const VerificationStatus = Object.freeze({
+  VALID: 'valid',
+  REVOKED: 'revoked',
+  ABSENT: 'absent',
+  UNAVAILABLE: 'unavailable',
+});
+
+/**
  * Verify vaccination status via a read-only contract call.
+ *
+ * Returns an explicit status rather than a boolean so callers cannot
+ * misinterpret missing/revoked/unavailable data as a positive result.
+ * RPC and simulation failures are mapped to UNAVAILABLE (never VALID).
+ *
  * @param {string} wallet - Stellar wallet address to verify
  * @param {Object} [options]
  * @param {string} [options.requestId] - Correlation ID for this workflow
+ * @returns {Promise<{wallet: string, status: string, vaccinated: boolean, records: Array, error?: string}>}
  */
 async function verifyVaccination(wallet, options = {}) {
   const requestId = options.requestId || getRequestId();
   try {
     const args = [StellarSdk.Address.fromString(wallet).toScVal()];
     const rawResult = await simulateContract('verify_vaccination', args, { requestId });
+
+    if (rawResult == null) {
+      // No return value from the contract: treat as absent, never positive.
+      return {
+        wallet,
+        status: VerificationStatus.ABSENT,
+        vaccinated: false,
+        records: [],
+      };
+    }
+
     const [vaccinated, records] = StellarSdk.scValToNative(rawResult);
+    const recordList = Array.isArray(records) ? records : [];
+
+    let status;
+    if (vaccinated === true && recordList.length > 0) {
+      status = VerificationStatus.VALID;
+    } else if (recordList.length > 0) {
+      // Records exist but are not currently valid (e.g. revoked).
+      status = VerificationStatus.REVOKED;
+    } else {
+      status = VerificationStatus.ABSENT;
+    }
+
     return {
       wallet,
-      vaccinated,
-      records: Array.isArray(records) ? records : [],
+      status,
+      vaccinated: status === VerificationStatus.VALID,
+      records: recordList,
     };
   } catch (error) {
-    if (error instanceof SorobanError) throw error;
-    throw new SorobanSimulationError('Failed to verify vaccination status', error);
+    // Any RPC/simulation failure means data is unavailable — never positive.
+    logger.warn('Vaccination verification unavailable', {
+      wallet,
+      message: error.message,
+    });
+    return {
+      wallet,
+      status: VerificationStatus.UNAVAILABLE,
+      vaccinated: false,
+      records: [],
+      error: error.message,
+    };
   }
 }
 
@@ -351,6 +402,7 @@ module.exports = {
   addIssuer,
   revokeIssuer,
   sendRpcTimeout,
+  VerificationStatus,
   SorobanError,
   SorobanRpcError,
   SorobanTransactionError,

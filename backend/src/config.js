@@ -39,6 +39,12 @@ const schema = z.object({
 
   // Indexer
   EVENT_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(15000),
+  // Maximum number of consecutive failed poll attempts before giving up (bounded retries)
+  EVENT_POLL_MAX_RETRIES: z.coerce.number().int().nonnegative().default(5),
+  // Base delay for exponential backoff between failed poll attempts
+  EVENT_POLL_BACKOFF_BASE_MS: z.coerce.number().int().positive().default(500),
+  // Upper bound for exponential backoff delay between failed poll attempts
+  EVENT_POLL_BACKOFF_MAX_MS: z.coerce.number().int().positive().default(30000),
   DATABASE_PATH: z.string().default('/data/vaccichain.db'),
 
   // Batch verification limits (documented bounds)
@@ -46,6 +52,12 @@ const schema = z.object({
   BATCH_MAX_SIZE: z.coerce.number().int().min(1).max(100).default(100),
   // BATCH_CONCURRENCY: maximum number of items processed in parallel (1..20)
   BATCH_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(5),
+
+  // Database migrations directory (repeatable, reversible schema upgrades)
+  MIGRATIONS_DIR: z.string().min(1).default('./migrations'),
+
+  // Graceful shutdown: maximum time to drain in-flight work before forcing exit
+  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
 });
 
 function validateEnv(env) {

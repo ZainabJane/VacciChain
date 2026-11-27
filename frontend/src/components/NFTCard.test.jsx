@@ -4,6 +4,27 @@ import NFTCard from './NFTCard';
 
 expect.extend(toHaveNoViolations);
 
+const mockChangeLanguage = jest.fn();
+
+jest.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key, options) => {
+      if (key === 'card.date') return `Date: ${options?.value ?? ''}`;
+      if (key === 'card.issuer') return `Issuer: ${options?.value ?? ''}`;
+      if (key === 'card.doses') {
+        return `${options?.current}/${options?.total} doses`;
+      }
+      if (key === 'card.dose') return `Dose ${options?.count ?? ''}`;
+      if (key === 'card.dateUnknown') return 'Date: Unknown';
+      return key;
+    },
+    i18n: {
+      language: 'en',
+      changeLanguage: mockChangeLanguage
+    }
+  })
+}));
+
 describe('NFTCard', () => {
   const mockRecord = {
     token_id: '12345',
@@ -16,6 +37,7 @@ describe('NFTCard', () => {
 
   beforeEach(() => {
     mockOnClick.mockClear();
+    mockChangeLanguage.mockClear();
   });
 
   it('should render NFT details correctly', () => {
@@ -23,8 +45,45 @@ describe('NFTCard', () => {
 
     expect(screen.getByText('💉 COVID-19')).toBeInTheDocument();
     expect(screen.getByText('#12345')).toBeInTheDocument();
-    expect(screen.getByText('Date: 2024-01-15')).toBeInTheDocument();
+    expect(screen.getByText(/Date: /)).toBeInTheDocument();
     expect(screen.getByText(/Issuer: GABC1234/)).toBeInTheDocument();
+  });
+
+  it('formats date_administered using the en locale', () => {
+    render(<NFTCard record={mockRecord} />);
+
+    const expected = new Intl.DateTimeFormat('en', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    }).format(new Date('2024-01-15'));
+
+    expect(screen.getByText(`Date: ${expected}`)).toBeInTheDocument();
+  });
+
+  it('formats date_administered using the fr locale', () => {
+    mockChangeLanguage('fr');
+    render(<NFTCard record={mockRecord} />);
+
+    const expected = new Intl.DateTimeFormat('fr', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    }).format(new Date('2024-01-15'));
+
+    expect(screen.getByText(`Date: ${expected}`)).toBeInTheDocument();
+  });
+
+  it('renders a safe fallback for an invalid date_administered', () => {
+    render(<NFTCard record={{ ...mockRecord, date_administered: 'not-a-date' }} />);
+
+    expect(screen.getByText('Date: Unknown')).toBeInTheDocument();
+  });
+
+  it('renders a safe fallback when date_administered is missing', () => {
+    render(<NFTCard record={{ ...mockRecord, date_administered: undefined }} />);
+
+    expect(screen.getByText('Date: Unknown')).toBeInTheDocument();
   });
 
   it('should handle click events', () => {
@@ -85,6 +144,13 @@ describe('NFTCard', () => {
     const doseRecord = { ...mockRecord, dose_number: 1 };
     render(<NFTCard record={doseRecord} />);
     expect(screen.getByText('Dose 1')).toBeInTheDocument();
+  });
+
+  it('should use singular plural form for a single dose', () => {
+    const doseRecord = { ...mockRecord, dose_number: 1, dose_series: 1 };
+    render(<NFTCard record={doseRecord} />);
+    expect(screen.getByText('1/1 doses')).toBeInTheDocument();
+    expect(screen.getByLabelText('Dose 1 of 1')).toBeInTheDocument();
   });
 
   it('should not display dose badge when dose_number is absent', () => {

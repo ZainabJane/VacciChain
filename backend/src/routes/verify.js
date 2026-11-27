@@ -57,6 +57,50 @@ function isTimeoutError(err) {
 }
 
 /**
+ * Verification status values. These are the only values a caller may rely on:
+ * - valid:       records exist and are currently valid
+ * - revoked:     records exist but have been revoked
+ * - absent:      no records exist for the wallet
+ * - unavailable: the contract/RPC could not be queried; this is NOT a negative result
+ */
+const VERIFY_STATUS = Object.freeze({
+  VALID: 'valid',
+  REVOKED: 'revoked',
+  ABSENT: 'absent',
+  UNAVAILABLE: 'unavailable',
+});
+
+/**
+ * Derive the explicit verification status from a successful contract result.
+ * A wallet is only "valid" when it has at least one non-revoked record.
+ */
+function deriveStatus(vaccinated, records) {
+  const list = Array.isArray(records) ? records : [];
+  if (list.length === 0) return VERIFY_STATUS.ABSENT;
+  if (vaccinated) return VERIFY_STATUS.VALID;
+  return VERIFY_STATUS.REVOKED;
+}
+
+/**
+ * Detect RPC/transport failures that must be surfaced as "unavailable"
+ * rather than collapsed into a positive or negative verification result.
+ */
+function isUnavailableError(err) {
+  if (!err) return true;
+  if (err instanceof SorobanTimeoutError) return true;
+  if (err.code === 'SOROBAN_TIMEOUT' || err.code === 'RPC_UNAVAILABLE') return true;
+  const msg = typeof err.message === 'string' ? err.message.toLowerCase() : '';
+  return (
+    msg.includes('timeout') ||
+    msg.includes('deadline') ||
+    msg.includes('abort') ||
+    msg.includes('unavailable') ||
+    msg.includes('econnrefused') ||
+    msg.includes('network')
+  );
+}
+
+/**
  * Try JWT first; if no Authorization header, fall through to API key auth.
  * One of the two must succeed — otherwise 401.
  */
@@ -106,7 +150,16 @@ function adaptiveLimiter(req, res, next) {
  *                   type: string
  *                 verified:
  *                   type: boolean
- *                   description: Whether the wallet has vaccination records
+ *                   description: >
+ *                     True only when status is "valid". Never true when status is
+ *                     "revoked", "absent", or "unavailable".
+ *                 status:
+ *                   type: string
+ *                   enum: [valid, revoked, absent, unavailable]
+ *                   description: >
+ *                     Explicit verification status. "unavailable" means the data
+ *                     could not be retrieved and MUST NOT be interpreted as a
+ *                     negative (or positive) medical determination.
  *                 records:
  *                   type: array
  *                   items:
@@ -116,9 +169,11 @@ function adaptiveLimiter(req, res, next) {
  *       429:
  *         description: Rate limit exceeded (60 requests per IP per minute)
  *       503:
- *         description: RPC timeout or service unavailable
+ *         description: >
+ *           RPC timeout or service unavailable. Response body has
+ *           status "unavailable" and verified false; this is not a negative result.
  *       500:
- *         description: Contract query failed
+ *         description: Contract query failed (status "unavailable", verified false)
  *         content:
  *           application/json:
  *             schema:
@@ -138,15 +193,18 @@ router.get(
     if (cached && (now - cached.timestamp < CACHE_TTL)) {
       return res.json({
         wallet,
-        verified: cached.vaccinated,
+        status: cached.status,
+        verified: cached.status === VERIFY_STATUS.VALID,
         records: cached.records
       });
     }
 
     try {
       const { vaccinated, records } = await verifyVaccination(wallet, { requestId: req.id });
+      const status = deriveStatus(vaccinated, records);
 
       verifyCache.set(wallet, {
+        status,
         vaccinated,
         records,
         timestamp: now
@@ -157,15 +215,29 @@ router.get(
         action: 'verify.public_lookup',
         target: wallet,
         result: 'success',
-        meta: { ip },
+        meta: { ip, status },
       });
 
-      res.json({ wallet, verified: vaccinated, records });
+      res.json({
+        wallet,
+        status,
+        verified: status === VERIFY_STATUS.VALID,
+        records
+      });
     } catch (err) {
       const errorMessage = resolveContractErrorMessage(err);
       audit({ actor: ip, action: 'verify.public_lookup', target: wallet, result: 'failure', meta: { error: errorMessage, ip } });
 
-      res.status(isTimeoutError(err) ? 503 : 500).json({ error: errorMessage, requestId: req.id });
+      // An RPC/contract failure is "unavailable" — never a positive verification
+      // result, and never a negative determination either.
+      const unavailable = isUnavailableError(err);
+      res.status(unavailable ? 503 : 500).json({
+        wallet,
+        status: VERIFY_STATUS.UNAVAILABLE,
+        verified: false,
+        error: errorMessage,
+        requestId: req.id
+      });
     }
   }
 );
@@ -204,6 +276,16 @@ router.get(
  *                   type: boolean
  *                 verified:
  *                   type: boolean
+ *                   description: >
+ *                     True only when status is "valid". Never true when status is
+ *                     "revoked", "absent", or "unavailable".
+ *                 status:
+ *                   type: string
+ *                   enum: [valid, revoked, absent, unavailable]
+ *                   description: >
+ *                     Explicit verification status. "unavailable" means the data
+ *                     could not be retrieved and MUST NOT be interpreted as a
+ *                     negative (or positive) medical determination.
  *                 record_count:
  *                   type: number
  *                 records:
@@ -217,9 +299,11 @@ router.get(
  *       429:
  *         description: Rate limit exceeded
  *       503:
- *         description: RPC timeout or service unavailable
+ *         description: >
+ *           RPC timeout or service unavailable. Response body has
+ *           status "unavailable" and verified false; this is not a negative result.
  *       500:
- *         description: Contract query failed
+ *         description: Contract query failed (status "unavailable", verified false)
  *         content:
  *           application/json:
  *             schema:
@@ -348,8 +432,9 @@ router.get(
     if (cached && (now - cached.timestamp < CACHE_TTL)) {
       return res.json({
         wallet,
+        status: cached.status,
         vaccinated: cached.vaccinated,
-        verified: cached.vaccinated,
+        verified: cached.status === VERIFY_STATUS.VALID,
         record_count: cached.records.length,
         records: cached.records
       });
@@ -357,8 +442,10 @@ router.get(
 
     try {
       const { vaccinated, records } = await verifyVaccination(wallet, { requestId: req.id });
+      const status = deriveStatus(vaccinated, records);
 
       verifyCache.set(wallet, {
+        status,
         vaccinated,
         records,
         timestamp: now
@@ -369,18 +456,35 @@ router.get(
         action: 'verify.lookup',
         target: wallet,
         result: 'success',
-        meta: req.verifier ? { verifier_label: req.verifier.label } : {},
+        meta: req.verifier ? { verifier_label: req.verifier.label, status } : { status },
       });
 
-      res.json({ wallet, vaccinated, verified: vaccinated, record_count: records.length, records });
+      res.json({
+        wallet,
+        status,
+        vaccinated,
+        verified: status === VERIFY_STATUS.VALID,
+        record_count: records.length,
+        records
+      });
     } catch (err) {
       const errorMessage = resolveContractErrorMessage(err);
       audit({ actor, action: 'verify.lookup', target: wallet, result: 'failure', meta: { error: errorMessage } });
 
-      res.status(isTimeoutError(err) ? 503 : 500).json({ error: errorMessage, requestId: req.id });
+      // An RPC/contract failure is "unavailable" — never a positive verification
+      // result, and never a negative determination either.
+      const unavailable = isUnavailableError(err);
+      res.status(unavailable ? 503 : 500).json({
+        wallet,
+        status: VERIFY_STATUS.UNAVAILABLE,
+        verified: false,
+        error: errorMessage,
+        requestId: req.id
+      });
     }
   }
 );
 
 router.verifyCache = verifyCache;
+router.VERIFY_STATUS = VERIFY_STATUS;
 module.exports = router;

@@ -35,9 +35,45 @@ describe('RecordDetailModal', () => {
     expect(screen.getByText(/COVID-19/i)).toBeInTheDocument();
   });
 
-  it('displays date administered', () => {
+  it('displays date administered formatted for the active locale (en)', () => {
     render(<RecordDetailModal record={mockRecord} onClose={mockOnClose} />);
-    expect(screen.getByText(/2024-01-15/i)).toBeInTheDocument();
+    const expected = new Intl.DateTimeFormat('en', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric'
+    }).format(new Date('2024-01-15T00:00:00'));
+    expect(screen.getByText(expected)).toBeInTheDocument();
+  });
+
+  it('displays date administered formatted for the active locale (fr)', () => {
+    const originalLanguage = navigator.language;
+    Object.defineProperty(navigator, 'language', { value: 'fr-FR', configurable: true });
+    try {
+      render(<RecordDetailModal record={mockRecord} onClose={mockOnClose} />);
+      const expected = new Intl.DateTimeFormat('fr', {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric'
+      }).format(new Date('2024-01-15T00:00:00'));
+      expect(screen.getByText(expected)).toBeInTheDocument();
+    } finally {
+      Object.defineProperty(navigator, 'language', {
+        value: originalLanguage,
+        configurable: true
+      });
+    }
+  });
+
+  it('shows a safe fallback for an invalid date', () => {
+    const invalidRecord = { ...mockRecord, date_administered: 'not-a-date' };
+    render(<RecordDetailModal record={invalidRecord} onClose={mockOnClose} />);
+    expect(screen.getByText(/Date not available/i)).toBeInTheDocument();
+  });
+
+  it('shows a safe fallback when the date is missing', () => {
+    const missingDateRecord = { ...mockRecord, date_administered: null };
+    render(<RecordDetailModal record={missingDateRecord} onClose={mockOnClose} />);
+    expect(screen.getByText(/Date not available/i)).toBeInTheDocument();
   });
 
   it('displays token ID', () => {

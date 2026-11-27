@@ -111,6 +111,11 @@ jobs:
     name: Deploy → Mainnet
     needs: [build, deploy-testnet]
     runs-on: ubuntu-latest
+    # Production promotion is gated on successful staging smoke tests:
+    # - deploy-testnet (incl. its smoke test step) must succeed via `needs`
+    # - the "Deploy to Staging" workflow must have completed successfully for
+    #   this commit (checked in the first step below), so a failing staging
+    #   smoke test blocks promotion even when triggered manually.
     if: github.event_name == 'workflow_dispatch' && inputs.network == 'mainnet'
     environment:
       name: mainnet
@@ -119,6 +124,29 @@ jobs:
       contract_id: ${{ steps.deploy.outputs.contract_id }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Require successful staging smoke tests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STAGING_WORKFLOW: deploy-staging.yml
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "Checking latest '$STAGING_WORKFLOW' run for commit $TARGET_SHA..."
+          RUN_JSON=$(gh run list \
+            --workflow "$STAGING_WORKFLOW" \
+            --commit "$TARGET_SHA" \
+            --limit 1 \
+            --json conclusion,status,headSha,databaseId)
+          CONCLUSION=$(echo "$RUN_JSON" | jq -r '.[0].conclusion // "none"')
+          STATUS=$(echo "$RUN_JSON" | jq -r '.[0].status // "none"')
+          RUN_ID=$(echo "$RUN_JSON" | jq -r '.[0].databaseId // "none"')
+          echo "Staging run: id=$RUN_ID status=$STATUS conclusion=$CONCLUSION"
+          if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" != "success" ]; then
+            echo "::error::Staging smoke tests have not passed for $TARGET_SHA (status=$STATUS, conclusion=$CONCLUSION). Blocking production promotion."
+            exit 1
+          fi
+          echo "Staging smoke tests passed for $TARGET_SHA. Proceeding with production promotion."
 
       - uses: actions/download-artifact@v4
         with:

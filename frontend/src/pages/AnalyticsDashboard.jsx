@@ -1,11 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from '../hooks/useFreighter';
 
+import { pageContainerWide } from '../layout.js';
+
 const ANALYTICS_BASE = import.meta.env.VITE_ANALYTICS_URL || 'http://localhost:8001';
 const REFRESH_INTERVAL = 60_000;
+const STALE_THRESHOLD_MS = 5 * 60_000;
 
 const s = {
-  page: { maxWidth: 900, width: '100%', margin: '2rem auto', padding: '0 1rem', boxSizing: 'border-box' },
   header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem', flexWrap: 'wrap', gap: '0.5rem' },
   h2: { color: '#e2e8f0', margin: 0 },
   refreshInfo: { color: '#64748b', fontSize: '0.8rem' },
@@ -32,10 +34,44 @@ const s = {
   barFill: (pct) => ({ width: `${pct}%`, height: '100%', background: '#0ea5e9', borderRadius: 4, transition: 'width 0.4s ease' }),
   barCount: { color: '#e2e8f0', fontSize: '0.85rem', minWidth: 40 },
   noData: { color: '#475569', textAlign: 'center', padding: '1.5rem 0' },
+  statusMissing: { color: '#f87171', fontSize: '0.85rem', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' },
+  statusDelayed: { color: '#f59e0b', fontSize: '0.85rem', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' },
+  statusEmpty: { color: '#94a3b8', fontSize: '0.85rem', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' },
+  statusZero: { color: '#93c5fd', fontSize: '0.85rem', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' },
+  summaryWrap: { marginTop: '0.75rem', fontSize: '0.85rem', color: '#94a3b8' },
 };
 
-function BarChart({ data }) {
-  if (!data || data.length === 0) return <p style={s.noData}>No data available.</p>;
+function dataStatus(data, lastRefresh) {
+  if (data === null) return 'missing';
+  if (lastRefresh && Date.now() - lastRefresh.getTime() > STALE_THRESHOLD_MS) return 'delayed';
+  if (data.length === 0) return 'empty';
+  if (data.every((d) => (d.count ?? 0) === 0)) return 'zero';
+  return 'loaded';
+}
+
+function StatusBanner({ kind, label }) {
+  const styles = {
+    missing: s.statusMissing,
+    delayed: s.statusDelayed,
+    empty: s.statusEmpty,
+    zero: s.statusZero,
+  };
+  const icons = { missing: '⚠️', delayed: '⏳', empty: '📭', zero: '0️⃣' };
+  return (
+    <p style={styles[kind]} role="status" aria-label={label}>
+      {icons[kind]} {label}
+    </p>
+  );
+}
+
+function BarChart({ data, status }) {
+  if (status === 'missing') {
+    return <p style={s.noData}>Rates data is missing. Unable to load vaccination rates.</p>;
+  }
+  if (status === 'delayed') {
+    return <p style={s.noData}>Rates data is delayed. Data may not reflect recent activity.</p>;
+  }
+  if (!data || data.length === 0) return <p style={s.noData}>No vaccination rates recorded.</p>;
   const max = Math.max(...data.map((d) => d.count), 1);
   return (
     <div style={s.barWrap} role="list" aria-label="Vaccination rates by vaccine type">
@@ -54,7 +90,25 @@ function BarChart({ data }) {
   );
 }
 
-function IssuerTable({ data }) {
+function RatesSummary({ data, status }) {
+  if (status === 'missing' || status === 'delayed') return null;
+  if (!data || data.length === 0) return <p style={s.summaryWrap}>No rates to summarize.</p>;
+  const total = data.reduce((acc, d) => acc + (d.count ?? 0), 0);
+  const top = [...data].sort((a, b) => (b.count ?? 0) - (a.count ?? 0))[0];
+  return (
+    <div style={s.summaryWrap}>
+      Total doses: {total} · {top ? `Top: ${top.vaccine_name} (${top.count})` : ''}
+    </div>
+  );
+}
+
+function IssuerTable({ data, status }) {
+  if (status === 'missing') {
+    return <p style={s.noData}>Issuer activity data is missing. Unable to load.</p>;
+  }
+  if (status === 'delayed') {
+    return <p style={s.noData}>Issuer activity data is delayed. Data may not reflect recent activity.</p>;
+  }
   if (!data || data.length === 0) return <p style={s.noData}>No issuer activity recorded.</p>;
   return (
     <table style={s.table} aria-label="Issuer activity">
@@ -80,7 +134,13 @@ function IssuerTable({ data }) {
   );
 }
 
-function AnomalyList({ data }) {
+function AnomalyList({ data, status }) {
+  if (status === 'missing') {
+    return <p style={s.noData}>Anomaly data is missing. Unable to load.</p>;
+  }
+  if (status === 'delayed') {
+    return <p style={s.noData}>Anomaly data is delayed. Data may not reflect recent activity.</p>;
+  }
   if (!data || data.length === 0) return <p style={{ ...s.noData, color: '#4ade80' }}>✅ No anomalies detected.</p>;
   return (
     <table style={s.table} aria-label="Anomaly flags">
@@ -149,16 +209,20 @@ export default function AnalyticsDashboard() {
     return () => clearInterval(timerRef.current);
   }, [fetchAll]);
 
+  const ratesStatus = loading && rates === null ? 'loading' : dataStatus(rates, lastRefresh);
+  const issuersStatus = loading && issuers === null ? 'loading' : dataStatus(issuers, lastRefresh);
+  const anomaliesStatus = loading && anomalies === null ? 'loading' : dataStatus(anomalies, lastRefresh);
+
   if (role !== 'issuer') {
     return (
-      <div style={s.page}>
+      <div style={{ ...pageContainerWide, marginTop: '2rem', marginBottom: '2rem' }}>
         <p style={{ color: '#f87171' }}>Access restricted to authorized issuers.</p>
       </div>
     );
   }
 
   return (
-    <div style={s.page}>
+    <div style={{ ...pageContainerWide, marginTop: '2rem', marginBottom: '2rem' }}>
       <div style={s.header}>
         <h2 style={s.h2}>📊 Analytics Dashboard</h2>
         <span style={s.refreshInfo} aria-live="polite">
@@ -171,19 +235,59 @@ export default function AnalyticsDashboard() {
       {/* Vaccination Rates */}
       <section style={s.section} aria-labelledby="rates-title">
         <h3 id="rates-title" style={s.sectionTitle}>Vaccination Rates by Vaccine Type</h3>
-        {loading && !rates ? <p style={s.loading}>Loading…</p> : <BarChart data={rates} />}
+        {loading && rates === null ? (
+          <p style={s.loading}>Loading…</p>
+        ) : ratesStatus === 'missing' || ratesStatus === 'delayed' || ratesStatus === 'empty' || ratesStatus === 'zero' ? (
+          <>
+            <StatusBanner
+              kind={ratesStatus}
+              label={ratesStatus === 'missing' ? 'Rates data is missing.' : ratesStatus === 'delayed' ? 'Rates data is delayed.' : ratesStatus === 'empty' ? 'No vaccination rates recorded.' : 'All vaccination rates are zero.'}
+            />
+            <BarChart data={rates} status={ratesStatus} />
+            <RatesSummary data={rates} status={ratesStatus} />
+          </>
+        ) : (
+          <>
+            <BarChart data={rates} status={ratesStatus} />
+            <RatesSummary data={rates} status={ratesStatus} />
+          </>
+        )}
       </section>
 
       {/* Issuer Activity */}
       <section style={s.section} aria-labelledby="issuers-title">
         <h3 id="issuers-title" style={s.sectionTitle}>Issuer Activity</h3>
-        {loading && !issuers ? <p style={s.loading}>Loading…</p> : <IssuerTable data={issuers} />}
+        {loading && issuers === null ? (
+          <p style={s.loading}>Loading…</p>
+        ) : (
+          <>
+            {issuersStatus === 'missing' || issuersStatus === 'delayed' || issuersStatus === 'empty' ? (
+              <StatusBanner
+                kind={issuersStatus}
+                label={issuersStatus === 'missing' ? 'Issuer activity data is missing.' : issuersStatus === 'delayed' ? 'Issuer activity data is delayed.' : 'No issuer activity recorded.'}
+              />
+            ) : null}
+            <IssuerTable data={issuers} status={issuersStatus} />
+          </>
+        )}
       </section>
 
       {/* Anomaly Flags */}
       <section style={s.section} aria-labelledby="anomalies-title">
         <h3 id="anomalies-title" style={s.sectionTitle}>Anomaly Flags</h3>
-        {loading && !anomalies ? <p style={s.loading}>Loading…</p> : <AnomalyList data={anomalies} />}
+        {loading && anomalies === null ? (
+          <p style={s.loading}>Loading…</p>
+        ) : (
+          <>
+            {anomaliesStatus === 'missing' || anomaliesStatus === 'delayed' ? (
+              <StatusBanner
+                kind={anomaliesStatus}
+                label={anomaliesStatus === 'missing' ? 'Anomaly data is missing.' : 'Anomaly data is delayed.'}
+              />
+            ) : null}
+            <AnomalyList data={anomalies} status={anomaliesStatus} />
+          </>
+        )}
       </section>
     </div>
   );

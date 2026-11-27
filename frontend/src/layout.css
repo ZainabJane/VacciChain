@@ -1,0 +1,46 @@
+/* Shared responsive layout tokens for VacciChain frontend.
+ *
+ * Breakpoints: 320px (phones), 768px (tablets), 1024px (desktop).
+ * Spacing scale and container max-widths are reused by every dashboard
+ * and verification page so the app stays usable without horizontal
+ * scrolling at 320 / 768 / desktop viewports.
+ */
+
+/* Breakpoints (used in media queries throughout the app). */
+:root {
+  --bp-phone: 320px;
+  --bp-tablet: 768px;
+  --bp-desktop: 1024px;
+
+  /* Spacing scale. */
+  --space-0: 0;
+  --space-xs: 0.5rem;
+  --space-sm: 1rem;
+  --space-md: 1.5rem;
+  --space-lg: 2rem;
+  --space-xl: 3rem;
+
+  /* Container max-widths. */
+  --container-narrow: 520px;
+  --container-default: 700px;
+  --container-wide: 900px;
+
+  /* Responsive page padding: tighter on phones, looser on desktop. */
+  --page-padding: 1rem;
+}
+
+/* Prevent horizontal scroll on every viewport. */
+html {
+  overflow-x: hidden;
+}
+body {
+  overflow-x: hidden;
+  min-width: 0;
+}
+
+/* Responsive page padding — wider gutters on tablet+. */
+@media (min-width: 768px) {
+  :root {
+    --page-padding: 1.5rem;
+  }
+}
