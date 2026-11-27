@@ -164,6 +164,26 @@ module "ecs" {
   # Environment-specific backend endpoints for the analytics service.
   backend_service_url   = local.backend_service_url
   analytics_service_url = local.analytics_service_url
+
+  # Container health checks (Backlog 120)
+  backend_health_check_path     = "/health"
+  frontend_health_check_path    = "/health"
+  analytics_health_check_path   = "/health"
+  backend_health_check_grace_period   = 60
+  frontend_health_check_grace_period  = 30
+  analytics_health_check_grace_period = 60
+  health_check_interval         = 30
+  health_check_timeout          = 5
+  health_check_retries          = 3
+  health_check_start_period     = 15
+
+  # Target group health checks
+  target_group_health_check_path     = "/health"
+  target_group_health_check_interval = 30
+  target_group_health_check_timeout  = 5
+  target_group_healthy_threshold     = 2
+  target_group_unhealthy_threshold   = 3
+  target_group_deregistration_delay  = 30
 }
 
 output "alb_dns_name" { value = module.ecs.alb_dns_name }

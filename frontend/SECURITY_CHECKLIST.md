@@ -59,6 +59,65 @@ Use this checklist when developing or reviewing code to ensure XSS protection is
 - [ ] No hardcoded secrets or API keys
 - [ ] Logging doesn't expose sensitive data
 - [ ] Error messages don't reveal system details
+- [ ] Diagnostics/privacy review completed (see Diagnostics & Privacy Review below)
+
+## ✅ Diagnostics & Privacy Review
+
+Use this section when reviewing console output, error states, and analytics payloads. Production diagnostics must never leak patient identifiers, access tokens, or unnecessary vaccination details.
+
+### Console Output
+- [ ] Access tokens (bearer tokens, JWTs, refresh tokens, session IDs) are redacted before logging
+- [ ] Patient identifiers (names, DOB, MRN, email, phone, address) are not logged
+- [ ] Vaccination details (vaccine names, lot numbers, dates, provider info) are not logged unless strictly required
+- [ ] Raw error objects are not logged in production (they may contain request bodies, headers, or tokens)
+- [ ] `console.log`/`console.debug` calls with sensitive data are removed or gated behind a dev-only flag
+- [ ] Logging helpers apply a redaction allowlist rather than logging whole objects
+
+### Error States
+- [ ] User-facing error messages are generic and do not echo API response bodies
+- [ ] Error boundaries do not render stack traces or raw error objects in production
+- [ ] Error state components do not display tokens, patient IDs, or record details
+- [ ] Error reporting (e.g., Sentry-style hooks) strips `Authorization` headers and request payloads before sending
+
+### Analytics Payloads
+- [ ] Analytics events do not include access tokens or session identifiers
+- [ ] Analytics events do not include patient identifiers or vaccination record details
+- [ ] Event properties use coarse-grained categories (e.g., `event: "vaccine_viewed"`) instead of raw record data
+- [ ] Analytics payloads are reviewed against the redaction helper before shipping
+
+### Common Error-Reporting Paths to Review
+- [ ] Global `window.onerror` / `unhandledrejection` handlers
+- [ ] React error boundaries and their `componentDidCatch`/fallback logging
+- [ ] API client interceptors (request/response error handlers)
+- [ ] Auth/token refresh failure handlers
+- [ ] Form submission error handlers
+- [ ] Third-party error/analytics SDK initialization and configuration
+- [ ] Service worker or background sync error handlers (if applicable)
+
+### Redaction Helper Example
+```javascript
+// ✅ GOOD - redact before logging/reporting
+const SENSITIVE_KEYS = ['token', 'accessToken', 'refreshToken', 'authorization',
+  'patientId', 'mrn', 'dob', 'name', 'email', 'phone', 'vaccine', 'lotNumber'];
+
+function redact(value) {
+  if (value == null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(redact);
+  return Object.fromEntries(
+    Object.entries(value).map(([k, v]) =>
+      SENSITIVE_KEYS.some((s) => k.toLowerCase().includes(s.toLowerCase()))
+        ? [k, '[REDACTED]']
+        : [k, redact(v)]
+    )
+  );
+}
+
+// ❌ BAD - logs raw error object (may contain tokens/patient data)
+console.error(error);
+
+// ✅ GOOD - logs redacted, minimal context
+console.error('Request failed', { status: error?.status, code: error?.code });
+```
 
 ## ✅ When Adding New Features
 

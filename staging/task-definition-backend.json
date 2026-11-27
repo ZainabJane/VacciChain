@@ -15,6 +15,16 @@
           "protocol": "tcp"
         }
       ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -fsS http://localhost/healthz || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
@@ -26,7 +36,7 @@
       "dependsOn": [
         {
           "containerName": "backend",
-          "condition": "START"
+          "condition": "HEALTHY"
         }
       ]
     },
@@ -100,6 +110,16 @@
           "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:vaccichain/staging/stellar:JWT_SECRET::"
         }
       ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:4000/health/ready || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
@@ -111,7 +131,7 @@
       "dependsOn": [
         {
           "containerName": "python-service",
-          "condition": "START"
+          "condition": "HEALTHY"
         }
       ]
     },
@@ -131,6 +151,16 @@
           "value": "http://backend.vaccichain-staging.local:4000"
         }
       ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:8001/health/ready || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {

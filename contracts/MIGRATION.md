@@ -40,3 +40,53 @@ For breaking changes (e.g., removing fields or changing types):
 The `verify_vaccination` function should continue to support older versions by:
 -   Using a common trait or converting older records to the latest internal representation before returning them to the caller.
 -   Ignoring records that cannot be parsed if they are considered "corrupt" or from a version no longer supported.
+
+## Supported Schema Changes and Migration Fixtures
+
+Every supported schema change must ship with a fixture-based migration test that
+replays prior on-chain state and asserts that records are neither misread,
+dropped, nor locked. Fixtures live in `contracts/test_fixtures/migrations/`.
+
+| Change | From → To | Fixture | Test |
+| --- | --- | --- | --- |
+| Add `schema_version` field | V0 (no version) → V1 | `v0_to_v1_records.json` | `test_migration_v0_to_v1` |
+| Add optional fields (`Option<T>`) | V1 → V1 (additive) | `v1_additive_fields.json` | `test_migration_v1_additive_fields` |
+| Wrap records in versioned enum | V1 → V2 | `v1_to_v2_enum.json` | `test_migration_v1_to_v2_enum` |
+| Change field type (breaking) | V2 → V3 | `v2_to_v3_type_change.json` | `test_migration_v2_to_v3_type_change` |
+
+Each fixture contains:
+-   `schema_version`: the version the records were written with.
+-   `records`: serialized `DataKey::Token` entries as stored on-chain.
+-   `expected`: the records as they must be readable after migration.
+
+The migration tests must verify, for every fixture:
+1.  All prior records remain readable (no dropped records).
+2.  Field values are preserved exactly (no misread records).
+3.  Records remain writable/updatable after migration (no locked records).
+4.  Re-running the migration is idempotent.
+
+## Unsupported Upgrade Paths
+
+An upgrade path is unsupported when the stored `schema_version` is greater than
+the version the new contract understands, or when a record cannot be deserialized
+into any known version.
+
+### Safe-failure behavior
+-   The contract must **fail closed**: reads of unparseable or future-version
+    records return an error (`Error::UnsupportedSchemaVersion`) rather than
+    silently returning empty or default data.
+-   No destructive writes may occur during a failed migration; existing storage
+    entries are left untouched.
+-   The contract version is not bumped, so the prior WASM remains a valid
+    rollback target.
+
+### Recovery plan
+1.  **Rollback:** Upgrade the contract back to the prior WASM version. Because
+    the failed migration performed no destructive writes, the prior version can
+    read all existing records.
+2.  **Re-run migration:** After fixing the migration logic, redeploy the new
+    WASM and re-run the migration. Migrations must be idempotent so a partial
+    prior attempt is safe to repeat.
+3.  **Verify records:** Run the fixture-based migration tests against a snapshot
+    of the affected state and confirm all records are readable, correct, and
+    writable before resuming normal operation.

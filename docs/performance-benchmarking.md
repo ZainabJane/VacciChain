@@ -72,35 +72,65 @@ Latency: 8.1ms
 Throughput: 456 kB/s
 ```
 
-### Contract Gas Benchmarks
+### Contract Resource Benchmarks
 
-Gas usage is measured per function. Lower gas = cheaper transactions.
+CPU instructions and memory are measured per function. Lower values = cheaper transactions and more headroom against Soroban limits.
 
 ```
-mint_vaccination: 12,345 instructions
-verify_vaccination: 5,678 instructions
+mint_vaccination:     12,345 instructions, 1,024 bytes memory
+verify_vaccination:    5,678 instructions,   512 bytes memory
+revoke_vaccination:    4,210 instructions,   384 bytes memory
+batch_mint (10):      98,760 instructions, 8,192 bytes memory
 ```
+
+Baselines are captured for the representative operations: `mint`, `verify`, `revoke`, and `batch` (batch mint/verify).
 
 ## Regression Thresholds
 
 - **Response time**: Alert if >20% slower than baseline
-- **Gas usage**: No automatic alert (informational only)
+- **Contract CPU instructions**: CI fails if a representative operation exceeds its baseline by more than **10%**
+- **Contract memory**: CI fails if a representative operation exceeds its baseline by more than **10%**
+- **Soroban hard limits**: CI also fails if any operation exceeds **80%** of the Soroban per-transaction CPU or memory limit, regardless of baseline
 
-To adjust thresholds, edit `.github/workflows/benchmark.yml`.
+Thresholds are intentionally tight because small contract changes can push operations past Soroban limits. To adjust thresholds, edit `.github/workflows/benchmark.yml` (see `CPU_REGRESSION_PCT`, `MEM_REGRESSION_PCT`, and `SOROBAN_LIMIT_PCT`).
+
+### Interpreting CPU/Memory Comparison Output
+
+The contract benchmark job publishes a comparison table to the job summary and as an artifact:
+
+```
+operation          metric   baseline   current    delta    status
+mint_vaccination   cpu      12,345     12,410     +0.5%    pass
+mint_vaccination   mem       1,024      1,024      0.0%    pass
+verify_vaccination cpu       5,678      6,402    +12.8%    FAIL
+batch_mint (10)    cpu      98,760    102,100     +3.4%    pass
+```
+
+- **delta**: percentage change vs the stored baseline; positive means more expensive
+- **status**: `pass` or `FAIL`; any `FAIL` row fails the CI job
+- **limit %**: shown alongside the table when an operation approaches a Soroban limit
+
+If a regression is intentional (e.g. added validation), update the baseline as described below and note the reason in the PR.
 
 ## Baseline Management
 
-Baselines are stored in `backend/benchmarks/` and updated on each merge to `main`.
+Backend baselines are stored in `backend/benchmarks/` and updated on each merge to `main`. Contract resource baselines are stored in `contracts/benchmarks/` and updated the same way.
 
-To manually update baseline:
+To manually update baselines:
 
 ```bash
 ./benchmark.sh backend
 cp benchmark-results/health_*.txt backend/benchmarks/health-benchmark.txt
 cp benchmark-results/verify_*.txt backend/benchmarks/verify-benchmark.txt
-git add backend/benchmarks/
+
+./benchmark.sh contract
+cp benchmark-results/contract_*.json contracts/benchmarks/
+
+git add backend/benchmarks/ contracts/benchmarks/
 git commit -m "chore: update performance baselines"
 ```
+
+Baseline updates must be reviewed in the PR that changes them; a baseline bump without an accompanying code change or justification should be rejected.
 
 ## Troubleshooting
 

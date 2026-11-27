@@ -37,6 +37,7 @@
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
+@import './layout.css';
 body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -45,3 +46,32 @@ button { cursor: pointer; }
 nav a { color: var(--nav-text); }
 nav a[aria-current="page"] { color: var(--accent); font-weight: 600; }
 #main-content:focus { outline: none; }
+
+/* ── NavBar responsive styles ───────────────────────────────────────────── */
+
+/*
+ * On wide screens the hamburger button is hidden and the link list is always
+ * visible inline.  On narrow screens the button is shown and the link list
+ * is toggled via the .nav-links--open modifier class.
+ */
+@media (max-width: 639px) {
+  .nav-hamburger {
+    display: block !important;
+  }
+
+  /* Hidden state: removed from layout AND from the accessibility tree.
+     aria-hidden="true" on the wrapper handles AT; display:none handles layout. */
+  .nav-links:not(.nav-links--open) {
+    display: none !important;
+  }
+
+  /* Open state: stack links vertically */
+  .nav-links.nav-links--open {
+    display: flex !important;
+    flex-direction: column;
+    align-items: flex-start;
+    width: 100%;
+    padding: 0.5rem 0;
+    gap: 0.75rem;
+  }
+}

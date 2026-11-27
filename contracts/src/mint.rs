@@ -1,5 +1,8 @@
 use soroban_sdk::{Env, Address, String, Vec};
-use crate::storage::{DataKey, VaccinationRecord, IssuerRecord, compute_token_id};
+use crate::storage::{
+    DataKey, VaccinationRecord, IssuerRecord, compute_token_id, extend_token_ttl,
+    extend_patient_tokens_ttl,
+};
 use crate::events;
 use crate::ContractError;
 use crate::validate_input_length;
@@ -104,7 +107,7 @@ pub fn mint_vaccination(
         .get(&DataKey::PatientRecordLimit)
         .unwrap_or(50u32);
     if tokens.len() >= limit {
-        panic!("record limit exceeded");
+        return Err(ContractError::RecordLimitExceeded);
     }
 
     // Build the vaccination record and persist it under DataKey::Token(token_id).
@@ -121,13 +124,15 @@ pub fn mint_vaccination(
         dose_series,
     };
 
-    // Persist the token record.
+    // Persist the token record and extend its TTL so the entry does not expire.
     env.storage().persistent().set(&DataKey::Token(token_id), &record);
+    extend_token_ttl(env, token_id);
 
-    // Append the minted token to the patient's token list.
+    // Append the minted token to the patient's token list and extend its TTL.
     let mut patient_tokens = tokens;
     patient_tokens.push_back(token_id);
     env.storage().persistent().set(&DataKey::PatientTokens(patient.clone()), &patient_tokens);
+    extend_patient_tokens_ttl(env, &patient);
 
     events::emit_minted(env, token_id, &patient, &vaccine_name, &issuer);
 

@@ -35,6 +35,59 @@ async def _fetch_events(event_type: str, limit: int = 500) -> list:
         return res.json().get("events", [])
 
 
+async def check_backend_readiness() -> dict:
+    """
+    Lightweight readiness probe for the analytics service.
+
+    Verifies that the backend dependency is reachable by issuing a minimal
+    request. This is used by the python-service readiness endpoint so that
+    failed dependency readiness removes the task from traffic without
+    masking process crashes (exceptions propagate to the caller).
+
+    Returns:
+        dict: A dictionary containing:
+            - ready (bool): True when the backend responded successfully
+            - backend_url (str): The backend URL that was probed
+
+    Raises:
+        httpx.HTTPError: If the backend API request fails
+    """
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            f"{BACKEND_URL}/events",
+            params={"event_type": "VaccinationMinted", "limit": 1},
+            timeout=5,
+        )
+        res.raise_for_status()
+    return {"ready": True, "backend_url": BACKEND_URL}
+
+
+@router.get("/ready")
+async def readiness():
+    """
+    Readiness endpoint for the analytics service.
+
+    Probes the backend dependency and reports readiness. Returns HTTP 503
+    when the backend is unreachable so orchestrators can remove the task
+    from traffic.
+
+    Returns:
+        dict: A dictionary containing:
+            - ready (bool): True when the backend responded successfully
+            - backend_url (str): The backend URL that was probed
+
+    Raises:
+        HTTPException: If the backend API is unreachable
+    """
+    try:
+        return await check_backend_readiness()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Backend dependency not ready: {exc}",
+        ) from exc
+
+
 @router.get("/rates")
 async def vaccination_rates():
     """
