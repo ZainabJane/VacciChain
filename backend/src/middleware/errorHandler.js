@@ -1,94 +1,85 @@
 const logger = require('../logger');
+const { errorBody } = require('../errors');
 
 /**
- * Global error handler middleware.
+ * Patterns that match sensitive values which must never reach logs.
+ * Each entry replaces the matched secret with a redaction marker.
+ */
+const SENSITIVE_PATTERNS = [
+  // JSON Web Tokens (three base64url segments separated by dots)
+  {
+    regex: /\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
+    replacement: '[REDACTED_JWT]',
+  },
+  // Bearer tokens in header-like strings
+  {
+    regex: /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi,
+    replacement: 'Bearer [REDACTED_TOKEN]',
+  },
+  // key=value / key: value pairs for common secret field names
+  {
+    regex: /\b(secret|secretKey|secret_key|apiKey|api_key|privateKey|private_key|password|passwd|token|accessToken|access_token|refreshToken|refresh_token|authorization)\b\s*[:=]\s*("[^"]*"|'[^']*'|[^\s,;&}]+)/gi,
+    replacement: '$1=[REDACTED]',
+  },
+  // Signed transaction payloads (hex blobs of 64+ chars)
+  {
+    regex: /\b0x[0-9a-fA-F]{64,}\b/g,
+    replacement: '[REDACTED_SIGNED_PAYLOAD]',
+  },
+  // Long raw hex blobs (signed payloads without 0x prefix)
+  {
+    regex: /\b[0-9a-fA-F]{128,}\b/g,
+    replacement: '[REDACTED_SIGNED_PAYLOAD]',
+  },
+];
+
+/**
+ * Redact sensitive values (JWTs, secret keys, signed payloads) from a string.
+ *
+ * @param {unknown} value
+ * @returns {unknown} redacted string, or the original value if not a string
+ */
+function redactSensitive(value) {
+  if (typeof value !== 'string') {
+    return value;
+  }
+
+  let redacted = value;
+  for (const { regex, replacement } of SENSITIVE_PATTERNS) {
+    redacted = redacted.replace(regex, replacement);
+  }
+  return redacted;
+}
+
+/**
+ * Global error handler middleware (#42 — see docs/api-errors.md).
  *
  * Operational errors (statusCode 4xx set on the error object) are returned
- * with their message. Unexpected errors (5xx) log the full stack but only
- * return a generic message so internals are never exposed in production.
+ * with their message and stable `code`. Unexpected errors (5xx) log the full
+ * stack but only return a generic message, so internals are never exposed.
  *
- * Validation and payload-size failures are normalized to a stable shape:
- *   { error, details?, requestId }
+ * Sensitive values (JWTs, secret keys, signed payloads) are redacted from the
+ * logged message and stack. Raw request headers and bodies are never logged.
  *
- * @param {Error} err
- * @param {import('express').Request} req
- * @param {import('express').Response} res
- * @param {import('express').NextFunction} _next
+ * Operational errors (4xx) return their safe message. Unexpected errors
+ * (5xx) return a generic message; the full stack is logged server-side and
+ * never leaked to the client.
  */
 function errorHandler(err, req, res, _next) {
-  // Normalize the status code, defaulting to 500 for anything unexpected.
-  let statusCode = Number.isInteger(err.statusCode) && err.statusCode >= 400 && err.statusCode < 600
-    ? err.statusCode
-    : 500;
-
-  let message = err.message;
-  let details;
-
-  // --- Zod validation errors -> 400 with { error, details } ---
-  if (err && (err.name === 'ZodError' || Array.isArray(err.issues))) {
-    statusCode = 400;
-    message = 'Validation failed';
-    details = Array.isArray(err.issues)
-      ? err.issues.map((issue) => ({
-        path: Array.isArray(issue.path) ? issue.path.join('.') : issue.path,
-        message: issue.message,
-        code: issue.code,
-      }))
-      : undefined;
-  }
-
-  // --- body-parser payload-too-large -> 413 ---
-  if (err && (err.type === 'entity.too.large' || err.code === 'LIMIT_FILE_SIZE')) {
-    statusCode = 413;
-    message = 'Payload Too Large';
-  }
-
-  // --- body-parser malformed / unsupported body -> 400 ---
-  if (err && (err.type === 'entity.parse.failed' || err.type === 'encoding.unsupported' || err.type === 'charset.unsupported')) {
-    statusCode = 400;
-    message = 'Malformed request body';
-  }
-
-  // --- body-parser unsupported media type -> 415 ---
-  if (err && err.type === 'entity.verify.failed') {
-    statusCode = 400;
-    message = 'Invalid request body';
-  }
-
-  // --- Explicit payload/limit violations -> 413 ---
-  if (err && (err.code === 'PAYLOAD_TOO_LARGE' || err.code === 'LIMIT_EXCEEDED')) {
-    statusCode = 413;
-    message = message || 'Payload Too Large';
-  }
-
-  // --- Semantic validation failures (oversized arrays/strings, range, nesting) -> 422 ---
-  if (err && (err.code === 'VALIDATION_FAILED' || err.code === 'UNPROCESSABLE_ENTITY')) {
-    statusCode = 422;
-    message = message || 'Unprocessable Entity';
-    if (err.details !== undefined) {
-      details = err.details;
-    }
-  }
-
-  const isOperational = statusCode >= 400 && statusCode < 500;
+  // express.json() parse failures and body-limit errors carry `status`.
+  const raw = Number.isInteger(err.statusCode) ? err.statusCode : err.status;
+  const statusCode = Number.isInteger(raw) && raw >= 400 && raw < 600 ? raw : 500;
 
   logger.error('unhandled error', {
     requestId: req.requestId,
-    message: err && err.message,
-    stack: err && err.stack,
+    message: redactSensitive(err.message),
+    stack: redactSensitive(err.stack),
     statusCode,
   });
 
-  const body = {
-    error: isOperational ? message : 'Internal Server Error',
-    requestId: req.requestId,
-  };
-
-  if (isOperational && details !== undefined) {
-    body.details = details;
-  }
-
-  res.status(statusCode).json(body);
+  const code = typeof err.code === 'string' && /^[A-Z_]+$/.test(err.code) ? err.code : undefined;
+  res.status(statusCode).json(errorBody(req, statusCode, code, err.message, err.details));
 }
 
 module.exports = errorHandler;
+module.exports.redactSensitive = redactSensitive;

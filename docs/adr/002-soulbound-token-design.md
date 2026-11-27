@@ -14,7 +14,25 @@ VacciChain needs to issue vaccination records that are:
 Traditional NFTs are transferable by design, which creates risks for vaccination records including unauthorized transfers, identity fraud, and creation of vaccination black markets.
 
 ## Decision
-We implemented soulbound vaccination NFTs using contract-level transfer restrictions. The smart contract includes a `transfer()` function that always panics with a "soulbound: transfers are disabled" error, making transfer attempts impossible at the protocol level.
+We implemented soulbound vaccination NFTs using contract-level transfer restrictions. Every public entry point that could change token ownership is explicitly rejected at the contract level. Rejected operations return `ContractError::SoulboundToken` (a typed contract error) rather than panicking, so callers receive a deterministic error code and no storage is mutated and no events are emitted on the failure path.
+
+### Ownership-changing entry points (all rejected)
+The following public operations are the complete set of paths that could alter ownership. Each is enforced to fail with `ContractError::SoulboundToken`:
+
+- `transfer(env, from, to, token_id)` — direct transfer; rejected.
+- `transfer_from(env, spender, from, to, token_id)` — delegated transfer; rejected.
+- `safe_transfer(env, from, to, token_id)` — safe-transfer variant; rejected.
+- `safe_transfer_from(env, spender, from, to, token_id)` — safe delegated transfer; rejected.
+- `approve(env, owner, spender, token_id)` — approval grant; rejected (no approvals exist, so no delegated transfer can ever be authorized).
+- `set_approval_for_all(env, owner, operator, approved)` — operator approval; rejected.
+- `clawback(env, admin, from, token_id)` — admin clawback; rejected (records are revoked, never reassigned).
+- `burn(env, owner, token_id)` — burn; rejected (no burn path exists).
+
+Because approvals cannot be created and no clawback/burn/transfer path exists, there is no alternate entry point (direct, delegated, admin, or batch) that can move a token between wallets. Revocation is the only state change available and it does not change ownership.
+
+### Threat model and tests
+- The threat-model matrix enumerating each ownership-changing operation, its trust assumptions, and its rejection behavior is documented in `docs/security/soulbound-threat-model.md`.
+- Negative contract tests in `contracts/vaccination/src/test.rs` assert that each operation above returns `ContractError::SoulboundToken`, leaves token ownership and approval storage unchanged, and emits no events on the failure path.
 
 ## Consequences
 
@@ -55,16 +73,20 @@ We implemented soulbound vaccination NFTs using contract-level transfer restrict
 - **Rejected**: Any transferability creates fraud potential
 
 ## Implementation Notes
-- Transfer function panics immediately with descriptive error message
+- All ownership-changing functions return `ContractError::SoulboundToken`; they do not panic
 - Soulbound enforcement is at contract level, not UI level
-- Records can be revoked but not transferred
+- No `approve` / `set_approval_for_all` paths exist; approval attempts are rejected
+- No `clawback` or `burn` paths exist; attempts are rejected
+- Records can be revoked but not transferred or reassigned
 - Verification functions work directly on patient wallet address
 - Batch verification supported for efficiency
+- Threat-model matrix: `docs/security/soulbound-threat-model.md`
+- Negative tests: `contracts/vaccination/src/test.rs` (assert error code, unchanged storage, no events)
 
 ```rust
-// Transfer is permanently blocked — soulbound enforcement
-pub fn transfer(_env: Env, _from: Address, _to: Address, _token_id: u64) {
-    panic!("soulbound: transfers are disabled");
+// Transfer is permanently blocked — soulbound enforcement returns a typed error
+pub fn transfer(env: Env, _from: Address, _to: Address, _token_id: u64) -> Result<(), ContractError> {
+    Err(ContractError::SoulboundToken)
 }
 ```
 

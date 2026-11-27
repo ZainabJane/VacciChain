@@ -1,6 +1,39 @@
 {
   "accessibility": {
-    "skipToContent": "Skip to main content"
+    "skipToContent": "Skip to main content",
+    "opensInNewTab": "(opens in new tab)"
+  },
+  "announcer": {
+    "walletConnected": "Wallet connected: {{address}}",
+    "walletDisconnected": "Wallet disconnected",
+    "walletConnectionError": "Wallet connection failed: {{message}}",
+    "mintSuccess": "Vaccination NFT minted successfully. Token ID: {{tokenId}}",
+    "mintError": "Minting failed: {{message}}",
+    "verifySuccess": "Verification complete: {{count}} record found",
+    "verifySuccess_other": "Verification complete: {{count}} records found",
+    "verifyError": "Verification failed: {{message}}",
+    "copySuccess": "{{label}} copied to clipboard",
+    "copyError": "Could not copy {{label}} to clipboard"
+  },
+  "network": {
+    "configured": "Configured network: {{network}}",
+    "walletNetwork": "Wallet network: {{network}}",
+    "mismatchTitle": "Network mismatch detected",
+    "mismatchBody": "Your wallet is connected to {{walletNetwork}}, but this app is configured for {{configuredNetwork}}. Signing is disabled until the networks match.",
+    "mismatchRecovery": "To continue, open your wallet extension, switch the network to {{configuredNetwork}}, then reconnect your wallet.",
+    "signingBlocked": "Transaction signing is blocked due to a network mismatch."
+  },
+  "asyncState": {
+    "loading": "Loading…",
+    "loadingAria": "Loading content",
+    "empty": "No data available.",
+    "partial": "Some data could not be loaded.",
+    "partialDetails": "Showing {{loaded}} of {{total}} items.",
+    "error": "Something went wrong while loading data.",
+    "errorDetails": "Error: {{message}}",
+    "retry": "Retry",
+    "retrying": "Retrying…",
+    "retryAria": "Retry loading data"
   },
   "nav": {
     "home": "Home",
@@ -46,6 +79,8 @@
     "validation": {
       "invalidAddress": "Must be a valid Stellar public key (G…, 56 chars)",
       "vaccineRequired": "Vaccine name is required",
+      "dosePositive": "Must be a positive whole number",
+      "doseExceedsSeries": "Dose number cannot exceed doses in series",
       "dateRequired": "Date is required",
       "dateFuture": "Date cannot be in the future"
     }
@@ -87,7 +122,86 @@
     "tokenId": "Token ID",
     "issuerAddress": "Issuer Address",
     "txHash": "Transaction Hash",
-    "viewExplorer": "View on Stellar Explorer ↗",
+    "viewExplorer": "View on Stellar Explorer",
     "noTxHash": "Transaction hash not available for this record."
+  },
+  "wallet": {
+    "errors": {
+      "missingExtension": {
+        "title": "Freighter wallet not found",
+        "description": "The Freighter browser extension is not installed or is disabled.",
+        "nextStep": "Install Freighter from freighter.app, then reload this page and connect again."
+      },
+      "rejected": {
+        "title": "Connection request declined",
+        "description": "The connection request was declined in your wallet.",
+        "nextStep": "Open Freighter and approve the connection request, or click Connect to try again."
+      },
+      "locked": {
+        "title": "Wallet is locked",
+        "description": "Freighter is locked and cannot approve requests right now.",
+        "nextStep": "Unlock Freighter with your password, then retry the connection."
+      },
+      "providerError": {
+        "title": "Wallet provider error",
+        "description": "The wallet could not complete the request.",
+        "nextStep": "Reload the page and try again. If the problem continues, contact support."
+      }
+    }
+  },
+  "transaction": {
+    "status": {
+      "pending": "Pending — waiting for network confirmation",
+      "confirmed": "Confirmed",
+      "failed": "Failed",
+      "expired": "Expired — confirmation timed out"
+    },
+    "pendingHint": "This can take a few moments. Keep this page open.",
+    "confirmedHint": "The transaction was confirmed on the network.",
+    "failedHint": "The transaction was not completed. No changes were made.",
+    "expiredHint": "We could not confirm the transaction in time. It may still complete, but do not assume it succeeded.",
+    "networkError": "Network error: we could not check the transaction status.",
+    "retry": "Retry",
+    "contactSupport": "Contact support",
+    "viewExplorer": "View on Stellar Explorer ↗",
+    "explorerUnavailable": "An explorer link will appear once a valid transaction ID is available."
+  },
+  "consent": {
+    "title": "Consent & Privacy",
+    "statusLabel": "Current consent status",
+    "status": {
+      "granted": "Consent granted",
+      "revoked": "Consent revoked",
+      "none": "No consent on record"
+    },
+    "scopeLabel": "What you are sharing",
+    "scope": {
+      "records": "Vaccination records",
+      "issuer": "Issuing organization",
+      "dates": "Vaccination dates"
+    },
+    "consequences": {
+      "grant": "Granting consent lets verifiers check your vaccination status.",
+      "revoke": "Revoking consent stops new verifications. Existing verifiers may keep records they already received."
+    },
+    "grant": "Grant consent",
+    "revoke": "Revoke consent",
+    "confirmGrant": "Confirm you want to grant consent for the scope shown above.",
+    "confirmRevoke": "Confirm you want to revoke consent. Verifiers will no longer be able to check your status.",
+    "confirm": "Confirm",
+    "cancel": "Cancel",
+    "updating": "Updating…",
+    "updated": "Consent updated.",
+    "error": "Could not update consent. Please try again."
+  },
+  "qr": {
+    "title": "Scan to verify",
+    "ariaLabel": "QR code linking to the verification page",
+    "description": "Scan this QR code with a camera to open the verification page. If you cannot scan it, copy the link below.",
+    "urlLabel": "Verification URL",
+    "copy": "Copy link",
+    "copied": "Link copied to clipboard.",
+    "copyFailed": "Could not copy the link. Select the URL above and copy it manually.",
+    "clipboardDenied": "Clipboard access was denied. Select the URL above and copy it manually."
   }
 }

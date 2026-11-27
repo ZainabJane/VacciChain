@@ -87,18 +87,80 @@ If using your own PKI or a commercial CA:
    docker compose up -d
    ```
 
-## Option 3: Cloud Load Balancer
+## Option 3: AWS ALB with Managed Certificate (ACM) — Production Default
 
-If deploying behind AWS ALB, GCP Load Balancer, or Cloudflare:
+Production terminates public HTTP(S) at an AWS Application Load Balancer using a
+certificate managed by **AWS Certificate Manager (ACM)**. ACM issues the
+certificate, renews it automatically before expiry, and requires no manual
+renewal jobs or certbot containers.
 
-1. **Configure TLS at the load balancer** (not in nginx).
-2. **Update nginx.conf** to listen on port 80 only (remove the HTTPS server block).
-3. **Trust X-Forwarded-Proto** header from the load balancer:
+### 1. Request the certificate (DNS validation)
+
+1. **Request a public certificate** in ACM for your domain (and `*.` wildcard if needed):
+   ```bash
+   aws acm request-certificate \
+     --domain-name vaccichain.example.com \
+     --validation-method DNS \
+     --subject-alternative-names www.vaccichain.example.com
+   ```
+2. **Create the DNS validation record** shown in the ACM console (or via
+   `aws acm describe-certificate`). If DNS is hosted in Route 53, use
+   "Create records in Route 53" for one-click validation.
+3. **Wait for status `ISSUED`**:
+   ```bash
+   aws acm describe-certificate \
+     --certificate-arn <cert-arn> \
+     --query 'Certificate.Status'
+   # Expected: "ISSUED"
+   ```
+
+ACM renews the certificate automatically as long as the DNS validation record
+remains in place — do not delete it. No renewal cron or certbot service is needed.
+
+### 2. Configure the ALB listeners
+
+- **HTTPS listener (443)**: attach the ACM certificate and set the security policy
+  to a modern policy, e.g. `ELBSecurityPolicy-TLS13-1-2-2021-06`
+  (TLS 1.3 + TLS 1.2, forward-secret ciphers only; TLS 1.0/1.1 disabled).
+- **HTTP listener (80)**: do **not** forward to the target group. Instead add a
+  rule that redirects all traffic to HTTPS:
+  ```
+  Default action: Redirect
+    Protocol: HTTPS
+    Port: 443
+    Status code: HTTP_301
+  ```
+  This makes plaintext application traffic explicitly redirected rather than served.
+
+Example (AWS CLI):
+```bash
+# HTTPS listener with managed cert + modern policy
+aws elbv2 create-listener \
+  --load-balancer-arn <alb-arn> \
+  --protocol HTTPS --port 443 \
+  --certificates CertificateArn=<cert-arn> \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06 \
+  --default-actions Type=forward,TargetGroupArn=<tg-arn>
+
+# HTTP listener that redirects to HTTPS
+aws elbv2 create-listener \
+  --load-balancer-arn <alb-arn> \
+  --protocol HTTP --port 80 \
+  --default-actions '[{"Type":"redirect","RedirectConfig":{"Protocol":"HTTPS","Port":"443","StatusCode":"HTTP_301"}}]'
+```
+
+### 3. Application (nginx) behind the ALB
+
+1. **Update nginx.conf** to listen on port 80 only (remove the HTTPS server block);
+   TLS is terminated at the ALB.
+2. **Trust X-Forwarded-Proto** header from the load balancer:
    ```nginx
    # In each proxy_pass location:
    proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
    ```
-4. **Verify HSTS** is set by the load balancer (or add it to nginx).
+3. **Verify HSTS** is set by the load balancer (or add it to nginx).
+4. **Restrict the target group** so instances only accept traffic from the ALB
+   security group (no direct public access on 80/443).
 
 ## Verification
 
@@ -124,7 +186,35 @@ curl -I https://vaccichain.example.com
 # Expected: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
 ```
 
-### 4. SSL Labs test
+### 4. Verify the managed certificate (ACM)
+
+```bash
+# Certificate is issued and not expired
+aws acm describe-certificate \
+  --certificate-arn <cert-arn> \
+  --query 'Certificate.{Status:Status,NotAfter:NotAfter,Domain:DomainName}'
+# Expected: Status "ISSUED", NotAfter in the future
+
+# Certificate served by the ALB matches the ACM certificate
+echo | openssl s_client -connect vaccichain.example.com:443 -servername vaccichain.example.com 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+# Expected: subject CN=vaccichain.example.com, issuer Amazon, notAfter in the future
+```
+
+### 5. Verify TLS policy enforcement (ALB)
+
+```bash
+# TLS 1.0 / 1.1 must fail (disabled by the security policy)
+openssl s_client -connect vaccichain.example.com:443 -tls1_1
+# Expected: handshake failure
+
+# TLS 1.2 / 1.3 must succeed
+openssl s_client -connect vaccichain.example.com:443 -tls1_2
+openssl s_client -connect vaccichain.example.com:443 -tls1_3
+# Expected: successful connection
+```
+
+### 6. SSL Labs test
 Visit [SSL Labs](https://www.ssllabs.com/ssltest/) and enter your domain. Target grade: **A** or **A+**.
 
 ## Security Considerations
@@ -158,17 +248,21 @@ Visit [SSL Labs](https://www.ssllabs.com/ssltest/) and enter your domain. Target
 
 - [ ] Domain DNS configured
 - [ ] Firewall allows ports 80 and 443
-- [ ] TLS certificate obtained and valid
-- [ ] HTTP redirects to HTTPS (301)
+- [ ] ACM certificate issued (status `ISSUED`) with DNS validation record retained
+- [ ] ALB HTTPS listener (443) uses the ACM certificate
+- [ ] ALB security policy is modern (e.g. `ELBSecurityPolicy-TLS13-1-2-2021-06`)
+- [ ] HTTP listener (80) redirects to HTTPS (301) — no plaintext forwarding
 - [ ] HSTS header present with 1-year max-age
 - [ ] TLS 1.2+ enforced (1.0/1.1 disabled)
 - [ ] SSL Labs grade A or A+
-- [ ] Certificate auto-renewal tested
+- [ ] Certificate auto-renewal confirmed (ACM managed; DNS validation record present)
 - [ ] Private key secured (not in git)
-- [ ] Monitoring alerts for certificate expiry
+- [ ] Monitoring alerts for certificate expiry (ACM expiry CloudWatch alarm)
 
 ## References
 
+- [AWS Certificate Manager Documentation](https://docs.aws.amazon.com/acm/)
+- [ALB HTTPS Listeners & Security Policies](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/create-https-listener.html)
 - [Let's Encrypt Documentation](https://letsencrypt.org/docs/)
 - [Mozilla SSL Configuration Generator](https://ssl-config.mozilla.org/)
 - [OWASP TLS Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Transport_Layer_Protection_Cheat_Sheet.html)

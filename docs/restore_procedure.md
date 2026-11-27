@@ -55,6 +55,35 @@ And then checking:
 ## Backup Integrity Checks
 Before relying on any backup for a restore (including drills), confirm it passed the automated integrity checks. Backup jobs emit success/failure metrics and validate that each archive is complete, readable, and encrypted; an alert fires when an expected backup is missing or invalid. If a backup has not passed these checks, do not use it for a restore — select the most recent backup that did.
 
+## Retention and Purge Interaction with Recovery
+
+Automated retention/purge jobs run on a schedule and delete off-chain data that has exceeded its retention period (see the data retention policy for data classes and periods). These jobs must **never** delete records required for recovery or audit.
+
+### Protected Records
+The following records are exempt from automated purge and must survive any retention job:
+- **Recovery checkpoints**: backup manifests, restore checkpoints, and the metadata needed to identify and validate a backup (e.g. `vaccichain_YYYYMMDD_HHMMSS.db` entries and their checksums).
+- **Audit logs**: entries required for compliance and audit trails, which are retained per the audit retention period and are not subject to the standard operational purge.
+- **Backup catalog records**: the index of available backups in S3, which is needed to locate a restore point.
+
+Purge jobs must filter these classes out explicitly (by data class / table) rather than relying on age alone, so that a restore point is always available even after a purge cycle.
+
+### Verifying Recovery Records Survive a Purge
+Before relying on a backup for recovery, confirm that the retention jobs have not removed the records needed to restore:
+
+1. List the available backups and confirm the expected restore point is still present:
+   ```bash
+   aws s3 ls s3://<S3_BUCKET_NAME>/
+   ```
+2. Check the backend logs for the most recent retention/purge run and confirm it reports zero deletions of protected classes (recovery checkpoints, audit logs, backup catalog):
+   ```bash
+   docker compose logs backend | grep -i purge
+   ```
+3. Query the backup catalog / checkpoint table to confirm the restore point metadata (timestamp, checksum) is intact:
+   ```bash
+   docker compose exec backend node -e "/* query checkpoint table and print rows */"
+   ```
+4. If any protected record is missing, do **not** proceed with the restore using that backup; select an older backup that still has intact checkpoint metadata, or escalate before continuing.
+
 ## Scheduled Restore Drills
 
 ### Cadence
@@ -103,3 +132,4 @@ Each drill records: drill date, backup file used, integrity-check outcome, datab
 ## Troubleshooting
 - **Database Locked / Corrupted**: Ensure the backend service is fully stopped before copying the database over. `sql.js` loads the DB entirely into memory, so live replacement will fail or cause corruption when it flushes.
 - **Permissions**: Make sure the replacement database file has appropriate permissions so that the node.js backend user can read/write to it. Running the `docker run alpine cp ...` as shown above ensures it runs as root within the volume, which matches the default Docker volume behaviour.
+- **Missing Restore Point After Purge**: If the expected backup or its checkpoint metadata is gone, a retention job may have deleted a protected record. Restore from the most recent backup with intact checkpoint metadata and file a bug against the purge job's data-class filters.

@@ -33,6 +33,12 @@ process.env.NODE_ENV = 'test';
 const { buildChallenge, verifyChallenge } = require('../src/stellar/sep10');
 const nonceStore = require('../src/stellar/nonceStore');
 
+// Helper: verifyChallenge is async (nonce consumption is atomic/awaited).
+// Wrap sync-style assertions so tests can `await` and still use expect(...).toThrow.
+const expectRejection = async (promise, message) => {
+  await expect(promise).rejects.toThrow(message);
+};
+
 // Test keypairs - using Stellar's test keys
 const SERVER_KEYPAIR = StellarSdk.Keypair.fromSecret(process.env.SEP10_SERVER_KEY);
 const CLIENT_KEYPAIR = StellarSdk.Keypair.random();
@@ -96,7 +102,7 @@ describe('SEP-10 Authentication Flow', () => {
       const signedXDR = tx.toXDR();
 
       // Verify
-      const result = verifyChallenge(signedXDR, nonce);
+      const result = await verifyChallenge(signedXDR, nonce);
       expect(result).toBe(CLIENT_KEYPAIR.publicKey());
     });
 
@@ -138,7 +144,7 @@ describe('SEP-10 Authentication Flow', () => {
       Date.now = jest.fn(() => originalDateNow() + (5 * 60 * 1000) + 1000);
 
       try {
-        expect(() => verifyChallenge(signedXDR, nonce)).toThrow('Challenge expired');
+        await expectRejection(verifyChallenge(signedXDR, nonce), 'Challenge expired');
       } finally {
         Date.now = originalDateNow;
       }
@@ -155,7 +161,7 @@ describe('SEP-10 Authentication Flow', () => {
       Date.now = jest.fn(() => originalDateNow() + (5 * 60 * 1000));
 
       try {
-        expect(() => verifyChallenge(signedXDR, nonce)).toThrow('Challenge expired');
+        await expectRejection(verifyChallenge(signedXDR, nonce), 'Challenge expired');
       } finally {
         Date.now = originalDateNow;
       }
@@ -173,7 +179,7 @@ describe('SEP-10 Authentication Flow', () => {
 
       try {
         // Should still work at 4:59.999
-        const result = verifyChallenge(signedXDR, nonce);
+        const result = await verifyChallenge(signedXDR, nonce);
         expect(result).toBe(CLIENT_KEYPAIR.publicKey());
       } finally {
         Date.now = originalDateNow;
@@ -189,11 +195,11 @@ describe('SEP-10 Authentication Flow', () => {
       const signedXDR = tx.toXDR();
 
       // First verification should succeed
-      const result = verifyChallenge(signedXDR, nonce);
+      const result = await verifyChallenge(signedXDR, nonce);
       expect(result).toBe(CLIENT_KEYPAIR.publicKey());
 
       // Second verification with same nonce should fail
-      expect(() => verifyChallenge(signedXDR, nonce)).toThrow('Invalid or already used nonce');
+      await expectRejection(verifyChallenge(signedXDR, nonce), 'Invalid or already used nonce');
     });
 
     it('should reject nonce that was never issued', async () => {
@@ -205,7 +211,7 @@ describe('SEP-10 Authentication Flow', () => {
       tx.sign(CLIENT_KEYPAIR);
       const signedXDR = tx.toXDR();
 
-      expect(() => verifyChallenge(signedXDR, fakeNonce)).toThrow('Invalid or already used nonce');
+      await expectRejection(verifyChallenge(signedXDR, fakeNonce), 'Invalid or already used nonce');
     });
 
     it('should track nonce uniqueness across multiple challenges', async () => {
@@ -225,8 +231,8 @@ describe('SEP-10 Authentication Flow', () => {
       const signed2 = new StellarSdk.Transaction(tx2, TESTNET_PASSPHRASE);
       signed2.sign(client2Keypair);
 
-      const result1 = verifyChallenge(signed1.toXDR(), nonce1);
-      const result2 = verifyChallenge(signed2.toXDR(), nonce2);
+      const result1 = await verifyChallenge(signed1.toXDR(), nonce1);
+      const result2 = await verifyChallenge(signed2.toXDR(), nonce2);
 
       expect(result1).toBe(CLIENT_KEYPAIR.publicKey());
       expect(result2).toBe(client2Keypair.publicKey());
@@ -264,7 +270,7 @@ describe('SEP-10 Authentication Flow', () => {
       tx.sign(CLIENT_KEYPAIR);
       const signedXDR = tx.toXDR();
 
-      const result = verifyChallenge(signedXDR, nonce);
+      const result = await verifyChallenge(signedXDR, nonce);
       expect(result).toBe(CLIENT_KEYPAIR.publicKey());
     });
 
@@ -287,7 +293,7 @@ describe('SEP-10 Authentication Flow', () => {
       const { transaction, nonce } = await buildChallenge(CLIENT_KEYPAIR.publicKey());
       // Don't sign with client key
 
-      expect(() => verifyChallenge(transaction, nonce)).toThrow('Client signature missing or invalid');
+      await expectRejection(verifyChallenge(transaction, nonce), 'Client signature missing or invalid');
     });
 
     it('should reject challenge signed with wrong keypair', async () => {
@@ -296,7 +302,7 @@ describe('SEP-10 Authentication Flow', () => {
       tx.sign(WRONG_KEYPAIR); // Sign with wrong key
       const signedXDR = tx.toXDR();
 
-      expect(() => verifyChallenge(signedXDR, nonce)).toThrow('Client signature missing or invalid');
+      await expectRejection(verifyChallenge(signedXDR, nonce), 'Client signature missing or invalid');
     });
 
     it('should reject challenge with modified transaction', async () => {
@@ -310,7 +316,7 @@ describe('SEP-10 Authentication Flow', () => {
       // Add a dummy signature (this would invalidate the original signatures)
       modifiedTx.signatures.push({ signature: Buffer.from('fake') });
 
-      expect(() => verifyChallenge(modifiedTx.toXDR(), nonce)).toThrow();
+      await expect(verifyChallenge(modifiedTx.toXDR(), nonce)).rejects.toThrow();
     });
 
     it('should reject challenge with invalid server signature', async () => {
@@ -323,7 +329,7 @@ describe('SEP-10 Authentication Flow', () => {
       tx.sign(CLIENT_KEYPAIR);
       const signedXDR = tx.toXDR();
 
-      expect(() => verifyChallenge(signedXDR, nonce)).toThrow('Invalid server signature');
+      await expectRejection(verifyChallenge(signedXDR, nonce), 'Invalid server signature');
     });
 
     it('should accept challenge with multiple valid signatures', async () => {
@@ -334,7 +340,7 @@ describe('SEP-10 Authentication Flow', () => {
       tx.sign(WRONG_KEYPAIR);
       const signedXDR = tx.toXDR();
 
-      const result = verifyChallenge(signedXDR, nonce);
+      const result = await verifyChallenge(signedXDR, nonce);
       expect(result).toBe(CLIENT_KEYPAIR.publicKey());
     });
   });
@@ -391,7 +397,7 @@ describe('SEP-10 Authentication Flow', () => {
       const modifiedTx = new StellarSdk.Transaction(signedXDR, TESTNET_PASSPHRASE);
       modifiedTx.operations[0].source = undefined;
 
-      expect(() => verifyChallenge(modifiedTx.toXDR(), nonce)).toThrow();
+      await expect(verifyChallenge(modifiedTx.toXDR(), nonce)).rejects.toThrow();
     });
 
     it('should reject transaction with missing manageData operation', async () => {
@@ -404,7 +410,7 @@ describe('SEP-10 Authentication Flow', () => {
       const modifiedTx = new StellarSdk.Transaction(signedXDR, TESTNET_PASSPHRASE);
       modifiedTx.operations = []; // Remove operations
 
-      expect(() => verifyChallenge(modifiedTx.toXDR(), nonce)).toThrow('Invalid challenge format');
+      await expectRejection(verifyChallenge(modifiedTx.toXDR(), nonce), 'Invalid challenge format');
     });
 
     it('should reject transaction with wrong manageData key', async () => {
@@ -419,7 +425,7 @@ describe('SEP-10 Authentication Flow', () => {
 
       // The verification doesn't check the key name, only that it's manageData
       // But the nonce won't match, so it will fail
-      expect(() => verifyChallenge(modifiedTx.toXDR(), nonce)).toThrow();
+      await expect(verifyChallenge(modifiedTx.toXDR(), nonce)).rejects.toThrow();
     });
 
     it('should reject transaction with invalid sequence number', async () => {
@@ -462,12 +468,38 @@ describe('SEP-10 Authentication Flow', () => {
       const verifyFn = () => verifyChallenge(signedXDR, nonce);
       
       // First should succeed
-      expect(verifyFn()).toBe(CLIENT_KEYPAIR.publicKey());
+      expect(await verifyFn()).toBe(CLIENT_KEYPAIR.publicKey());
       
       // All subsequent should fail
-      expect(verifyFn).toThrow('Invalid or already used nonce');
-      expect(verifyFn).toThrow('Invalid or already used nonce');
-      expect(verifyFn).toThrow('Invalid or already used nonce');
+      await expectRejection(verifyFn(), 'Invalid or already used nonce');
+      await expectRejection(verifyFn(), 'Invalid or already used nonce');
+      await expectRejection(verifyFn(), 'Invalid or already used nonce');
+    });
+
+    it('should allow only one of many simultaneous verification attempts to succeed', async () => {
+      const { transaction, nonce } = await buildChallenge(CLIENT_KEYPAIR.publicKey());
+      const tx = new StellarSdk.Transaction(transaction, TESTNET_PASSPHRASE);
+      tx.sign(CLIENT_KEYPAIR);
+      const signedXDR = tx.toXDR();
+
+      // Fire all attempts at the same time without awaiting in between
+      const attempts = Array.from({ length: 10 }, () =>
+        verifyChallenge(signedXDR, nonce).then(
+          (key) => ({ ok: true, key }),
+          (err) => ({ ok: false, err })
+        )
+      );
+
+      const results = await Promise.all(attempts);
+      const successes = results.filter((r) => r.ok);
+      const failures = results.filter((r) => !r.ok);
+
+      expect(successes).toHaveLength(1);
+      expect(successes[0].key).toBe(CLIENT_KEYPAIR.publicKey());
+      expect(failures).toHaveLength(9);
+      for (const failure of failures) {
+        expect(failure.err.message).toMatch('Invalid or already used nonce');
+      }
     });
 
     it('should handle very long nonces', async () => {
@@ -479,7 +511,7 @@ describe('SEP-10 Authentication Flow', () => {
 
       // Nonce from buildChallenge is a public key (56 chars for ed25519)
       // But the store should handle any string
-      expect(() => verifyChallenge(signedXDR, longNonce)).toThrow('Invalid or already used nonce');
+      await expectRejection(verifyChallenge(signedXDR, longNonce), 'Invalid or already used nonce');
     });
 
     it('should handle special characters in nonce', async () => {
@@ -489,7 +521,7 @@ describe('SEP-10 Authentication Flow', () => {
       tx.sign(CLIENT_KEYPAIR);
       const signedXDR = tx.toXDR();
 
-      expect(() => verifyChallenge(signedXDR, specialNonce)).toThrow('Invalid or already used nonce');
+      await expectRejection(verifyChallenge(signedXDR, specialNonce), 'Invalid or already used nonce');
     });
 
     it('should handle empty nonce', async () => {
@@ -498,13 +530,13 @@ describe('SEP-10 Authentication Flow', () => {
       tx.sign(CLIENT_KEYPAIR);
       const signedXDR = tx.toXDR();
 
-      expect(() => verifyChallenge(signedXDR, '')).toThrow('Invalid or already used nonce');
+      await expectRejection(verifyChallenge(signedXDR, ''), 'Invalid or already used nonce');
     });
 
     it('should handle malformed XDR', async () => {
       const malformedXDR = 'invalid-xdr-data';
       
-      expect(() => verifyChallenge(malformedXDR, 'any-nonce')).toThrow();
+      await expect(verifyChallenge(malformedXDR, 'any-nonce')).rejects.toThrow();
     });
 
     it('should handle transaction from future (invalid timeBounds)', async () => {
@@ -518,7 +550,7 @@ describe('SEP-10 Authentication Flow', () => {
       Date.now = jest.fn(() => originalDateNow() - 60000); // 1 minute before now
 
       try {
-        expect(() => verifyChallenge(signedXDR, nonce)).toThrow('Challenge expired');
+        await expectRejection(verifyChallenge(signedXDR, nonce), 'Challenge expired');
       } finally {
         Date.now = originalDateNow;
       }
@@ -538,7 +570,7 @@ describe('SEP-10 Authentication Flow', () => {
         const tx = new StellarSdk.Transaction(transaction, TESTNET_PASSPHRASE);
         tx.sign(CLIENT_KEYPAIR);
         
-        expect(() => verifyChallenge(tx.toXDR(), randomNonce)).toThrow('Invalid or already used nonce');
+        await expectRejection(verifyChallenge(tx.toXDR(), randomNonce), 'Invalid or already used nonce');
       }
     });
 
@@ -566,7 +598,7 @@ describe('SEP-10 Authentication Flow', () => {
 
       try {
         // Nonce should be expired
-        expect(() => verifyChallenge(transaction, nonce)).toThrow('Challenge expired');
+        await expectRejection(verifyChallenge(transaction, nonce), 'Challenge expired');
       } finally {
         Date.now = originalDateNow;
       }
@@ -584,13 +616,13 @@ describe('SEP-10 Authentication Flow', () => {
       const signedChallenge = tx.toXDR();
       
       // Step 3: Server verifies
-      const authenticatedKey = verifyChallenge(signedChallenge, nonce);
+      const authenticatedKey = await verifyChallenge(signedChallenge, nonce);
       
       // Result: Client is authenticated
       expect(authenticatedKey).toBe(CLIENT_KEYPAIR.publicKey());
       
       // Step 4: Subsequent verification with same nonce should fail
-      expect(() => verifyChallenge(signedChallenge, nonce)).toThrow('Invalid or already used nonce');
+      await expectRejection(verifyChallenge(signedChallenge, nonce), 'Invalid or already used nonce');
     });
 
     it('should handle multiple clients authenticating simultaneously', async () => {
@@ -617,13 +649,96 @@ describe('SEP-10 Authentication Flow', () => {
 
       // All clients verify (should all succeed)
       for (const client of clients) {
-        const result = verifyChallenge(client.signedXDR, client.nonce);
+        const result = await verifyChallenge(client.signedXDR, client.nonce);
         expect(result).toBe(client.keypair.publicKey());
       }
 
       // All nonces should be unique
       const nonces = clients.map(c => c.nonce);
       expect(new Set(nonces).size).toBe(5);
+    });
+  });
+
+  describe('Integration: Challenge Lifecycle Storage', () => {
+    it('should reject replay after a successful verification', async () => {
+      const { transaction, nonce } = await buildChallenge(CLIENT_KEYPAIR.publicKey());
+      const tx = new StellarSdk.Transaction(transaction, TESTNET_PASSPHRASE);
+      tx.sign(CLIENT_KEYPAIR);
+      const signedXDR = tx.toXDR();
+
+      expect(await verifyChallenge(signedXDR, nonce)).toBe(CLIENT_KEYPAIR.publicKey());
+      await expectRejection(verifyChallenge(signedXDR, nonce), 'Invalid or already used nonce');
+    });
+
+    it('should reject a challenge after expiry even if never consumed', async () => {
+      const { transaction, nonce } = await buildChallenge(CLIENT_KEYPAIR.publicKey());
+      const tx = new StellarSdk.Transaction(transaction, TESTNET_PASSPHRASE);
+      tx.sign(CLIENT_KEYPAIR);
+      const signedXDR = tx.toXDR();
+
+      const originalDateNow = Date.now;
+      Date.now = jest.fn(() => originalDateNow() + (5 * 60 * 1000) + 1000);
+      try {
+        await expectRejection(verifyChallenge(signedXDR, nonce), 'Challenge expired');
+      } finally {
+        Date.now = originalDateNow;
+      }
+    });
+
+    it('should fail explicitly when the nonce store is unavailable', async () => {
+      const { transaction, nonce } = await buildChallenge(CLIENT_KEYPAIR.publicKey());
+      const tx = new StellarSdk.Transaction(transaction, TESTNET_PASSPHRASE);
+      tx.sign(CLIENT_KEYPAIR);
+      const signedXDR = tx.toXDR();
+
+      const originalConsume = nonceStore.consume;
+      nonceStore.consume = jest.fn(async () => {
+        throw new Error('Nonce store unavailable');
+      });
+
+      try {
+        await expect(verifyChallenge(signedXDR, nonce)).rejects.toThrow('Nonce store unavailable');
+      } finally {
+        nonceStore.consume = originalConsume;
+      }
+    });
+
+    it('should not accept a challenge twice across a simulated process restart (Redis backend)', async () => {
+      // Simulate a Redis-backed store that survives process restarts.
+      const redisData = new Map();
+      const redisMock = {
+        set: jest.fn(async (key, value, opts) => {
+          if (opts && opts.NX && redisData.has(key)) return null;
+          redisData.set(key, value);
+          return 'OK';
+        }),
+        get: jest.fn(async (key) => (redisData.has(key) ? redisData.get(key) : null)),
+        del: jest.fn(async (key) => (redisData.delete(key) ? 1 : 0)),
+      };
+
+      const originalClient = nonceStore.client;
+      nonceStore.client = redisMock;
+
+      try {
+        const { transaction, nonce } = await buildChallenge(CLIENT_KEYPAIR.publicKey());
+        const tx = new StellarSdk.Transaction(transaction, TESTNET_PASSPHRASE);
+        tx.sign(CLIENT_KEYPAIR);
+        const signedXDR = tx.toXDR();
+
+        expect(await verifyChallenge(signedXDR, nonce)).toBe(CLIENT_KEYPAIR.publicKey());
+
+        // Simulate process restart: fresh module instance, same Redis data.
+        jest.resetModules();
+        const restartedNonceStore = require('../src/stellar/nonceStore');
+        restartedNonceStore.client = redisMock;
+        const restartedSep10 = require('../src/stellar/sep10');
+
+        await expect(restartedSep10.verifyChallenge(signedXDR, nonce)).rejects.toThrow(
+          'Invalid or already used nonce'
+        );
+      } finally {
+        nonceStore.client = originalClient;
+      }
     });
   });
 });

@@ -20,6 +20,7 @@ const app = require('../src/app');
 const StellarSdk = require('@stellar/stellar-sdk');
 const { simulateContract } = require('../src/stellar/soroban');
 const verifyRouter = require('../src/routes/verify');
+const { ContractError, ErrorCodes } = require('../src/contractErrors');
 
 const VALID_WALLET = 'GA3AUY2XRF6S7R73ABSLJMKG4R2NQGRUFPEJUGCANMBAAXI4MTBS6AQU';
 // Generate valid Stellar public keys to pass regex and SDK base32 verification checks
@@ -121,6 +122,62 @@ describe('Integration Tests - Public Verify Endpoint (GET /v1/verify/:wallet)', 
 
     expect(res.status).toBe(503);
     expect(res.body).toHaveProperty('error');
+  });
+
+  it('Test: contract error (NotAuthorized) maps to stable 403 API response', async () => {
+    simulateContract.mockRejectedValueOnce(
+      new ContractError(ErrorCodes.NotAuthorized, 'caller is not authorized')
+    );
+
+    const res = await request(app)
+      .get(`/v1/verify/${VALID_WALLET}`)
+      .set('Authorization', `Bearer ${validToken}`);
+
+    expect(res.status).toBe(403);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code', ErrorCodes.NotAuthorized);
+  });
+
+  it('Test: contract error (NotFound) maps to stable 404 API response', async () => {
+    simulateContract.mockRejectedValueOnce(
+      new ContractError(ErrorCodes.NotFound, 'record not found')
+    );
+
+    const res = await request(app)
+      .get(`/v1/verify/${VALID_WALLET}`)
+      .set('Authorization', `Bearer ${validToken}`);
+
+    expect(res.status).toBe(404);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code', ErrorCodes.NotFound);
+  });
+
+  it('Test: contract error (InvalidInput) maps to stable 400 API response', async () => {
+    simulateContract.mockRejectedValueOnce(
+      new ContractError(ErrorCodes.InvalidInput, 'invalid argument')
+    );
+
+    const res = await request(app)
+      .get(`/v1/verify/${VALID_WALLET}`)
+      .set('Authorization', `Bearer ${validToken}`);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code', ErrorCodes.InvalidInput);
+  });
+
+  it('Test: unknown contract error maps to stable 500 API response', async () => {
+    simulateContract.mockRejectedValueOnce(
+      new ContractError(9999, 'unexpected contract failure')
+    );
+
+    const res = await request(app)
+      .get(`/v1/verify/${VALID_WALLET}`)
+      .set('Authorization', `Bearer ${validToken}`);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code', 9999);
   });
 
   it('Test: response is served from cache on second request within TTL', async () => {

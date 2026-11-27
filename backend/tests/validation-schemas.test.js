@@ -144,6 +144,12 @@ describe('Request Body Validation Schemas', () => {
         expect(result.success).toBe(false);
       });
 
+      it('should reject dose_number greater than dose_series', () => {
+        expect(issueSchema.safeParse({
+          patient_address: 'GABC', vaccine_name: 'MMR', date_administered: '2024-01-15', dose_number: 3, dose_series: 2,
+        }).success).toBe(false);
+      });
+
       it('should allow optional dose fields', () => {
         const result = issueSchema.safeParse({
           patient_address: 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF',
@@ -151,6 +157,100 @@ describe('Request Body Validation Schemas', () => {
           date_administered: '2024-01-15T10:30:00Z',
         });
         expect(result.success).toBe(true);
+      });
+
+      describe('date and timezone normalization', () => {
+        const base = {
+          patient_address: 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF',
+          vaccine_name: 'Pfizer-BioNTech',
+        };
+
+        const parseDate = (date_administered) =>
+          issueSchema.safeParse({ ...base, date_administered });
+
+        it('should accept a UTC timestamp at the start-of-day boundary', () => {
+          const result = parseDate('2024-01-15T00:00:00Z');
+          expect(result.success).toBe(true);
+          expect(new Date(result.data.date_administered).toISOString()).toBe(
+            '2024-01-15T00:00:00.000Z'
+          );
+        });
+
+        it('should accept a UTC timestamp at the end-of-day boundary', () => {
+          const result = parseDate('2024-01-15T23:59:59Z');
+          expect(result.success).toBe(true);
+          expect(new Date(result.data.date_administered).toISOString()).toBe(
+            '2024-01-15T23:59:59.000Z'
+          );
+        });
+
+        it('should accept a leap-day timestamp', () => {
+          const result = parseDate('2024-02-29T12:00:00Z');
+          expect(result.success).toBe(true);
+          expect(new Date(result.data.date_administered).toISOString()).toBe(
+            '2024-02-29T12:00:00.000Z'
+          );
+        });
+
+        it('should reject a non-leap-year February 29th', () => {
+          const result = parseDate('2023-02-29T12:00:00Z');
+          expect(result.success).toBe(false);
+        });
+
+        it('should accept an explicit positive offset and normalize to UTC', () => {
+          const result = parseDate('2024-01-15T10:30:00+05:30');
+          expect(result.success).toBe(true);
+          expect(new Date(result.data.date_administered).toISOString()).toBe(
+            '2024-01-15T05:00:00.000Z'
+          );
+        });
+
+        it('should accept an explicit negative offset and normalize to UTC', () => {
+          const result = parseDate('2024-01-15T10:30:00-08:00');
+          expect(result.success).toBe(true);
+          expect(new Date(result.data.date_administered).toISOString()).toBe(
+            '2024-01-15T18:30:00.000Z'
+          );
+        });
+
+        it('should not shift an offset timestamp across a UTC day boundary', () => {
+          const result = parseDate('2024-01-15T23:30:00-05:00');
+          expect(result.success).toBe(true);
+          expect(new Date(result.data.date_administered).toISOString()).toBe(
+            '2024-01-16T04:30:00.000Z'
+          );
+        });
+
+        it('should reject a timestamp without timezone information', () => {
+          const result = parseDate('2024-01-15T10:30:00');
+          expect(result.success).toBe(false);
+        });
+
+        it('should reject a date-only value for the timestamp field', () => {
+          const result = parseDate('2024-01-15');
+          expect(result.success).toBe(false);
+        });
+
+        it('should reject an ambiguous non-ISO date string', () => {
+          const result = parseDate('01/15/2024');
+          expect(result.success).toBe(false);
+        });
+
+        it('should preserve historical records without timezone shift', () => {
+          const result = parseDate('1970-01-01T00:00:00Z');
+          expect(result.success).toBe(true);
+          expect(new Date(result.data.date_administered).toISOString()).toBe(
+            '1970-01-01T00:00:00.000Z'
+          );
+        });
+
+        it('should preserve pre-epoch historical records without timezone shift', () => {
+          const result = parseDate('1960-06-15T08:15:00Z');
+          expect(result.success).toBe(true);
+          expect(new Date(result.data.date_administered).toISOString()).toBe(
+            '1960-06-15T08:15:00.000Z'
+          );
+        });
       });
     });
 

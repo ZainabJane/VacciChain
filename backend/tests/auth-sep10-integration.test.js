@@ -11,11 +11,21 @@ const NETWORK_PASSPHRASE = 'Test SDF Network ; September 2015';
 
 // ── Mocks (declared before any require of app/routes) ────────────────────────
 
-jest.mock('../src/stellar/sep10', () => ({
-  buildChallenge: jest.fn(),
-  verifyChallenge: jest.fn(),
-  NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
-}));
+jest.mock('../src/stellar/sep10', () => {
+  class NonceStoreUnavailableError extends Error {
+    constructor(message = 'Nonce store unavailable') {
+      super(message);
+      this.name = 'NonceStoreUnavailableError';
+      this.code = 'NONCE_STORE_UNAVAILABLE';
+    }
+  }
+  return {
+    buildChallenge: jest.fn(),
+    verifyChallenge: jest.fn(),
+    NonceStoreUnavailableError,
+    NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+  };
+});
 
 jest.mock('../src/jwtKeys', () => ({
   getSigningKey: () => ({ secret: 'test-jwt-secret', kid: 'test-kid' }),
@@ -124,5 +134,42 @@ describe('POST /v1/auth/verify', () => {
 
     expect(res.status).toBe(401);
     expect(res.body.error).toMatch(/expired/i);
+  });
+
+  it('returns 401 when the same nonce is replayed', async () => {
+    sep10.verifyChallenge
+      .mockReturnValueOnce(VALID_PUBLIC_KEY)
+      .mockImplementationOnce(() => {
+        throw new Error('Challenge nonce has already been used');
+      });
+
+    const first = await request(app)
+      .post('/v1/auth/verify')
+      .send({ transaction: SIGNED_TX, nonce: MOCK_NONCE });
+
+    expect(first.status).toBe(200);
+    expect(typeof first.body.token).toBe('string');
+
+    const replay = await request(app)
+      .post('/v1/auth/verify')
+      .send({ transaction: SIGNED_TX, nonce: MOCK_NONCE });
+
+    expect(replay.status).toBe(401);
+    expect(replay.body.token).toBeUndefined();
+    expect(replay.body.error).toMatch(/already been used|replay/i);
+  });
+
+  it('returns 503 (fail closed) when the nonce store is unavailable', async () => {
+    sep10.verifyChallenge.mockImplementation(() => {
+      throw new sep10.NonceStoreUnavailableError();
+    });
+
+    const res = await request(app)
+      .post('/v1/auth/verify')
+      .send({ transaction: SIGNED_TX, nonce: MOCK_NONCE });
+
+    expect(res.status).toBe(503);
+    expect(res.body.token).toBeUndefined();
+    expect(res.body.error).toMatch(/unavailable/i);
   });
 });

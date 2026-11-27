@@ -12,7 +12,7 @@ const { invokeContract } = require('../src/stellar/soroban');
 const { jwtFactory } = require('./factories');
 
 
-describe('POST /patient/register', () => {
+describe('POST /v1/patient/register', () => {
   beforeEach(() => {
     process.env.JWT_SECRET = 'test-secret';
     process.env.ADMIN_SECRET_KEY = 'SCZANGBA5RLMPI35IQKZNMHES4NXBS4RVZJBZPAXKZQNQNZ5RX42L72';
@@ -22,14 +22,14 @@ describe('POST /patient/register', () => {
   afterEach(() => jest.clearAllMocks());
 
   it('returns 401 without a token', async () => {
-    const res = await request(app).post('/patient/register');
+    const res = await request(app).post('/v1/patient/register');
     expect(res.status).toBe(401);
   });
 
   it('registers successfully with a valid patient JWT', async () => {
     const token = jwtFactory({ role: 'patient' });
     const res = await request(app)
-      .post('/patient/register')
+      .post('/v1/patient/register')
       .set('Authorization', `Bearer ${token}`);
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
@@ -44,7 +44,7 @@ describe('POST /patient/register', () => {
     invokeContract.mockRejectedValue(new Error('contract error'));
     const token = jwtFactory({ role: 'patient' });
     const res = await request(app)
-      .post('/patient/register')
+      .post('/v1/patient/register')
       .set('Authorization', `Bearer ${token}`);
     expect(res.status).toBe(500);
     expect(res.body.error).toBe('contract error');

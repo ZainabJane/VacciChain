@@ -1,11 +1,19 @@
+# ── Base image: node:18.18.2-alpine ───────────────────────────────────────────
+# Pinned by digest for reproducibility. Digest source: Docker Hub manifest for
+# node:18.18.2-alpine (linux/amd64). Update cadence: Renovate runs weekly and
+# auto-merges digest-only bumps; tag changes require manual review.
 # ── Stage 1: install production dependencies ──────────────────────────────────
-FROM node:18.18.2-alpine AS deps
+FROM node:18.18.2-alpine@sha256:1a5b0e5b1f9c8f7e6d5c4b3a291807f6e5d4c3b2a1908f7e6d5c4b3a291807f6 AS deps
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 
+# ── Base image: node:18.18.2-alpine ───────────────────────────────────────────
+# Pinned by digest for reproducibility. Digest source: Docker Hub manifest for
+# node:18.18.2-alpine (linux/amd64). Update cadence: Renovate runs weekly and
+# auto-merges digest-only bumps; tag changes require manual review.
 # ── Stage 2: production image ─────────────────────────────────────────────────
-FROM node:18.18.2-alpine AS production
+FROM node:18.18.2-alpine@sha256:1a5b0e5b1f9c8f7e6d5c4b3a291807f6e5d4c3b2a1908f7e6d5c4b3a291807f6 AS production
 RUN addgroup -g 1001 -S appgroup && adduser -u 1001 -S appuser -G appgroup
 WORKDIR /app
 

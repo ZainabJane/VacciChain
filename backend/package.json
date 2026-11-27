@@ -9,8 +9,10 @@
     "migrate:rollback": "node scripts/migrate.mjs --rollback",
     "migrate:status": "node scripts/migrate.mjs --status",
     "test": "jest --forceExit",
+    "test:swagger": "node scripts/check-swagger-coverage.js",
     "test:coverage": "c8 --check-coverage --lines 70 --functions 70 --branches 70 jest --forceExit",
     "lint": "eslint src",
+    "docs:check": "node scripts/check-openapi.js",
     "seed": "node scripts/seed_demo.mjs",
     "load-test": "k6 run load-test.js",
     "load-test:baseline": "k6 run -e BASE_URL=http://localhost:4000 -e VUS=100 -e DURATION=60s load-test.js"

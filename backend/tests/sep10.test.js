@@ -136,22 +136,26 @@ describe('buildChallenge — transaction structure', () => {
 // ── Nonce store ───────────────────────────────────────────────────────────────
 
 describe('nonceStore — TTL and single-use', () => {
-  test('consume succeeds once then throws on replay', () => {
+  test('consume succeeds once then rejects on replay', async () => {
     const nonceStore = require('../src/stellar/nonceStore');
-    nonceStore.set('test-nonce-1', clientKeypair.publicKey());
-    expect(() => nonceStore.consume('test-nonce-1')).not.toThrow();
-    expect(() => nonceStore.consume('test-nonce-1')).toThrow('Invalid or already used nonce');
+    await nonceStore.set('test-nonce-1', clientKeypair.publicKey());
+    await expect(nonceStore.consume('test-nonce-1')).resolves.toBeUndefined();
+    await expect(nonceStore.consume('test-nonce-1')).rejects.toThrow(
+      'Invalid or already used nonce'
+    );
   });
 
-  test('consume throws for unknown nonce', () => {
+  test('consume rejects for unknown nonce', async () => {
     const nonceStore = require('../src/stellar/nonceStore');
-    expect(() => nonceStore.consume('never-registered')).toThrow('Invalid or already used nonce');
+    await expect(nonceStore.consume('never-registered')).rejects.toThrow(
+      'Invalid or already used nonce'
+    );
   });
 
-  test('consume throws for expired nonce', () => {
+  test('consume rejects for expired nonce', async () => {
     const nonceStore = require('../src/stellar/nonceStore');
     // Manually insert an already-expired entry
-    nonceStore.set('expired-nonce', clientKeypair.publicKey());
+    await nonceStore.set('expired-nonce', clientKeypair.publicKey());
     // Reach into the store and backdate the expiry
     const store = nonceStore._storeForTesting?.();
     if (store) {
@@ -161,7 +165,49 @@ describe('nonceStore — TTL and single-use', () => {
       // If internal store not exposed, skip this sub-test
       return;
     }
-    expect(() => nonceStore.consume('expired-nonce')).toThrow('Challenge expired');
+    await expect(nonceStore.consume('expired-nonce')).rejects.toThrow('Challenge expired');
+  });
+
+  test('consume fails closed when the store backend is unavailable', async () => {
+    const nonceStore = require('../src/stellar/nonceStore');
+    const { NonceStoreUnavailableError } = nonceStore;
+
+    await nonceStore.set('unavailable-nonce', clientKeypair.publicKey());
+
+    // Simulate a backend outage: the store cannot be read.
+    const store = nonceStore._storeForTesting?.();
+    if (!store) {
+      // If internal store not exposed, skip this sub-test
+      return;
+    }
+    const originalGet = store.get;
+    store.get = () => {
+      throw new Error('backend down');
+    };
+
+    try {
+      await expect(nonceStore.consume('unavailable-nonce')).rejects.toBeInstanceOf(
+        NonceStoreUnavailableError
+      );
+    } finally {
+      store.get = originalGet;
+    }
+  });
+
+  test('concurrent consume calls: exactly one succeeds', async () => {
+    const nonceStore = require('../src/stellar/nonceStore');
+    await nonceStore.set('race-nonce', clientKeypair.publicKey());
+
+    const results = await Promise.allSettled([
+      nonceStore.consume('race-nonce'),
+      nonceStore.consume('race-nonce'),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason.message).toBe('Invalid or already used nonce');
   });
 });
 
@@ -171,16 +217,16 @@ describe('verifyChallenge — spec validation', () => {
   test('returns client public key on valid signed challenge', async () => {
     const { verifyChallenge } = require('../src/stellar/sep10');
     const { xdr, nonce } = await buildAndSign();
-    const result = verifyChallenge(xdr, nonce);
+    const result = await verifyChallenge(xdr, nonce);
     expect(result).toBe(clientKeypair.publicKey());
   });
 
   test('rejects replayed nonce', async () => {
     const { verifyChallenge } = require('../src/stellar/sep10');
     const { xdr, nonce } = await buildAndSign();
-    verifyChallenge(xdr, nonce); // first use — ok
+    await verifyChallenge(xdr, nonce); // first use — ok
     // Re-sign to get a fresh XDR (nonce already consumed, so this should throw on nonce)
-    expect(() => verifyChallenge(xdr, nonce)).toThrow('Invalid or already used nonce');
+    await expect(verifyChallenge(xdr, nonce)).rejects.toThrow('Invalid or already used nonce');
   });
 
   test('rejects wrong network_passphrase', async () => {
@@ -199,7 +245,7 @@ describe('verifyChallenge — spec validation', () => {
     process.env.STELLAR_NETWORK = 'mainnet';
     const { verifyChallenge: verifyMain } = require('../src/stellar/sep10');
 
-    expect(() => verifyMain(signedXdr, nonce)).toThrow();
+    await expect(verifyMain(signedXdr, nonce)).rejects.toThrow();
   });
 
   test('rejects transaction with wrong home_domain key', async () => {
@@ -223,9 +269,9 @@ describe('verifyChallenge — spec validation', () => {
     const { verifyChallenge: verifyOther } = require('../src/stellar/sep10');
     // Register the nonce in the new module's nonceStore
     const newNonceStore = require('../src/stellar/nonceStore');
-    newNonceStore.set(nonce, clientKeypair.publicKey());
+    await newNonceStore.set(nonce, clientKeypair.publicKey());
 
-    expect(() => verifyOther(signedXdr, nonce)).toThrow(/Invalid manage_data key/);
+    await expect(verifyOther(signedXdr, nonce)).rejects.toThrow(/Invalid manage_data key/);
   });
 
   test('rejects transaction with sequence number != 0', async () => {
@@ -250,9 +296,9 @@ describe('verifyChallenge — spec validation', () => {
 
     // Register a fake nonce so the nonce check passes
     const nonceStore = require('../src/stellar/nonceStore');
-    nonceStore.set('A'.repeat(64), clientKeypair.publicKey());
+    await nonceStore.set('A'.repeat(64), clientKeypair.publicKey());
 
-    expect(() => verifyChallenge(tx.toXDR(), 'A'.repeat(64))).toThrow(
+    await expect(verifyChallenge(tx.toXDR(), 'A'.repeat(64))).rejects.toThrow(
       'Challenge transaction sequence number must be 0'
     );
   });
@@ -261,6 +307,8 @@ describe('verifyChallenge — spec validation', () => {
     const { buildChallenge, verifyChallenge, NETWORK_PASSPHRASE: NP } = require('../src/stellar/sep10');
     const { transaction, nonce } = await buildChallenge(clientKeypair.publicKey());
     // Do NOT sign with client — submit server-only signed XDR
-    expect(() => verifyChallenge(transaction, nonce)).toThrow('Client signature missing or invalid');
+    await expect(verifyChallenge(transaction, nonce)).rejects.toThrow(
+      'Client signature missing or invalid'
+    );
   });
 });

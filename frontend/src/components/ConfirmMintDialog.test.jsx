@@ -1,4 +1,5 @@
 import { render, screen, fireEvent } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import ConfirmMintDialog from './ConfirmMintDialog';
 
 describe('ConfirmMintDialog', () => {
@@ -78,5 +79,51 @@ describe('ConfirmMintDialog', () => {
     const preventDefault = jest.fn();
     fireEvent.keyDown(overlay, { key: 'Enter', preventDefault });
     expect(preventDefault).not.toHaveBeenCalled(); // Enter is allowed to propagate
+  });
+
+  it('disables confirm button and does not call onConfirm when isSubmitting is true', () => {
+    render(
+      <ConfirmMintDialog
+        record={mockRecord}
+        onConfirm={mockOnConfirm}
+        onCancel={mockOnCancel}
+        isSubmitting={true}
+      />
+    );
+    const confirmButton = screen.getByRole('button', { name: /Confirm & Mint/i });
+    expect(confirmButton).toBeDisabled();
+    fireEvent.click(confirmButton);
+    expect(mockOnConfirm).not.toHaveBeenCalled();
+  });
+
+  it('keeps confirm button enabled and calls onConfirm once when isSubmitting is false', () => {
+    render(
+      <ConfirmMintDialog
+        record={mockRecord}
+        onConfirm={mockOnConfirm}
+        onCancel={mockOnCancel}
+        isSubmitting={false}
+      />
+    );
+    const confirmButton = screen.getByRole('button', { name: /Confirm & Mint/i });
+    expect(confirmButton).not.toBeDisabled();
+    fireEvent.click(confirmButton);
+    expect(mockOnConfirm).toHaveBeenCalledTimes(1);
+  });
+
+  it('only triggers onConfirm once when confirm is clicked multiple times rapidly', () => {
+    render(
+      <ConfirmMintDialog
+        record={mockRecord}
+        onConfirm={mockOnConfirm}
+        onCancel={mockOnCancel}
+        isSubmitting={false}
+      />
+    );
+    const confirmButton = screen.getByRole('button', { name: /Confirm & Mint/i });
+    fireEvent.click(confirmButton);
+    fireEvent.click(confirmButton);
+    fireEvent.click(confirmButton);
+    expect(mockOnConfirm).toHaveBeenCalledTimes(1);
   });
 });

@@ -11,140 +11,30 @@ const { z } = require('zod');
  * - nested objects are depth-limited
  */
 
-// ---------------------------------------------------------------------------
-// Shared limit constants
-// ---------------------------------------------------------------------------
-
-const LIMITS = {
-  // String lengths
-  SHORT_STRING_MAX: 255,
-  MEDIUM_STRING_MAX: 1024,
-  LONG_STRING_MAX: 4096,
-  SECRET_MIN: 32,
-  SECRET_MAX: 4096,
-
-  // Arrays
-  ARRAY_MAX: 100,
-
-  // Pagination
-  PAGE_LIMIT_MIN: 1,
-  PAGE_LIMIT_MAX: 100,
-  PAGE_LIMIT_DEFAULT: 20,
-  PAGE_OFFSET_MIN: 0,
-  PAGE_OFFSET_MAX: 1000000,
-
-  // Nested object depth
-  MAX_DEPTH: 5,
-};
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
 /**
- * Bounded string schema.
- * @param {object} opts
- * @param {number} [opts.min]
- * @param {number} [opts.max]
- * @param {string} [opts.label]
+ * Stellar public key: 56-character StrKey starting with 'G' (ed25519 public key).
+ * Base32 alphabet (A-Z, 2-7).
  */
-function boundedString(opts = {}) {
-  const { min = 1, max = LIMITS.SHORT_STRING_MAX, label = 'value' } = opts;
-  return z.string()
-    .min(min, `${label} must be at least ${min} character(s)`)
-    .max(max, `${label} must not exceed ${max} characters`);
-}
+const stellarPublicKeySchema = z.string()
+  .regex(/^G[A-Z2-7]{55}$/, 'must be a valid Stellar public key')
+  .describe('Stellar public key (56-char StrKey starting with G)');
 
-/**
- * Bounded array schema.
- * @param {import('zod').ZodTypeAny} itemSchema
- * @param {object} opts
- * @param {number} [opts.max]
- * @param {string} [opts.label]
- */
-function boundedArray(itemSchema, opts = {}) {
-  const { max = LIMITS.ARRAY_MAX, label = 'items' } = opts;
-  return z.array(itemSchema)
-    .max(max, `${label} must not exceed ${max} entries`);
-}
+const addIssuerSchema = z.object({
+  address: z.string()
+    .min(1, 'address is required')
+    .describe('Stellar public key of issuer to authorize'),
+});
 
-/**
- * Pagination limit schema.
- */
-const paginationLimitSchema = z.coerce.number()
-  .int('limit must be an integer')
-  .min(LIMITS.PAGE_LIMIT_MIN, `limit must be at least ${LIMITS.PAGE_LIMIT_MIN}`)
-  .max(LIMITS.PAGE_LIMIT_MAX, `limit must not exceed ${LIMITS.PAGE_LIMIT_MAX}`)
-  .default(LIMITS.PAGE_LIMIT_DEFAULT);
+const createApiKeySchema = z.object({
+  label: z.string()
+    .min(1, 'label is required')
+    .max(255, 'label must not exceed 255 characters')
+    .describe('Human-readable label for the API key'),
+});
 
-/**
- * Pagination offset schema.
- */
-const paginationOffsetSchema = z.coerce.number()
-  .int('offset must be an integer')
-  .min(LIMITS.PAGE_OFFSET_MIN, `offset must be at least ${LIMITS.PAGE_OFFSET_MIN}`)
-  .max(LIMITS.PAGE_OFFSET_MAX, `offset must not exceed ${LIMITS.PAGE_OFFSET_MAX}`)
-  .default(LIMITS.PAGE_OFFSET_MIN);
-
-/**
- * Compute the depth of a value (objects/arrays only).
- * @param {*} value
- * @param {number} [current]
- * @returns {number}
- */
-function valueDepth(value, current = 0) {
-  if (value === null || typeof value !== 'object') {
-    return current;
-  }
-  let maxChild = current;
-  const children = Array.isArray(value) ? value : Object.values(value);
-  for (const child of children) {
-    const childDepth = valueDepth(child, current + 1);
-    if (childDepth > maxChild) {
-      maxChild = childDepth;
-    }
-  }
-  return maxChild;
-}
-
-/**
- * Refine a schema so nested objects do not exceed the max depth.
- * @param {import('zod').ZodTypeAny} schema
- * @param {number} [maxDepth]
- */
-function withDepthLimit(schema, maxDepth = LIMITS.MAX_DEPTH) {
-  return schema.refine(
-    (data) => valueDepth(data) <= maxDepth,
-    { message: `nested object depth must not exceed ${maxDepth}` }
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Write schemas
-// ---------------------------------------------------------------------------
-
-const addIssuerSchema = withDepthLimit(z.object({
-  address: boundedString({
-    min: 1,
-    max: LIMITS.SHORT_STRING_MAX,
-    label: 'address',
-  }).describe('Stellar public key of issuer to authorize'),
-}).strict());
-
-const createApiKeySchema = withDepthLimit(z.object({
-  label: boundedString({
-    min: 1,
-    max: LIMITS.SHORT_STRING_MAX,
-    label: 'label',
-  }).describe('Human-readable label for the API key'),
-}).strict());
-
-const rotateJwtSchema = withDepthLimit(z.object({
-  new_secret: boundedString({
-    min: LIMITS.SECRET_MIN,
-    max: LIMITS.SECRET_MAX,
-    label: 'new_secret',
-  })
+const rotateJwtSchema = z.object({
+  new_secret: z.string()
+    .min(32, 'new_secret must be at least 32 characters')
     .optional()
     .describe('New JWT signing secret (min 32 chars)'),
   new_kid: boundedString({
@@ -214,6 +104,59 @@ const apiKeysQuerySchema = withDepthLimit(z.object({
     .describe('Filter by active status'),
 }).strict());
 
+/**
+ * Propose an admin key rotation / recovery.
+ * Requires the new admin address, the approval threshold, and the
+ * activation delay (in seconds) before the rotation can be accepted.
+ */
+const proposeAdminRotationSchema = z.object({
+  new_admin: stellarPublicKeySchema
+    .describe('Stellar public key of the proposed new admin'),
+  threshold: z.number()
+    .int('threshold must be an integer')
+    .min(1, 'threshold must be at least 1')
+    .max(10, 'threshold must not exceed 10')
+    .describe('Number of approvals required to accept the rotation'),
+  delay_seconds: z.number()
+    .int('delay_seconds must be an integer')
+    .min(0, 'delay_seconds must be non-negative')
+    .max(30 * 24 * 60 * 60, 'delay_seconds must not exceed 30 days')
+    .describe('Activation delay in seconds before the rotation can be accepted'),
+  emergency: z.boolean()
+    .optional()
+    .default(false)
+    .describe('If true, marks the rotation as an emergency recovery request'),
+  reason: z.string()
+    .max(1024, 'reason must not exceed 1024 characters')
+    .optional()
+    .describe('Optional human-readable justification for the rotation'),
+});
+
+/**
+ * Accept an admin rotation proposal once its delay has elapsed and
+ * the threshold of approvals has been met.
+ */
+const acceptAdminRotationSchema = z.object({
+  proposal_id: z.string()
+    .min(1, 'proposal_id is required')
+    .uuid('proposal_id must be a valid UUID')
+    .describe('UUID of the admin rotation proposal to accept'),
+});
+
+/**
+ * Cancel a pending admin rotation proposal.
+ */
+const cancelAdminRotationSchema = z.object({
+  proposal_id: z.string()
+    .min(1, 'proposal_id is required')
+    .uuid('proposal_id must be a valid UUID')
+    .describe('UUID of the admin rotation proposal to cancel'),
+  reason: z.string()
+    .min(1, 'reason is required')
+    .max(1024, 'reason must not exceed 1024 characters')
+    .describe('Human-readable reason for cancelling the rotation'),
+});
+
 module.exports = {
   // limits & helpers (exported for reuse/testing)
   LIMITS,
@@ -228,8 +171,7 @@ module.exports = {
   createApiKeySchema,
   rotateJwtSchema,
   approveProposalSchema,
-
-  // query schemas
-  auditLogQuerySchema,
-  apiKeysQuerySchema,
+  proposeAdminRotationSchema,
+  acceptAdminRotationSchema,
+  cancelAdminRotationSchema,
 };

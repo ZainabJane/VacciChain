@@ -17,6 +17,38 @@ VacciChain uses HMAC-SHA256 JWTs. The signing key is managed by `backend/src/jwt
 | `JWT_KEY_ID` | Key identifier for the current secret | `"1"` |
 | `JWT_PREVIOUS_KEYS` | Comma-separated previous secrets (max 5) | empty |
 
+## Claims and validation (#47)
+
+Issued and accepted tokens share one policy (`signOptions()` / `verifyOptions()` in `backend/src/jwtKeys.js`):
+
+| Item | Value |
+| --- | --- |
+| Algorithm | `HS256` only; any other `alg`, including `none`, is rejected |
+| `iss` | `JWT_ISSUER`, else `HOME_DOMAIN`, else `localhost` |
+| `aud` | `JWT_AUDIENCE` (default `vaccichain-api`) |
+| `exp` | 1 hour after issue |
+| `sub`, `wallet` | The SEP-10-authenticated Stellar key; must be equal |
+| `role` | `admin` (`ADMIN_PUBLIC_KEY`), `issuer` (on the on-chain issuer allowlist at login), else `patient` |
+| Header `kid` | ID of the signing key |
+
+Roles and wallet identity come only from server-side sources (SEP-10 signature, configured admin key, on-chain allowlist), never from client-supplied values. Issuer access to other wallets' data is re-checked against the on-chain allowlist on each request, so revoking an issuer takes effect before their token expires.
+
+**Rollout:** tokens issued before this change have no `aud` claim and will be rejected. Users re-authenticate once, within at most 1 hour.
+
+### Overlap and retirement
+
+`POST /v1/admin/jwt/rotate` demotes the current key with a `retiredAt` timestamp. It keeps verifying for `JWT_ROTATION_OVERLAP_SECONDS` (default `3600`, the token lifetime) and is rejected after that cutoff, even though it is still in memory.
+
+Keys loaded from `JWT_PREVIOUS_KEYS` have no known rotation time, so they're accepted until you remove them from the variable and reload or restart.
+
+`rotate` rejects secrets shorter than 32 characters and `kid` values that are already in use.
+
+| Variable | Description | Default |
+|---|---|---|
+| `JWT_ISSUER` | Expected/issued `iss` | `HOME_DOMAIN` or `localhost` |
+| `JWT_AUDIENCE` | Expected/issued `aud` | `vaccichain-api` |
+| `JWT_ROTATION_OVERLAP_SECONDS` | How long a rotated-out key still verifies | `3600` |
+
 ## Rotation Procedure
 
 ### Option A — Runtime rotation via API (no restart)

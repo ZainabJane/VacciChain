@@ -1,0 +1,204 @@
+# Image and Artifact Cleanup Policy
+#
+# This workflow keeps container registries and workflow artifacts within
+# retention and cost limits while retaining release evidence.
+#
+# RETENTION WINDOWS
+#   - Container images (GHCR / ECR): versions older than 90 days are deleted.
+#   - Workflow artifacts: artifacts older than 30 days are pruned.
+#
+# PROTECTION RULES (cleanup can NEVER delete these)
+#   - Container images tagged `release-*` (signed production release artifacts).
+#   - The currently deployed image tag, read from the ECS service via
+#     `aws ecs describe-services` (the live production image).
+#   - Workflow artifacts whose name starts with `release-` (release evidence).
+#
+# Disposable build outputs (untagged / non-release image versions and
+# non-release artifacts) are the only things eligible for deletion.
+#
+# Schedule: weekly (Mondays 03:00 UTC). Also runnable manually via workflow_dispatch.
+
+name: Cleanup
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  actions: write
+
+env:
+  # Retention windows (in days).
+  IMAGE_RETENTION_DAYS: 90
+  ARTIFACT_RETENTION_DAYS: 30
+  # Registry / deployment configuration.
+  GHCR_OWNER: ${{ github.repository_owner }}
+  GHCR_PACKAGE: ${{ github.event.repository.name }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+
+jobs:
+  cleanup-images:
+    name: Cleanup container images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CLEANUP_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve currently deployed image tag
+        id: deployed
+        run: |
+          set -euo pipefail
+          # Read the image tag of the currently deployed task definition so we
+          # never delete the live production image.
+          TASK_DEF=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          IMAGE=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_DEF" \
+            --query 'taskDefinition.containerDefinitions[0].image' \
+            --output text)
+          # Extract the tag portion (after the last ':').
+          DEPLOYED_TAG="${IMAGE##*:}"
+          echo "Deployed image: $IMAGE"
+          echo "Deployed tag: $DEPLOYED_TAG"
+          echo "tag=$DEPLOYED_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Delete old ECR image versions (excluding protected tags)
+        env:
+          DEPLOYED_TAG: ${{ steps.deployed.outputs.tag }}
+        run: |
+          set -euo pipefail
+          CUTOFF=$(date -u -d "-${IMAGE_RETENTION_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Deleting ECR images pushed before $CUTOFF (excluding protected tags)"
+
+          REPOS=$(aws ecr describe-repositories --query 'repositories[].repositoryName' --output text)
+          for REPO in $REPOS; do
+            echo "::group::Repository $REPO"
+            # List image details; keep only those older than the cutoff.
+            aws ecr describe-images \
+              --repository-name "$REPO" \
+              --query "imageDetails[?imagePushedAt<='${CUTOFF}'].[imageDigest,imageTags]" \
+              --output json > /tmp/images.json
+
+            # Build the list of digests to delete, skipping protected tags.
+            jq -r --arg deployed "$DEPLOYED_TAG" '
+              .[]
+              | select(
+                  ((.[1] // []) | map(
+                      . == $deployed or startswith("release-")
+                    ) | any) | not
+                )
+              | .[0]
+            ' /tmp/images.json > /tmp/to_delete.txt
+
+            if [ -s /tmp/to_delete.txt ]; then
+              while read -r DIGEST; do
+                [ -z "$DIGEST" ] && continue
+                echo "Deleting $REPO@$DIGEST"
+                aws ecr batch-delete-image \
+                  --repository-name "$REPO" \
+                  --image-ids imageDigest="$DIGEST" || true
+              done < /tmp/to_delete.txt
+            else
+              echo "No disposable images to delete in $REPO"
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: Delete old GHCR package versions (excluding protected tags)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOYED_TAG: ${{ steps.deployed.outputs.tag }}
+        run: |
+          set -euo pipefail
+          CUTOFF=$(date -u -d "-${IMAGE_RETENTION_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Deleting GHCR versions created before $CUTOFF (excluding protected tags)"
+
+          # Fetch all versions of the container package (paginated).
+          PAGE=1
+          : > /tmp/ghcr_versions.json
+          while :; do
+            RESP=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/users/${GHCR_OWNER}/packages/container/${GHCR_PACKAGE}/versions?per_page=100&page=${PAGE}" 2>/dev/null || echo "[]")
+            COUNT=$(echo "$RESP" | jq 'length')
+            [ "$COUNT" -eq 0 ] && break
+            echo "$RESP" | jq -c '.[]' >> /tmp/ghcr_versions.json
+            [ "$COUNT" -lt 100 ] && break
+            PAGE=$((PAGE + 1))
+          done
+
+          # Select versions older than cutoff whose tags are not protected.
+          jq -r --arg cutoff "$CUTOFF" --arg deployed "$DEPLOYED_TAG" '
+            select(.created_at < $cutoff)
+            | select(
+                ((.metadata.container.tags // []) | map(
+                    . == $deployed or startswith("release-")
+                  ) | any) | not
+              )
+            | .id
+          ' /tmp/ghcr_versions.json > /tmp/ghcr_to_delete.txt
+
+          if [ -s /tmp/ghcr_to_delete.txt ]; then
+            while read -r ID; do
+              [ -z "$ID" ] && continue
+              echo "Deleting GHCR version $ID"
+              gh api -X DELETE \
+                "/users/${GHCR_OWNER}/packages/container/${GHCR_PACKAGE}/versions/${ID}" || true
+            done < /tmp/ghcr_to_delete.txt
+          else
+            echo "No disposable GHCR versions to delete"
+          fi
+
+  cleanup-artifacts:
+    name: Prune workflow artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete artifacts older than retention window (preserve release-*)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          CUTOFF=$(date -u -d "-${ARTIFACT_RETENTION_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Deleting artifacts created before $CUTOFF (preserving release-* artifacts)"
+
+          PAGE=1
+          : > /tmp/artifacts.json
+          while :; do
+            RESP=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100&page=${PAGE}")
+            COUNT=$(echo "$RESP" | jq '.artifacts | length')
+            [ "$COUNT" -eq 0 ] && break
+            echo "$RESP" | jq -c '.artifacts[]' >> /tmp/artifacts.json
+            [ "$COUNT" -lt 100 ] && break
+            PAGE=$((PAGE + 1))
+          done
+
+          # Select artifacts older than cutoff whose name does not start with release-.
+          jq -r --arg cutoff "$CUTOFF" '
+            select(.created_at < $cutoff)
+            | select(.name | startswith("release-") | not)
+            | .id
+          ' /tmp/artifacts.json > /tmp/artifacts_to_delete.txt
+
+          if [ -s /tmp/artifacts_to_delete.txt ]; then
+            while read -r ID; do
+              [ -z "$ID" ] && continue
+              echo "Deleting artifact $ID"
+              gh api -X DELETE \
+                "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ID}" || true
+            done < /tmp/artifacts_to_delete.txt
+          else
+            echo "No disposable artifacts to delete"
+          fi

@@ -44,7 +44,9 @@ const applySchema = z.object({
 });
 
 const reviewSchema = z.object({
-  decision: z.enum(['approved', 'rejected'])
+  decision: z.enum(['approved', 'rejected'], {
+    errorMap: () => ({ message: "decision must be either 'approved' or 'rejected'" }),
+  })
     .describe('Approval decision'),
   reviewer_note: boundedString({
     max: 500,
@@ -81,5 +83,4 @@ module.exports = {
   boundedString,
   applySchema,
   reviewSchema,
-  listApplicationsQuerySchema,
 };

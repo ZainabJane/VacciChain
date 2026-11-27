@@ -1,0 +1,144 @@
+name: Failure Injection (Non-Production)
+
+# Backlog #125: Align monitoring alerts with service-level objectives.
+# This workflow validates that SLO alerts (latency, error-rate, poller-lag,
+# data-freshness) actually fire under controlled failure injection in the
+# staging environment. It must NEVER run against production.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Failure scenario to inject"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - latency
+          - http-errors
+          - poller-stall
+      confirm_staging:
+        description: "Type 'staging' to confirm this targets the non-production environment"
+        required: true
+        type: string
+  schedule:
+    # Weekly smoke test of alerting on Monday 06:00 UTC
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: failure-injection-staging
+  cancel-in-progress: false
+
+env:
+  ENVIRONMENT: staging
+  ALERTMANAGER_URL: ${{ secrets.STAGING_ALERTMANAGER_URL }}
+  PROMETHEUS_URL: ${{ secrets.STAGING_PROMETHEUS_URL }}
+  TOXIPROXY_URL: ${{ secrets.STAGING_TOXIPROXY_URL }}
+  # Maximum time to wait for an alert to become active after injection
+  ALERT_WAIT_SECONDS: "300"
+  ALERT_POLL_INTERVAL_SECONDS: "15"
+
+jobs:
+  guard:
+    name: Guard (non-production only)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse to run against production
+        run: |
+          set -euo pipefail
+          if [ "${ENVIRONMENT}" = "production" ] || [ "${ENVIRONMENT}" = "prod" ]; then
+            echo "::error::Failure injection must not run against production."
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.confirm_staging }}" != "staging" ]; then
+            echo "::error::You must type 'staging' in confirm_staging to proceed."
+            exit 1
+          fi
+          echo "Target environment: ${ENVIRONMENT}"
+
+  inject-and-verify:
+    name: Inject failures and verify SLO alerts
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: staging
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.scenario != 'all' && format('["{0}"]', github.event.inputs.scenario) || '["latency","http-errors","poller-stall"]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Deploy to staging
+        run: |
+          set -euo pipefail
+          echo "Deploying current revision to ${ENVIRONMENT}..."
+          # Replace with the project's actual staging deploy command, e.g.:
+          # ./scripts/deploy.sh --env "${ENVIRONMENT}" --ref "${GITHUB_SHA}"
+          ./scripts/deploy.sh --env "${ENVIRONMENT}" --ref "${GITHUB_SHA}" || {
+            echo "::warning::deploy.sh not found or failed; assuming staging is already deployed."
+          }
+
+      - name: Wait for staging to be healthy
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 40); do
+            if curl -fsS "${PROMETHEUS_URL}/-/ready" >/dev/null 2>&1; then
+              echo "Prometheus is ready."
+              exit 0
+            fi
+            echo "Waiting for Prometheus... (${i}/40)"
+            sleep 15
+          done
+          echo "::error::Prometheus did not become ready in time."
+          exit 1
+
+      - name: Inject failure - ${{ matrix.scenario }}
+        id: inject
+        run: |
+          set -euo pipefail
+          python .github/scripts/failure_injection.py inject \
+            --scenario "${{ matrix.scenario }}" \
+            --toxiproxy-url "${TOXIPROXY_URL}" \
+            --environment "${ENVIRONMENT}"
+
+      - name: Verify SLO alert fires - ${{ matrix.scenario }}
+        run: |
+          set -euo pipefail
+          python .github/scripts/failure_injection.py verify \
+            --scenario "${{ matrix.scenario }}" \
+            --alertmanager-url "${ALERTMANAGER_URL}" \
+            --wait-seconds "${ALERT_WAIT_SECONDS}" \
+            --poll-interval "${ALERT_POLL_INTERVAL_SECONDS}"
+
+      - name: Cleanup failure injection - ${{ matrix.scenario }}
+        if: always()
+        run: |
+          set -euo pipefail
+          python .github/scripts/failure_injection.py cleanup \
+            --scenario "${{ matrix.scenario }}" \
+            --toxiproxy-url "${TOXIPROXY_URL}" \
+            --environment "${ENVIRONMENT}"
+
+      - name: Upload verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-injection-report-${{ matrix.scenario }}
+          path: failure-injection-report-*.json
+          if-no-files-found: ignore
+          retention-days: 14
