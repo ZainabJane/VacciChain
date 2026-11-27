@@ -58,14 +58,36 @@
   },
   "nftCard": {
     "date": "Date : {{date}}",
-    "issuer": "Émetteur : {{address}}"
+    "issuer": "Émetteur : {{address}}",
+    "dose_one": "{{count}} dose",
+    "dose_other": "{{count}} doses",
+    "doseLabel": "Dose : {{dose}}"
   },
   "badge": {
     "verified": "Vérifié : {{count}} dossier",
     "verified_other": "Vérifié : {{count}} dossiers",
     "notFound": "Aucun dossier trouvé",
     "revoked": "Certificat révoqué",
-    "verifying": "Vérification en cours..."
+    "verifying": "Vérification en cours...",
+    "status": {
+      "valid": "Valide",
+      "validDescription": "Ce dossier est valide et vérifié.",
+      "revoked": "Révoqué",
+      "revokedDescription": "Ce certificat a été révoqué et n'est plus valide.",
+      "notFound": "Introuvable",
+      "notFoundDescription": "Aucun dossier n'a été trouvé pour cette adresse.",
+      "verifying": "Vérification en cours",
+      "verifyingDescription": "Le statut de ce dossier est en cours de vérification.",
+      "unknown": "Inconnu",
+      "unknownDescription": "Le statut de ce dossier n'a pas pu être déterminé."
+    },
+    "ariaLabel": {
+      "valid": "Statut : Valide. Ce dossier est valide et vérifié.",
+      "revoked": "Statut : Révoqué. Ce certificat a été révoqué et n'est plus valide.",
+      "notFound": "Statut : Introuvable. Aucun dossier n'a été trouvé pour cette adresse.",
+      "verifying": "Statut : Vérification en cours. Le statut de ce dossier est en cours de vérification.",
+      "unknown": "Statut : Inconnu. Le statut de ce dossier n'a pas pu être déterminé."
+    }
   },
   "modal": {
     "title": "💉 Dossier de vaccination",
@@ -78,5 +100,13 @@
     "txHash": "Hash de transaction",
     "viewExplorer": "Voir sur Stellar Explorer ↗",
     "noTxHash": "Hash de transaction non disponible pour ce dossier."
+  },
+  "format": {
+    "date": "{{date, datetime}}",
+    "dateShort": "{{date, dateStyle: short}}",
+    "dateLong": "{{date, dateStyle: long}}",
+    "number": "{{value, number}}",
+    "invalidDate": "Date non disponible",
+    "missingDate": "Date non renseignée"
   }
 }

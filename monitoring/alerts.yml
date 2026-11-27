@@ -204,3 +204,57 @@ groups:
           description: >
             {{ $labels.service }} connection pool is above 85% of its maximum.
             Additional tasks may not obtain connections safely.
+
+  - name: vaccichain_backups
+    rules:
+      # Alert when an expected backup has not succeeded within its window
+      - alert: BackupMissing
+        expr: absent(backup_last_success_timestamp_seconds) or (time() - backup_last_success_timestamp_seconds) > 86400
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Expected backup missing: {{ $labels.job }}"
+          description: >
+            No successful backup has been recorded for job={{ $labels.job }}
+            (env={{ $labels.env }}) within the expected 24h window. The
+            recovery plan's retention may be at risk.
+
+      # Alert when the most recent backup exceeds the recovery point objective
+      - alert: BackupStale
+        expr: backup_age_seconds > 86400
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backup stale: {{ $labels.job }}"
+          description: >
+            The most recent backup for job={{ $labels.job }}
+            (env={{ $labels.env }}) is {{ $value | humanizeDuration }} old,
+            exceeding the recovery point objective (RPO) of 24h.
+
+      # Alert when a backup job reports failure
+      - alert: BackupFailed
+        expr: backup_success == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backup job failed: {{ $labels.job }}"
+          description: >
+            Backup job={{ $labels.job }} (env={{ $labels.env }}) reported
+            failure (backup_success == 0). Investigate the job logs and
+            re-run the backup.
+
+      # Alert when a backup archive fails integrity validation
+      - alert: BackupInvalid
+        expr: backup_integrity_ok == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backup archive invalid: {{ $labels.job }}"
+          description: >
+            Backup job={{ $labels.job }} (env={{ $labels.env }}) produced an
+            archive that failed integrity validation (backup_integrity_ok == 0).
+            The backup may be incomplete, unreadable, or improperly encrypted.

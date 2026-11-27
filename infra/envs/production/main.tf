@@ -109,6 +109,26 @@ module "ecs" {
   backend_cpu     = 1024
   backend_memory  = 2048
   desired_count   = 2
+
+  # Container health checks (Backlog 120)
+  backend_health_check_path     = "/health"
+  frontend_health_check_path    = "/health"
+  analytics_health_check_path   = "/health"
+  backend_health_check_grace_period   = 60
+  frontend_health_check_grace_period  = 30
+  analytics_health_check_grace_period = 60
+  health_check_interval         = 30
+  health_check_timeout          = 5
+  health_check_retries          = 3
+  health_check_start_period     = 15
+
+  # Target group health checks
+  target_group_health_check_path     = "/health"
+  target_group_health_check_interval = 30
+  target_group_health_check_timeout  = 5
+  target_group_healthy_threshold     = 2
+  target_group_unhealthy_threshold   = 3
+  target_group_deregistration_delay  = 30
 }
 
 output "alb_dns_name" { value = module.ecs.alb_dns_name }

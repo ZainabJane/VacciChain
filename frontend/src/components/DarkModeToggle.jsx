@@ -1,8 +1,10 @@
 export default function DarkModeToggle({ dark, onToggle }) {
+  const label = dark ? 'Switch to light mode' : 'Switch to dark mode';
   return (
     <button
       onClick={onToggle}
-      aria-label={dark ? 'Switch to light mode' : 'Switch to dark mode'}
+      aria-label={label}
+      title={label}
       style={{
         marginLeft: 'auto',
         padding: '0.4rem 0.75rem',
@@ -13,7 +15,8 @@ export default function DarkModeToggle({ dark, onToggle }) {
         fontSize: '1rem',
       }}
     >
-      {dark ? '☀️' : '🌙'}
+      <span aria-hidden="true">{dark ? '☀️' : '🌙'}</span>
+      <span style={{ marginLeft: '0.4rem' }}>{dark ? 'Light' : 'Dark'}</span>
     </button>
   );
 }

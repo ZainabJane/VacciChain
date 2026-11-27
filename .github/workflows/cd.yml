@@ -60,3 +60,11 @@ jobs:
 
       - name: Print contract ID
         run: echo "Deployed contract ID ${{ steps.deploy.outputs.contract_id }}"
+
+  restore-drill:
+    # Scheduled restore drills are defined in .github/workflows/restore-drill.yml
+    # (cron cadence documented there). This job is intentionally a no-op here.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore drill reference
+        run: echo "Restore drills run via .github/workflows/restore-drill.yml"

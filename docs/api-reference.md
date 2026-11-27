@@ -106,17 +106,49 @@ Errors:
 
 Public endpoint returning aggregated verification result.
 
-Response (200):
+The response always includes a `status` field that distinguishes the four possible data states. Clients MUST branch on `status` and MUST NOT treat `verified` alone as a medical determination.
+
+| `status` | Meaning | `verified` | Interpretation |
+|----------|---------|------------|----------------|
+| `valid` | All expected records are present and none are revoked. | `true` | Records exist and are currently valid. |
+| `revoked` | One or more records exist but have been revoked on-chain. | `false` | Do not treat as verified; revoked records are not valid. |
+| `absent` | The wallet has no vaccination records. | `false` | No determination can be made. |
+| `unavailable` | Records could not be retrieved (RPC/contract failure, timeout, or indexer error). | `false` | Unknown state — MUST NOT be interpreted as valid verification. |
+
+Response (200) — valid:
 ```json
 {
   "wallet": "G...",
+  "status": "valid",
   "verified": true,
   "records": [ { "vaccine":"COVID-19", "date":"2026-05-01", "issuer":"G..." } ]
 }
 ```
 
+Response (200) — revoked:
+```json
+{
+  "wallet": "G...",
+  "status": "revoked",
+  "verified": false,
+  "records": [ { "vaccine":"COVID-19", "date":"2026-05-01", "issuer":"G...", "revoked": true } ]
+}
+```
+
+Response (200) — absent:
+```json
+{ "wallet": "G...", "status": "absent", "verified": false, "records": [] }
+```
+
+Response (200) — unavailable:
+```json
+{ "wallet": "G...", "status": "unavailable", "verified": false, "records": [] }
+```
+
 Errors:
 - 400: malformed wallet address
+
+> **Rule:** An RPC or contract failure MUST NOT be collapsed into a positive verification result. When data cannot be retrieved, the endpoint returns `status: "unavailable"` with `verified: false`; it never returns `verified: true` for missing, revoked, or unavailable data. This endpoint reports record state only and is not a medical determination.
 
 ---
 
@@ -132,7 +164,9 @@ Response:
 
 ### POST /batch/verify
 Request: `{"wallets": ["G...", "G..."]}`
-Response: `{"results": [{"wallet":"G...","verified":true}]}`
+Response: `{"results": [{"wallet":"G...","status":"valid","verified":true}]}`
+
+Each result carries the same `status` enum as `GET /verify/:wallet` (`valid`, `revoked`, `absent`, `unavailable`). Entries with `status: "unavailable"` indicate a retrieval failure and MUST NOT be interpreted as valid verification.
 
 ---
 

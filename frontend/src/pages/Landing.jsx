@@ -1,8 +1,8 @@
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../hooks/useFreighter';
+import { pageContainer } from '../layout.js';
 
 const styles = {
-  page: { maxWidth: 700, margin: '4rem auto', padding: '0 1rem', textAlign: 'center' },
   title: { fontSize: '3rem', fontWeight: 700, color: 'var(--accent)', marginBottom: '1rem' },
   sub: { color: 'var(--text-muted)', fontSize: '1.1rem', marginBottom: '2rem' },
   btn: { padding: '0.75rem 2rem', background: 'var(--btn-primary)', color: '#fff', border: 'none', borderRadius: 8, fontSize: '1rem' },
@@ -14,7 +14,7 @@ export default function Landing() {
   const { publicKey, connect, disconnect } = useAuth();
 
   return (
-    <div style={styles.page}>
+    <div style={{ ...pageContainer, textAlign: 'center' }}>
       <h1 style={styles.title}>💉 VacciChain</h1>
       <p style={styles.sub}>{t('landing.subtitle')}</p>
       {publicKey ? (

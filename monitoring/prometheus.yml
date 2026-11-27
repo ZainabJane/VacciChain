@@ -98,3 +98,35 @@ scrape_configs:
         labels:
           env: local
           source: cadvisor
+
+  # ── Backup job metrics (backup_* emitted by backup.sh) ────────────────────
+  # backup.sh writes its metrics to the node_exporter textfile collector
+  # directory; node_exporter exposes them on /metrics.
+  - job_name: backup_metrics
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          env: local
+          component: backup
+    relabel_configs:
+      # Keep only backup_* series so this job stays focused on backup health.
+      - source_labels: [__name__]
+        regex: backup_.*
+        action: keep
+
+  # ── Backup job metrics pushed via Pushgateway (optional) ──────────────────
+  # Enable if backup.sh runs on hosts without node_exporter and pushes
+  # backup_* metrics to the Pushgateway instead.
+  - job_name: backup_pushgateway
+    honor_labels: true
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["pushgateway:9091"]
+        labels:
+          env: local
+          component: backup
+    relabel_configs:
+      - source_labels: [__name__]
+        regex: backup_.*
+        action: keep

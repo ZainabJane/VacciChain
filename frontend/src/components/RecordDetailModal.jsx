@@ -1,6 +1,7 @@
 import { useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import CopyButton from './CopyButton';
+import { formatDate } from '../i18n/formatters';
 
 const STELLAR_EXPERT_BASE = 'https://stellar.expert/explorer/testnet/tx';
 
@@ -29,7 +30,7 @@ function getFocusableElements(root) {
 }
 
 export default function RecordDetailModal({ record, onClose }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const overlayRef = useRef(null);
   const modalRef = useRef(null);
   const previousActive = useRef(null);
@@ -37,6 +38,7 @@ export default function RecordDetailModal({ record, onClose }) {
   if (!record) return null;
 
   const explorerUrl = record.tx_hash ? `${STELLAR_EXPERT_BASE}/${record.tx_hash}` : null;
+  const formattedDate = formatDate(record.date_administered, i18n.language, t('modal.invalidDate'));
 
   useEffect(() => {
     previousActive.current = document.activeElement;
@@ -97,37 +99,37 @@ export default function RecordDetailModal({ record, onClose }) {
         </h2>
 
         <div style={row}>
-          <p style={labelStyle}>Vaccine Name</p>
+          <p style={labelStyle}>{t('modal.vaccineName')}</p>
           <p style={valueStyle}>{record.vaccine_name}</p>
         </div>
 
         <div style={row}>
-          <p style={labelStyle}>Date Administered</p>
-          <p style={valueStyle}>{record.date_administered}</p>
+          <p style={labelStyle}>{t('modal.dateAdministered')}</p>
+          <p style={valueStyle}>{formattedDate}</p>
         </div>
 
         <div style={row}>
-          <p style={labelStyle}>Token ID</p>
+          <p style={labelStyle}>{t('modal.tokenId')}</p>
           <p style={valueStyle}>
             #{record.token_id}
-            <CopyButton text={String(record.token_id)} label="token ID" />
+            <CopyButton text={String(record.token_id)} label={t('modal.tokenId')} />
           </p>
         </div>
 
         <div style={row}>
-          <p style={labelStyle}>Issuer Address</p>
+          <p style={labelStyle}>{t('modal.issuerAddress')}</p>
           <p style={valueStyle}>
             {record.issuer}
-            <CopyButton text={record.issuer} label="issuer address" />
+            <CopyButton text={record.issuer} label={t('modal.issuerAddress')} />
           </p>
         </div>
 
         {record.tx_hash && (
           <div style={row}>
-            <p style={labelStyle}>Transaction Hash</p>
+            <p style={labelStyle}>{t('modal.txHash')}</p>
             <p style={valueStyle}>
               {record.tx_hash}
-              <CopyButton text={record.tx_hash} label="transaction hash" />
+              <CopyButton text={record.tx_hash} label={t('modal.txHash')} />
             </p>
           </div>
         )}

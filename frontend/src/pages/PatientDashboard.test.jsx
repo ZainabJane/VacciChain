@@ -6,8 +6,16 @@ jest.mock('../hooks/useVaccination', () => ({ useVaccination: jest.fn() }));
 jest.mock('../hooks/useConsent', () => ({ useConsent: jest.fn() }));
 jest.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key) => {
+    t: (key, options) => {
       if (key === 'patient.title') return 'My Vaccination Records';
+      if (key === 'patient.recordCount') {
+        const count = options?.count;
+        const locale = options?.locale;
+        if (locale === 'fr') {
+          return count === 1 ? '1 dossier' : `${count} dossiers`;
+        }
+        return count === 1 ? '1 record' : `${count} records`;
+      }
       return key;
     },
   }),
@@ -80,7 +88,7 @@ describe('PatientDashboard', () => {
       expect(screen.queryByText(/No vaccination records have been issued yet/i)).not.toBeInTheDocument();
     });
 
-    it('shows record count when records exist', () => {
+    it('shows plural record count when multiple records exist', () => {
       const records = [
         { token_id: '1', vaccine_name: 'COVID-19', date_administered: '2024-01-15', issuer: 'G123' },
         { token_id: '2', vaccine_name: 'Flu', date_administered: '2023-10-01', issuer: 'G456' },
@@ -88,6 +96,27 @@ describe('PatientDashboard', () => {
       useVaccination.mockReturnValue({ records, loading: false, error: null, refetch: jest.fn() });
       render(<PatientDashboard />);
       expect(screen.getByText(/2 records/i)).toBeInTheDocument();
+    });
+
+    it('shows singular record count when exactly one record exists', () => {
+      const records = [
+        { token_id: '1', vaccine_name: 'COVID-19', date_administered: '2024-01-15', issuer: 'G123' },
+      ];
+      useVaccination.mockReturnValue({ records, loading: false, error: null, refetch: jest.fn() });
+      render(<PatientDashboard />);
+      expect(screen.getByText(/^1 record$/i)).toBeInTheDocument();
+      expect(screen.queryByText(/1 records/i)).not.toBeInTheDocument();
+    });
+
+    it('uses the active locale for record count formatting', () => {
+      const records = [
+        { token_id: '1', vaccine_name: 'COVID-19', date_administered: '2024-01-15', issuer: 'G123' },
+        { token_id: '2', vaccine_name: 'Flu', date_administered: '2023-10-01', issuer: 'G456' },
+      ];
+      useVaccination.mockReturnValue({ records, loading: false, error: null, refetch: jest.fn() });
+      render(<PatientDashboard />);
+      const countText = screen.getByText(/records/i).textContent;
+      expect(countText).toMatch(/2 records/);
     });
 
     it('shows error message and retry button on error', () => {

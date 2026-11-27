@@ -65,12 +65,41 @@ The wallet address must be a valid Stellar public key: starts with `G`, 56 chara
 }
 ```
 
+### Verification states
+
+A verification result is **not** a simple boolean. The API distinguishes four states, and integrators must handle each one explicitly:
+
+| State | Meaning | `vaccinated` | `status` field |
+|-------|---------|--------------|----------------|
+| **valid** | Records exist and are active on-chain | `true` | `"valid"` |
+| **revoked** | Records exist but have been revoked by the issuer | `false` | `"revoked"` |
+| **absent** | No records exist for this wallet | `false` | `"absent"` |
+| **unavailable** | The contract or RPC could not be reached, so status is unknown | `null` | `"unavailable"` |
+
+Example of an `unavailable` result (returned with HTTP `503`):
+
+```json
+{
+  "wallet": "GABCDEF...",
+  "vaccinated": null,
+  "status": "unavailable",
+  "record_count": 0,
+  "records": [],
+  "error": "contract unavailable"
+}
+```
+
+> **Warning:** `unavailable` means the status is **unknown**, not negative. Never treat an `unavailable` result (or any RPC/network failure) as a positive verification, and never collapse it into `vaccinated: false` or `vaccinated: true`. Surface it to your user as "could not verify — retry later" and retry with backoff.
+
+> **Note:** A `revoked` result means the record was issued but is no longer valid. Do not treat revoked records as active vaccinations.
+
 ### JavaScript example
 
 ```js
 async function checkVaccination(walletAddress) {
   const res = await fetch(`https://api.vaccichain.io/verify/${walletAddress}`);
   if (!res.ok) {
+    // Includes 503 "unavailable" — do NOT interpret as a positive result.
     const { error } = await res.json();
     throw new Error(error);
   }
@@ -78,7 +107,13 @@ async function checkVaccination(walletAddress) {
 }
 
 const status = await checkVaccination('GABCDEF...');
-console.log(status.vaccinated); // true | false
+switch (status.status) {
+  case 'valid':       console.log('Verified'); break;
+  case 'revoked':     console.log('Record revoked'); break;
+  case 'absent':      console.log('No records'); break;
+  case 'unavailable': console.log('Could not verify — retry later'); break;
+  default:            console.log('Unknown status — treat as unverified');
+}
 ```
 
 ### Python example
@@ -88,11 +123,12 @@ import httpx
 
 def check_vaccination(wallet_address: str) -> dict:
     r = httpx.get(f"https://api.vaccichain.io/verify/{wallet_address}")
+    # 503 "unavailable" raises here — never treat it as a positive result.
     r.raise_for_status()
     return r.json()
 
 status = check_vaccination("GABCDEF...")
-print(status["vaccinated"])  # True | False
+print(status["status"])  # "valid" | "revoked" | "absent" | "unavailable"
 ```
 
 ---
@@ -223,6 +259,7 @@ All errors return JSON with an `error` string field.
 | `401` | `Client signature missing or invalid` | Transaction was not signed with the correct private key | Re-sign with the matching keypair |
 | `401` | `Invalid server signature` | Transaction was tampered with | Do not modify the XDR before signing |
 | `429` | `Too many requests` | Rate limit exceeded (10 req/min for `/auth/sep10`, 60 req/min for `/verify`) | Back off and retry after `retryAfter` seconds |
+| `503` | `contract unavailable` | Contract or RPC could not be reached; status is unknown | Retry with backoff; treat as unverified, never as valid |
 | `500` | `<message>` | Unexpected server or contract error | Log and retry; contact support if persistent |
 
 ### Handling rate limits
@@ -280,16 +317,21 @@ Content-Type: application/json
 
 ```json
 [
-  { "wallet": "GABCDEF...", "vaccinated": true },
-  { "wallet": "GHIJKLM...", "vaccinated": false }
+  { "wallet": "GABCDEF...", "vaccinated": true,  "status": "valid" },
+  { "wallet": "GHIJKLM...", "vaccinated": false, "status": "absent" },
+  { "wallet": "GNOPQRS...", "vaccinated": null,  "status": "unavailable" }
 ]
 ```
+
+Each entry carries the same four-state `status` as the single-wallet endpoint. Entries with `status: "unavailable"` must be retried and must not be counted as verified or unverified.
 
 ---
 
 ## 5. Security Notes
 
-- Vaccination records are **soulbound on-chain** — they cannot be transferred or forged at the contract level. A positive `vaccinated: true` response is cryptographically guaranteed.
+- Vaccination records are **soulbound on-chain** — they cannot be transferred or forged at the contract level. A `status: "valid"` response is cryptographically guaranteed.
+- **Results are not medical determinations.** VacciChain reports what is recorded on-chain. It does not assess immunity, medical fitness, or suitability for any purpose. Your organization is responsible for how a result is interpreted and used.
+- **Never collapse a failure into a positive result.** An RPC error, timeout, `503`, or `status: "unavailable"` means the status is unknown. Treat it as unverified and retry; do not display it as valid.
 - Always verify the wallet address belongs to the person presenting it through your own identity verification process. VacciChain confirms the record exists on-chain; it does not confirm identity.
 - JWTs are scoped by role (`patient` or `issuer`) and expire after 1 hour.
 - SEP-10 nonces are single-use. A replayed challenge will be rejected with `401`.

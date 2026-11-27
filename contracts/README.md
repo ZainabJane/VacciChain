@@ -252,6 +252,81 @@ pub enum DataKey {
 3. **Patients → Records**: Each patient has a list of their token IDs
 4. **Records → Revocation**: Each record can be revoked by original issuer or admin
 
+## ADR: Storage Sizing, Rent, and Archival Strategy
+
+**Status:** Approved
+**Context:** Backlog items #78 (storage growth/archival), #90 (missing/expired storage), #92 (schema migrations).
+
+This ADR quantifies persistent storage cost for long-lived vaccination histories and issuer
+records, and defines the approved retention/compaction/indexing approach. It must not violate
+audit requirements: **records are never deleted, only revoked.**
+
+### Per-Entry Size Estimates
+
+Soroban charges rent per ledger entry based on serialized size plus a fixed per-entry overhead.
+The estimates below are approximate serialized sizes (bytes) for the dominant fields; treat them
+as upper bounds for planning.
+
+| Entry | Contents | Est. size (bytes) |
+|-------|----------|-------------------|
+| `Token(u64)` → `VaccinationRecord` | token_id (8) + patient Address (~32) + vaccine_name (≤100) + date_administered (≤100) + issuer Address (~32) + timestamp (8) + schema_version (4) + revoked (1) + struct/key overhead (~64) | **~350** |
+| `Revoked(u64)` | key (8) + bool (1) + overhead (~32) | **~40** |
+| `Issuer(BytesN<32>)` → `IssuerRecord` | name (≤100) + license (≤100) + country (≤100) + authorized (1) + overhead (~64) | **~370** |
+| `PatientTokens(BytesN<32>)` → `Vec<u64>` | 32-byte hash key + 8 bytes per token id + vec overhead (~32) | **~40 + 8·N** |
+| `Admin` / `Initialized` / `PendingAdmin` / `AdminTransferExpiry` / `NextTokenId` | scalar entries | **~40 each (~200 total)** |
+
+Note: `PatientTokens` grows linearly with the number of records per patient, so a patient with
+`N` records costs roughly `350·N` (records) + `40·N` (revocation flags) + `8·N` (index) bytes.
+
+### Projected Storage at Expected Volumes
+
+Assumptions: average 3 vaccination records per patient, 1 issuer per ~5,000 patients.
+
+| Scenario | Patients | Records | Issuers | Est. total bytes | Est. total (MiB) |
+|----------|----------|---------|---------|------------------|------------------|
+| Pilot | 10,000 | 30,000 | 5 | ~12.0 MB | ~11.5 |
+| Regional | 1,000,000 | 3,000,000 | 200 | ~1.20 GB | ~1,145 |
+| National | 50,000,000 | 150,000,000 | 10,000 | ~60 GB | ~57,220 |
+
+Issuer records are negligible relative to vaccination records; growth is dominated by
+`Token` entries and their per-patient index entries.
+
+### Soroban Rent Implications
+
+- Every persistent entry accrues rent proportional to its size and the length of time it stays
+  live. Long-lived vaccination histories therefore have an ongoing, non-trivial rent cost.
+- Entries whose TTL is not extended will **expire** (be archived) and become unavailable to the
+  contract until restored. Reads of expired entries return "missing" and must be handled
+  explicitly (see #90).
+- The contract extends TTLs on write paths (mint, revoke, issuer add/revoke) so that active
+  records remain live. Extension thresholds and bump amounts are documented in
+  [`docs/resource-limits.md`](../docs/resource-limits.md).
+- Rent and resource consumption per operation are measured in [`GAS_REPORT.md`](../GAS_REPORT.md).
+  Any change to storage layout must be re-measured there.
+
+### Approved Retention / Compaction / Indexing Approach
+
+1. **Never delete records.** Revocation sets `revoked = true` and the `Revoked(id)` flag; the
+   `VaccinationRecord` and its `PatientTokens` entry are retained permanently for audit. There is
+   no delete path in the contract.
+2. **TTL extension, not compaction.** Active entries have their TTL extended on write. Expired
+   entries are restored (via Soroban archival restore) rather than recreated, preserving the
+   original data and audit trail.
+3. **Off-chain indexing.** Query-heavy workloads (history lookups, reporting, analytics) are
+   served by an off-chain indexer that consumes contract events and mirrors state. The contract
+   remains the source of truth; the indexer is a read-optimized cache and is never authoritative.
+4. **Bounded inputs.** All string fields are length-validated (≤100 chars) to keep per-entry size
+   and rent bounded.
+5. **Schema versioning.** `VaccinationRecord.schema_version` allows forward-compatible reads.
+   Schema changes require fixture-based migration tests against prior state, and unsupported
+   upgrade paths must fail safely with a documented recovery plan (see #92).
+
+### Storage Lifecycle & Missing/Expired Entries
+
+- Missing or expired entries must be treated as "not found", never as "authorized". Authorization
+  checks (`is_issuer`, admin checks) must fail closed when the relevant entry is absent.
+- Tests cover expired/missing entries and assert that authorization cannot fail open (see #90).
+
 ## Error Codes
 
 Error codes are stable integers. Do not reorder or reuse codes; append new variants with a new code.
@@ -327,6 +402,8 @@ The contract includes comprehensive tests covering:
 - Batch verification
 - Soulbound transfer prevention
 - Edge cases and error conditions
+- Storage lifecycle: missing/expired entries and fail-closed authorization (#90)
+- Schema migration fixtures against prior on-chain state (#92)
 
 ## Deployment Guide
 

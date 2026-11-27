@@ -355,6 +355,48 @@ curl -X POST https://staging.vaccichain.example.com/auth/sep10 \
   -d '{"account": "GAAAA..."}'
 ```
 
+### Release Smoke Tests
+
+Every staging deployment runs a release-level smoke-test suite against the live
+staging environment. These tests exercise real deployed routing, health, auth,
+and verification behavior — they are not mocks.
+
+The suite covers:
+
+| Check | What it verifies |
+|---|---|
+| **Frontend route load** | The frontend root and key SPA routes return `200` and serve the app shell (no blank page or 5xx from nginx). |
+| **API health** | `GET /health` on the backend returns `200` with a healthy status payload. |
+| **Analytics reachability** | The analytics endpoint is reachable and responds successfully from the deployed environment. |
+| **Public verification** | A safe, read-only public verification case: `GET /verify/{wallet}` for a known staging wallet returns `200` with the expected response shape. No writes, mints, or revocations are performed. |
+
+#### Run the smoke tests manually
+
+```bash
+# From project root — runs the full smoke suite against staging
+npm run test:smoke:staging
+
+# Override the target base URL if needed
+STAGING_BASE_URL=https://staging.vaccichain.example.com npm run test:smoke:staging
+```
+
+The suite exits non-zero if any check fails, so it can be wired into any CI job
+or run locally before promoting a release.
+
+#### Promotion gate
+
+Staging smoke tests are a **required gate for production promotion**:
+
+- The `deploy-staging.yml` workflow runs the smoke suite after deploying to staging.
+- The production deployment (`deploy.yml`) is **blocked** when the latest staging
+  smoke run has failed or has not completed successfully for the release being promoted.
+- If smoke tests fail, the deployment stops and the failure is reported in the
+  GitHub Actions summary. Fix the issue, redeploy to staging, and re-run the
+  smoke suite before attempting promotion again.
+
+Do not bypass the gate by triggering production deployment manually unless the
+failure has been investigated and explicitly waived by a maintainer.
+
 ## Monitoring Staging
 
 ### CloudWatch Logs
@@ -445,11 +487,13 @@ aws logs tail /ecs/vaccichain-staging --follow --since 10m
 
 When staging is verified and ready:
 
-1. Update `CHANGELOG.md` with release notes for the new version.
-2. Create a release tag: `git tag v1.0.0`
-3. Push tag: `git push origin v1.0.0`
-4. Trigger production deployment: `gh workflow run deploy.yml -f network=mainnet`
-5. Monitor production deployment
+1. Confirm the staging smoke tests pass (`npm run test:smoke:staging`). Production
+   promotion is blocked if the staging smoke suite has not passed for this release.
+2. Update `CHANGELOG.md` with release notes for the new version.
+3. Create a release tag: `git tag v1.0.0`
+4. Push tag: `git push origin v1.0.0`
+5. Trigger production deployment: `gh workflow run deploy.yml -f network=mainnet`
+6. Monitor production deployment
 
 ## Cost Optimization
 

@@ -26,9 +26,19 @@ function WalletIndicator() {
   // Close on outside click
   useEffect(() => {
     if (!open) return;
-    const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    const handler = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  // Close wallet dropdown on Escape
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
   }, [open]);
 
   if (!publicKey) {
@@ -141,6 +151,49 @@ function WalletIndicator() {
   );
 }
 
+/**
+ * Trap Tab/Shift+Tab focus within `containerRef` while `active` is true.
+ */
+function useFocusTrap(containerRef, active) {
+  useEffect(() => {
+    if (!active) return;
+
+    const container = containerRef.current;
+    if (!container) return;
+
+    const focusable = () =>
+      Array.from(
+        container.querySelectorAll(
+          'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((el) => !el.closest('[hidden]'));
+
+    const handleKeyDown = (e) => {
+      if (e.key !== 'Tab') return;
+      const items = focusable();
+      if (items.length === 0) return;
+
+      const first = items[0];
+      const last = items[items.length - 1];
+
+      if (e.shiftKey) {
+        if (document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else {
+        if (document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [active, containerRef]);
+}
+
 export default function NavBar({ dark, onToggleDark }) {
   const { pathname } = useLocation();
   const [open, setOpen] = useState(false);
@@ -158,34 +211,48 @@ export default function NavBar({ dark, onToggleDark }) {
     return () => document.removeEventListener('keydown', onKey);
   }, [open, close]);
 
-  // When menu opens on small screens, move focus into the menu; restore when closed
+  // When menu opens, move focus to first item; when it closes, restore to hamburger.
   useEffect(() => {
     if (open) {
-      // focus first link inside nav-links
-      const firstLink = linksRef.current?.querySelector('a, button');
-      firstLink?.focus?.();
+      const firstFocusable = linksRef.current?.querySelector('a, button');
+      firstFocusable?.focus();
     } else {
-      // restore focus to hamburger button when closing
-      hamburgerRef.current?.focus?.();
+      // Only restore focus when hamburger is visible (narrow screens)
+      hamburgerRef.current?.focus();
     }
   }, [open]);
 
   // Close when route changes
   useEffect(() => { close(); }, [pathname, close]);
 
+  // Trap focus inside the mobile menu while it is open
+  useFocusTrap(linksRef, open);
+
   return (
-    <nav aria-label="Main navigation" style={{ padding: '1rem 2rem', background: 'var(--nav-bg)', display: 'flex', flexWrap: 'wrap', gap: '1.5rem', alignItems: 'center', position: 'relative' }}>
+    <nav
+      aria-label="Main navigation"
+      style={{
+        padding: '1rem 2rem',
+        background: 'var(--nav-bg)',
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: '1.5rem',
+        alignItems: 'center',
+        position: 'relative',
+      }}
+    >
       <strong style={{ color: 'var(--accent)', fontSize: '1.2rem', flex: 1 }}>💉 VacciChain</strong>
 
-      {/* Hamburger button — visible only below 640px */}
+      {/* Hamburger — visible only on narrow screens via CSS */}
       <button
+        ref={hamburgerRef}
+        className="nav-hamburger"
         aria-label={open ? 'Close menu' : 'Open menu'}
         aria-expanded={open}
         aria-controls="nav-links"
         onClick={() => setOpen((v) => !v)}
-        ref={hamburgerRef}
         style={{
-          display: 'none',
+          display: 'none',          /* overridden by .nav-hamburger media query */
           background: 'none',
           border: 'none',
           color: '#e2e8f0',
@@ -193,17 +260,22 @@ export default function NavBar({ dark, onToggleDark }) {
           lineHeight: 1,
           padding: '0.25rem',
         }}
-        className="nav-hamburger"
       >
-        {open ? '✕' : '☰'}
+        {/* Unicode chars have poor SR support — wrap in aria-hidden and use
+            the button's aria-label as the accessible name. */}
+        <span aria-hidden="true">{open ? '✕' : '☰'}</span>
       </button>
 
-      {/* Nav links */}
+      {/* Nav link list
+          On narrow screens: hidden when closed, shown as column when open.
+          aria-hidden removes collapsed menu items from the accessibility tree
+          so keyboard users cannot accidentally Tab into them while hidden. */}
       <div
         id="nav-links"
-        className="nav-links"
-        style={{ display: 'flex', gap: '1.5rem', alignItems: 'center', flexWrap: 'wrap' }}
         ref={linksRef}
+        className={`nav-links${open ? ' nav-links--open' : ''}`}
+        aria-hidden={!open ? true : undefined}
+        style={{ display: 'flex', gap: '1.5rem', alignItems: 'center', flexWrap: 'wrap' }}
       >
         {NAV_LINKS.map(({ to, label }) => (
           <Link
@@ -211,6 +283,8 @@ export default function NavBar({ dark, onToggleDark }) {
             to={to}
             aria-current={pathname === to ? 'page' : undefined}
             onClick={close}
+            /* Prevent keyboard access to hidden mobile menu items */
+            tabIndex={undefined}
           >
             {label}
           </Link>
@@ -218,20 +292,6 @@ export default function NavBar({ dark, onToggleDark }) {
         <DarkModeToggle dark={dark} onToggle={onToggleDark} />
         <WalletIndicator />
       </div>
-
-      <style>{`
-        @media (max-width: 639px) {
-          .nav-hamburger { display: block !important; }
-          .nav-links {
-            display: ${open ? 'flex' : 'none'} !important;
-            flex-direction: column;
-            align-items: flex-start;
-            width: 100%;
-            padding: 0.5rem 0;
-            gap: 0.75rem;
-          }
-        }
-      `}</style>
     </nav>
   );
 }
