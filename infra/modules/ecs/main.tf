@@ -51,6 +51,78 @@ variable "backend_canary_weight" {
   }
 }
 
+# ── Autoscaling configuration ─────────────────────────────────────────────────
+# Per-service scaling is defined via `var.autoscaling` so metrics, min/max
+# counts, cooldowns and cost caps are explicit and reviewable per service.
+#
+# NOTE (#117): the backend writes to a single EFS-backed SQLite database. SQLite
+# does not support safe multi-writer access over EFS, so the backend is
+# constrained to a single writer task (max_capacity = 1). Scaling the backend
+# horizontally requires migrating to a concurrent-safe datastore first. The
+# frontend and analytics services are stateless and may scale freely.
+variable "autoscaling" {
+  description = "Per-service autoscaling configuration (metrics, min/max, cooldowns, cost caps)."
+  type = map(object({
+    min_capacity       = number
+    max_capacity       = number
+    scale_out_cooldown = number
+    scale_in_cooldown  = number
+    # Cost cap: maximum number of tasks allowed by budget for this service.
+    cost_cap_max_tasks = number
+    # CPU target tracking (percent utilisation).
+    cpu_target_value = number
+    # Optional memory target tracking (percent utilisation).
+    memory_target_value = optional(number)
+    # Optional queue-depth (custom metric) target tracking.
+    queue_metric_name  = optional(string)
+    queue_metric_ns    = optional(string, "Vaccichain/Queues")
+    queue_target_value = optional(number)
+  }))
+  default = {
+    backend = {
+      min_capacity        = 1
+      max_capacity        = 1 # single-writer constraint (#117)
+      scale_out_cooldown  = 300
+      scale_in_cooldown   = 300
+      cost_cap_max_tasks  = 1
+      cpu_target_value    = 70
+      memory_target_value = 80
+    }
+    frontend = {
+      min_capacity        = 1
+      max_capacity        = 6
+      scale_out_cooldown  = 60
+      scale_in_cooldown   = 300
+      cost_cap_max_tasks  = 6
+      cpu_target_value    = 65
+      memory_target_value = 75
+    }
+    analytics = {
+      min_capacity        = 1
+      max_capacity        = 4
+      scale_out_cooldown  = 120
+      scale_in_cooldown   = 300
+      cost_cap_max_tasks  = 4
+      cpu_target_value    = 70
+      queue_metric_name   = "AnalyticsQueueDepth"
+      queue_target_value  = 50
+    }
+  }
+}
+
+variable "alarm_actions" {
+  description = "ARNs (e.g. SNS topics) notified when capacity alarms fire."
+  type        = list(string)
+  default     = []
+}
+
+locals {
+  # Effective max capacity is the lower of the scaling max and the cost cap.
+  backend_max   = min(var.autoscaling["backend"].max_capacity, var.autoscaling["backend"].cost_cap_max_tasks)
+  frontend_max  = min(var.autoscaling["frontend"].max_capacity, var.autoscaling["frontend"].cost_cap_max_tasks)
+  analytics_max = min(var.autoscaling["analytics"].max_capacity, var.autoscaling["analytics"].cost_cap_max_tasks)
+}
+
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 

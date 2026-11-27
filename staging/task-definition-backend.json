@@ -4,6 +4,11 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "1024",
   "memory": "2048",
+  "desiredCount": 1,
+  "deploymentConfiguration": {
+    "maximumPercent": 100,
+    "minimumHealthyPercent": 0
+  },
   "containerDefinitions": [
     {
       "name": "frontend",
@@ -212,6 +217,16 @@
           "awslogs-region": "REGION",
           "awslogs-stream-prefix": "python-service"
         }
+      }
+    }
+  ],
+  "volumes": [
+    {
+      "name": "efs-vaccichain-staging",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "EFS_FILESYSTEM_ID",
+        "transitEncryption": "ENABLED",
+        "rootDirectory": "/vaccichain/staging"
       }
     }
   ],

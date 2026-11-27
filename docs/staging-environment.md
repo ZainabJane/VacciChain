@@ -232,6 +232,66 @@ scoped secrets and variables; it does **not** inherit any production secrets.
 - Merges to `main` are gated by the `ci-required` aggregate status check, which
   passes only when all required CI jobs succeed.
 
+## Terraform Backend Configuration
+
+Staging uses its **own isolated Terraform state**. It never reads or writes the
+production state bucket, and no account IDs, regions, bucket names, or
+environment-specific values are hardcoded in the Terraform source. All of these
+are supplied explicitly per environment.
+
+### Required Inputs
+
+| Variable | Purpose | Example (staging) |
+|---|---|---|
+| `aws_account_id` | Target AWS account for staging | `111122223333` |
+| `aws_region` | Region for all staging resources | `us-east-1` |
+| `environment` | Environment name used in resource naming/tags | `staging` |
+| `state_bucket` | S3 bucket holding **staging** state only | `vaccichain-tfstate-staging` |
+| `state_key` | Key prefix within the staging bucket | `staging/terraform.tfstate` |
+| `lock_table` | DynamoDB table for state locking | `vaccichain-tflock-staging` |
+
+These values are provided via a per-environment backend config file
+(`backend/staging.hcl`) and a per-environment variable file
+(`env/staging.tfvars`). Neither file contains credentials.
+
+### Bootstrap Prerequisites
+
+Before the first staging plan, the following must exist in the staging account:
+
+1. **S3 state bucket** — versioned, server-side encrypted, public access blocked.
+2. **DynamoDB lock table** — partition key `LockID` (string).
+3. **IAM role for Terraform** — scoped to the staging account only, with access
+   to the staging state bucket and lock table (and nothing in production).
+4. **Secrets** — `vaccichain/staging/*` entries in Secrets Manager (see below).
+
+Bootstrap is performed once per environment by an operator with staging-account
+access. State credentials are never committed; Terraform authenticates via the
+standard AWS credential chain (SSO, assumed role, or CI OIDC role).
+
+### Initializing and Validating
+
+```bash
+# Initialize against the staging backend only
+terraform init -backend-config=backend/staging.hcl
+
+# Validate configuration and variables for staging
+terraform validate
+terraform plan -var-file=env/staging.tfvars -out=staging.tfplan
+```
+
+A clean staging plan must succeed without any reference to production state. If
+`terraform init` reports a backend mismatch, confirm `backend/staging.hcl` points
+at the staging bucket and not the production bucket.
+
+### Deployment Process Changes
+
+- CI passes `-backend-config=backend/staging.hcl` and
+  `-var-file=env/staging.tfvars` to every `init`/`plan`/`apply` invocation.
+- The deploy workflow assumes the staging-scoped IAM role via OIDC; no static
+  AWS keys are stored in GitHub.
+- Plans are validated per environment before apply; a staging plan that resolves
+  against production state fails the workflow.
+
 ## Architecture
 
 ```
@@ -498,7 +558,10 @@ Alerts are validated with the controlled failure injection described in [Failure
 
 ## Secrets Management in Staging
 
-Staging uses the same AWS Secrets Manager setup as production:
+Staging uses the same AWS Secrets Manager setup as production, but with its own
+`vaccichain/staging/*` secrets. State credentials are never stored in Terraform
+files or committed to the repository; Terraform uses the ambient AWS credential
+chain scoped to the staging account.
 
 ```bash
 # View staging secrets

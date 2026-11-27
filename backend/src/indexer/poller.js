@@ -15,6 +15,19 @@ const config = require('../config');
 const SOROBAN_RPC_URL = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
 const CONTRACT_ID = process.env.VACCINATIONS_CONTRACT_ID;
 
+// Single-writer constraint: only the task holding the poller lock may poll and
+// write to the EFS-backed SQLite database. Other tasks stay idle (standby) and
+// periodically attempt to acquire the lock so they can take over if the leader
+// is replaced or dies.
+const POLLER_ID =
+  process.env.POLLER_ID ||
+  `${process.env.HOSTNAME || 'local'}-${process.pid}`;
+const LOCK_TTL_MS = Number(process.env.POLLER_LOCK_TTL_MS) || 30_000;
+// Refresh the lock well before it expires to avoid losing leadership spuriously.
+const LOCK_REFRESH_MS = Math.max(1_000, Math.floor(LOCK_TTL_MS / 3));
+// How often a standby task retries acquiring the lock.
+const LEADER_RETRY_MS = Number(process.env.POLLER_LEADER_RETRY_MS) || 5_000;
+
 // Bounded exponential backoff for transient RPC failures.
 const RPC_MAX_RETRIES = Number.isFinite(config.SOROBAN_RPC_MAX_RETRIES)
   ? config.SOROBAN_RPC_MAX_RETRIES
@@ -213,13 +226,11 @@ function parseEvent(raw) {
   }
 }
 
-async function runPoll() {
-  if (!CONTRACT_ID) {
-    if (process.env.NODE_ENV !== 'test') {
-      console.warn('[indexer] VACCINATIONS_CONTRACT_ID not set — skipping poll');
-    }
-    return;
+function logInfo(...args) {
+  if (process.env.NODE_ENV !== 'test') {
+    console.log(...args);
   }
+}
 
   // Refuse to process new events if the database failed its integrity check.
   // Never silently initialize an empty replacement database over a corrupt one.
@@ -236,7 +247,11 @@ async function runPoll() {
   const rpc = getRpc();
   const startLedger = getCheckpoint() + 1;
 
-  let response;
+/**
+ * Attempt to become the single polling writer.
+ * Returns true if this task holds (or just acquired) the lock.
+ */
+function tryAcquireLeadership() {
   try {
     // Read-only call: safe to retry. The shared client applies bounded
     // timeouts and a retry policy, and classifies exhausted failures.
@@ -255,8 +270,16 @@ async function runPoll() {
         err.message,
       );
     }
-    return;
+  }, LOCK_REFRESH_MS);
+  if (lockRefreshTimer.unref) lockRefreshTimer.unref();
+}
+
+function stopLockRefresh() {
+  if (lockRefreshTimer) {
+    clearInterval(lockRefreshTimer);
+    lockRefreshTimer = null;
   }
+}
 
   running = true;
   const runStart = Date.now();
@@ -284,8 +307,32 @@ async function runPoll() {
 
     setGauge('indexer_latest_indexed_ledger', getLatestLedger());
 
-    if (process.env.NODE_ENV !== 'test') {
-      console.log(`[indexer] Stored ${valid.length} new event(s) from ledger ${startLedger}`);
+    const rawEvents = response.events ?? [];
+
+    // Validate and quarantine malformed payloads. Malformed events are dropped
+    // from persistence but the checkpoint is NOT advanced past them, so they are
+    // re-examined on the next poll rather than silently skipped.
+    const valid = [];
+    const seenIds = new Set();
+    let malformed = 0;
+    let maxLedger = startLedger - 1;
+
+    for (const raw of rawEvents) {
+      if (Number.isFinite(raw?.ledger) && raw.ledger > maxLedger) {
+        maxLedger = raw.ledger;
+      }
+      const parsed = parseEvent(raw);
+      if (!parsed || !parsed.id) {
+        malformed++;
+        continue;
+      }
+      if (seenIds.has(parsed.id)) continue; // dedupe duplicate delivery
+      seenIds.add(parsed.id);
+      valid.push(parsed);
+    }
+
+    if (malformed > 0 && process.env.NODE_ENV !== 'test') {
+      console.warn(`[indexer] Quarantined ${malformed} malformed event(s) at ledger ${startLedger}`);
     }
 
     jobStatus.lastEventCount = valid.length;
@@ -366,9 +413,6 @@ async function runPoll() {
  * Concurrent calls are coalesced onto the same in-flight promise.
  */
 function poll() {
-  if (stopped && timer === null && inFlight === null) {
-    // Allow explicit one-off polls (e.g. tests) even when the loop is stopped.
-  }
   if (inFlight) return inFlight;
   inFlight = runPoll().finally(() => {
     inFlight = null;
@@ -382,16 +426,23 @@ function poll() {
  */
 function startPoller(intervalMs) {
   if (timer) return;
+  stopping = false;
   stopped = false;
   logMigrationState();
   loadCheckpoint();
-  poll(); // immediate first run
-  timer = setInterval(() => {
-    if (!stopped) poll();
-  }, intervalMs);
-  if (process.env.NODE_ENV !== 'test') {
-    console.log(`[indexer] Polling every ${intervalMs}ms from ledger ${getCheckpoint()}`);
+
+  // Attempt to become the leader; if another task holds the lock we run as a
+  // standby and retry periodically until leadership is available.
+  if (!tryAcquireLeadership()) {
+    logInfo(
+      `[indexer] Not the leader (id=${POLLER_ID}); running in standby, retrying every ${LEADER_RETRY_MS}ms`
+    );
+    startLeaderRetry();
   }
+
+  poll(); // immediate first run (no-op unless leader)
+  timer = setInterval(poll, intervalMs);
+  logInfo(`[indexer] Polling every ${intervalMs}ms from ledger ${getCheckpoint()}`);
 }
 
 /**
@@ -399,11 +450,13 @@ function startPoller(intervalMs) {
  * Prevents new polls from starting.
  */
 async function stopPoller() {
+  stopping = true;
   stopped = true;
   if (timer) {
     clearInterval(timer);
     timer = null;
   }
+  releaseLeadership();
   if (inFlight) {
     try {
       await inFlight;

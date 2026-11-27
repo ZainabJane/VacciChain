@@ -79,6 +79,13 @@ services:
         max-file: "3"
     restart: unless-stopped
 
+  # SINGLE-WRITER CONSTRAINT (Backlog #117):
+  # SQLite on the shared `vaccichain_db` volume supports only ONE writer.
+  # Do NOT scale this service (`docker compose up --scale backend=N` is
+  # unsupported) and do NOT add a second backend replica sharing the volume —
+  # concurrent writers can corrupt the database or split the event index.
+  # Production (ECS/EFS) must likewise pin the backend to a single task
+  # (desiredCount=1, no autoscaling) or move to a DB with multi-writer support.
   backend:
     build: ./backend
     # No host port — only reachable via nginx on the internal network
@@ -123,14 +130,6 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    deploy:
-      resources:
-        limits:
-          cpus: "0.75"
-          memory: 256M
-        reservations:
-          cpus: "0.10"
-          memory: 128M
     logging:
       driver: json-file
       options:
@@ -177,6 +176,9 @@ services:
         max-file: "3"
     restart: unless-stopped
 
+  # Backup reads the same volume as the single backend writer. It must never
+  # write to the live DB; it only snapshots it (see ./backup). Keep this
+  # service singular as well so snapshots do not race each other.
   backup:
     build: ./backup
     env_file: .env

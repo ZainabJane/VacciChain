@@ -81,9 +81,57 @@ jobs:
         with:
           # Staging-scoped secret only; never use a production role here.
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_STAGING }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION_STAGING }}
+
+      - name: Validate staging Terraform backend configuration
+        env:
+          TF_ENV: staging
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET_STAGING }}
+          TF_STATE_KEY: ${{ vars.TF_STATE_KEY_STAGING }}
+          TF_STATE_REGION: ${{ vars.TF_STATE_REGION_STAGING }}
+          TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE_STAGING }}
+          TF_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID_STAGING }}
+        run: |
+          set -euo pipefail
+          for var in TF_STATE_BUCKET TF_STATE_KEY TF_STATE_REGION TF_LOCK_TABLE TF_AWS_ACCOUNT_ID; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::Required staging variable ${var} is not set"
+              exit 1
+            fi
+          done
+          if [ "${TF_STATE_BUCKET}" = "${TF_STATE_BUCKET_STAGING}" ] && [ -n "${TF_STATE_BUCKET_PROD:-}" ] && [ "${TF_STATE_BUCKET}" = "${TF_STATE_BUCKET_PROD}" ]; then
+            echo "::error::Staging state bucket must not match production state bucket"
+            exit 1
+          fi
+          if printf '%s' "${TF_STATE_BUCKET} ${TF_STATE_KEY} ${TF_LOCK_TABLE}" | grep -qi 'prod'; then
+            echo "::error::Staging backend configuration references production state"
+            exit 1
+          fi
+          echo "Staging backend configuration validated (bucket=${TF_STATE_BUCKET}, key=${TF_STATE_KEY}, region=${TF_STATE_REGION})"
+
+      - name: Terraform init, validate and plan (staging only)
+        working-directory: ./terraform
+        env:
+          TF_ENV: staging
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET_STAGING }}
+          TF_STATE_KEY: ${{ vars.TF_STATE_KEY_STAGING }}
+          TF_STATE_REGION: ${{ vars.TF_STATE_REGION_STAGING }}
+          TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE_STAGING }}
+          TF_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID_STAGING }}
+          AWS_REGION: ${{ vars.AWS_REGION_STAGING }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false -reconfigure \
+            -backend-config="envs/staging/backend.hcl" \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${TF_STATE_REGION}" \
+            -backend-config="dynamodb_table=${TF_LOCK_TABLE}"
+          terraform validate
+          terraform plan -input=false -lock-timeout=5m -var-file="envs/staging/staging.tfvars" -out=staging.tfplan
 
       - name: Login to Amazon ECR
+=======
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@2fc7aceee09e9e4a7105c0d060c656fad0b4f63d # v1.7.0
 

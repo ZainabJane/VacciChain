@@ -1,14 +1,40 @@
 /**
  * SQLite-backed event store using sql.js (pure WASM — no native build required).
  * The DB is loaded from disk on init and flushed to disk after every write.
+ *
+ * PERSISTENCE MODEL (see docs/deployment.md):
+ *   The database file lives on an EFS access point and is only safe for a
+ *   SINGLE writer. The indexer/API service MUST run with desired count 1 and a
+ *   deployment configuration that never overlaps old and new tasks
+ *   (maxSurge=0, maxUnavailable=1, single replica). To defend against
+ *   misconfiguration (or a rolling deploy that briefly overlaps), startup
+ *   acquires an exclusive advisory lock file next to the DB. If another live
+ *   process holds the lock, initDb() throws instead of opening the DB, which
+ *   prevents split-brain index state and corruption.
+ *
+ *   Writes are flushed atomically (temp file + rename) so a task killed
+ *   mid-write leaves either the previous or the new DB image on disk, never a
+ *   truncated one. WAL mode is enabled for crash resilience; because sql.js
+ *   exports a full image on flush, the WAL is checkpointed into the exported
+ *   bytes and no separate -wal/-shm files need to be shared across tasks.
  */
 const initSqlJs = require('sql.js');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { toIndexedMint } = require('../schemas/vaccinationRecord');
 
 let db = null;
 let dbPath = null;
+let lockPath = null;
+let lockFd = null;
+let lockAcquired = false;
+
+const LOCK_STALE_MS = Number(process.env.DB_LOCK_STALE_MS || 5 * 60 * 1000);
+const LOCK_HEARTBEAT_MS = Number(process.env.DB_LOCK_HEARTBEAT_MS || 30 * 1000);
+let lockHeartbeat = null;
+let lockOwner = null;
+
 let inTransaction = false;
 
 // Bump when the on-disk schema changes in a backwards-incompatible way.
@@ -368,6 +394,9 @@ function runMigrations() {
  */
 async function initDb(filePath) {
   dbPath = filePath;
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  acquireLock();
+
   const SQL = await initSqlJs();
 
   const exists = fs.existsSync(filePath);
@@ -388,23 +417,29 @@ async function initDb(filePath) {
   } else {
     // First run: create a fresh database and record the schema version.
     db = new SQL.Database();
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
   }
 
+  // WAL improves crash resilience for the on-disk image; sql.js checkpoints
+  // the WAL into the exported bytes on flush().
+  try { db.run('PRAGMA journal_mode = WAL;'); } catch (_) { /* not fatal */ }
+  db.run(SCHEMA);
   runMigrations();
   runMigrationHooks();
   flush();
   return db;
 }
 
-/** Close the database, flushing any pending state. Safe to call twice. */
+/** Close the DB, flushing any pending state and releasing the writer lock. Safe to call multiple times. */
 function closeDb() {
   if (!db) return;
   try {
     flush();
   } finally {
-    db.close();
+    try { db.close(); } catch (_) { /* ignore */ }
     db = null;
+    releaseLock();
+  }
+}
   }
 }
 

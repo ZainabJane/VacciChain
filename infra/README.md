@@ -159,20 +159,27 @@ aws dynamodb scan --table-name vaccichain-tfstate-lock \
 
 ```bash
 cd infra/envs/staging
-terraform init
+terraform init -backend-config=backend.hcl
 terraform plan \
+  -var="aws_account_id=<STAGING_ACCOUNT_ID>" \
+  -var="aws_region=us-east-1" \
   -var="backend_image=<ECR_URI>/vaccichain-backend:latest" \
   -var="frontend_image=<ECR_URI>/vaccichain-frontend:latest" \
   -var="analytics_image=<ECR_URI>/vaccichain-analytics:latest"
 terraform apply
 ```
 
+Staging uses its own state bucket and account; a staging plan never
+references production state.
+
 ## Deploy production
 
 ```bash
 cd infra/envs/production
-terraform init
+terraform init -backend-config=backend.hcl
 terraform plan \
+  -var="aws_account_id=<PRODUCTION_ACCOUNT_ID>" \
+  -var="aws_region=us-east-1" \
   -var="backend_image=<ECR_URI>/vaccichain-backend:<TAG>" \
   -var="frontend_image=<ECR_URI>/vaccichain-frontend:<TAG>" \
   -var="analytics_image=<ECR_URI>/vaccichain-analytics:<TAG>"

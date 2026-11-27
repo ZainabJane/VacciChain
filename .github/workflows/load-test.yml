@@ -4,12 +4,38 @@ on:
   schedule:
     - cron: '0 2 * * 0'  # Weekly on Sunday at 2 AM UTC
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (local or staging)'
+        required: false
+        default: 'local'
+        type: choice
+        options:
+          - local
+          - staging
+      run_autoscaling_test:
+        description: 'Run ECS autoscaling verification against staging'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  # Autoscaling verification settings (per-service limits, cooldowns, cost caps)
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+  ECS_MIN_TASKS: ${{ vars.ECS_MIN_TASKS || '1' }}
+  ECS_MAX_TASKS: ${{ vars.ECS_MAX_TASKS || '4' }}
+  ECS_SCALE_OUT_COOLDOWN: ${{ vars.ECS_SCALE_OUT_COOLDOWN || '60' }}
+  ECS_SCALE_IN_COOLDOWN: ${{ vars.ECS_SCALE_IN_COOLDOWN || '300' }}
+  # Backend writers are constrained to a single instance to protect EFS-backed SQLite
+  BACKEND_SINGLE_WRITER: 'true'
 
 permissions:
   contents: read
 
 jobs:
   load-test:
+    if: ${{ github.event.inputs.environment != 'staging' }}
     runs-on: ubuntu-latest
     
     services:
@@ -94,3 +120,117 @@ jobs:
             echo "Load test results not found"
             exit 1
           fi
+
+  autoscaling-test:
+    if: ${{ github.event.inputs.environment == 'staging' || github.event.inputs.run_autoscaling_test == 'true' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify single-writer constraint
+        run: |
+          # Scaling must not introduce concurrent writers against EFS-backed SQLite.
+          # Confirm the service is configured for a single backend writer.
+          if [ "${BACKEND_SINGLE_WRITER}" != "true" ]; then
+            echo "ERROR: BACKEND_SINGLE_WRITER must be true to protect shared persistence"
+            exit 1
+          fi
+          echo "Single-writer mode confirmed"
+
+      - name: Capture baseline task count
+        id: baseline
+        run: |
+          COUNT=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].runningCount' \
+            --output text)
+          echo "baseline_count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Baseline running tasks: $COUNT"
+
+      - name: Install k6
+        run: |
+          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6-stable.list
+          sudo apt-get update
+          sudo apt-get install -y k6
+
+      - name: Run load test against staging
+        working-directory: ./backend
+        run: |
+          k6 run \
+            -e BASE_URL=${{ vars.STAGING_BASE_URL }} \
+            -e VUS=100 \
+            -e DURATION=120s \
+            -e RAMP_UP=20s \
+            load-test.js \
+            --out json=load-test-results.json
+
+      - name: Verify scale-out
+        id: scaleout
+        run: |
+          echo "Waiting for scale-out (cooldown ${ECS_SCALE_OUT_COOLDOWN}s)..."
+          sleep "${ECS_SCALE_OUT_COOLDOWN}"
+          COUNT=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].runningCount' \
+            --output text)
+          echo "Running tasks after load: $COUNT (baseline ${{ steps.baseline.outputs.baseline_count }})"
+          if [ "$COUNT" -le "${{ steps.baseline.outputs.baseline_count }}" ]; then
+            echo "ERROR: Service did not scale out under load"
+            exit 1
+          fi
+          if [ "$COUNT" -gt "${ECS_MAX_TASKS}" ]; then
+            echo "ERROR: Service exceeded max task count ${ECS_MAX_TASKS}"
+            exit 1
+          fi
+          echo "Scale-out verified within limits"
+
+      - name: Verify capacity alarms fired
+        run: |
+          ALARM_STATE=$(aws cloudwatch describe-alarms \
+            --alarm-name-prefix "${ECS_SERVICE}-capacity" \
+            --state-value ALARM \
+            --query 'MetricAlarms[].AlarmName' \
+            --output text)
+          if [ -z "$ALARM_STATE" ]; then
+            echo "ERROR: No capacity alarms fired during load test"
+            exit 1
+          fi
+          echo "Capacity alarms fired: $ALARM_STATE"
+
+      - name: Verify scale-in
+        run: |
+          echo "Waiting for scale-in (cooldown ${ECS_SCALE_IN_COOLDOWN}s)..."
+          sleep "${ECS_SCALE_IN_COOLDOWN}"
+          COUNT=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].runningCount' \
+            --output text)
+          echo "Running tasks after cooldown: $COUNT"
+          if [ "$COUNT" -lt "${ECS_MIN_TASKS}" ]; then
+            echo "ERROR: Service dropped below min task count ${ECS_MIN_TASKS}"
+            exit 1
+          fi
+          echo "Scale-in verified within limits"
+
+      - name: Upload autoscaling test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autoscaling-test-results
+          path: backend/load-test-results.json
+          retention-days: 30

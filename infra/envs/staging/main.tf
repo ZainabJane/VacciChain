@@ -17,7 +17,53 @@ provider "aws" {
   region = var.aws_region
 }
 
-variable "aws_region"      { type = string; default = "us-east-1" }
+variable "aws_account_id" {
+  type        = string
+  description = "AWS account ID that owns the staging environment resources."
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.aws_account_id))
+    error_message = "aws_account_id must be a 12-digit AWS account ID."
+  }
+}
+
+variable "aws_region" {
+  type        = string
+  description = "AWS region for the staging environment."
+  default     = "us-east-1"
+  validation {
+    condition     = can(regex("^[a-z]{2}-[a-z]+-[0-9]$", var.aws_region))
+    error_message = "aws_region must be a valid AWS region identifier (e.g. us-east-1)."
+  }
+}
+
+variable "state_bucket" {
+  type        = string
+  description = "S3 bucket holding Terraform state for this environment (supplied via backend config)."
+  validation {
+    condition     = length(var.state_bucket) > 0
+    error_message = "state_bucket must be provided and non-empty."
+  }
+}
+
+variable "state_key" {
+  type        = string
+  description = "S3 object key for this environment's Terraform state (supplied via backend config)."
+  validation {
+    condition     = length(var.state_key) > 0 && !can(regex("prod", var.state_key))
+    error_message = "state_key must be non-empty and must not reference production state."
+  }
+}
+
+variable "environment" {
+  type        = string
+  description = "Deployment environment name."
+  default     = "staging"
+  validation {
+    condition     = var.environment == "staging"
+    error_message = "This configuration only supports the staging environment."
+  }
+}
+
 variable "backend_image"   { type = string }
 variable "frontend_image"  { type = string }
 variable "analytics_image" { type = string }

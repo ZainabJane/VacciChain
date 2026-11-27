@@ -708,3 +708,13 @@ The smoke test exits non-zero if the contract ID is not found on the expected ne
 | `ALERT_WEBHOOK_TYPE` | no | runtime | enum: `slack` \| `pagerduty` \| `email`, default `slack` |
 | `PAGERDUTY_ROUTING_KEY` | when type=pagerduty | runtime | 32-char hex string |
 | `ALERT_EMAIL_TO` | when type=email | runtime | valid email address |
+| `EGRESS_ALLOWLIST` | no | runtime | comma-separated DNS names |
+| `INTERNAL_API_ALLOWLIST` | no | runtime | comma-separated internal DNS names |
+| `NAT_GATEWAY_ENABLED` | no | runtime | boolean, default `true` |
+| `AUTOSCALING_ENABLED` | no | runtime | boolean, default `false` |
+| `AUTOSCALING_MIN_TASKS` | no | runtime | positive integer, default 1 |
+| `AUTOSCALING_MAX_TASKS` | no | runtime | positive integer `>=` min, default 4 |
+| `AUTOSCALING_TARGET_CPU_PERCENT` | no | runtime | integer 1–100, default 70 |
+| `AUTOSCALING_SCALE_OUT_COOLDOWN_SECONDS` | no | runtime | positive integer, default 60 |
+| `AUTOSCALING_SCALE_IN_COOLDOWN_SECONDS` | no | runtime | positive integer, default 300 |
+| `SINGLE_WRITER_MODE` | no | runtime | boolean, default `true` |
