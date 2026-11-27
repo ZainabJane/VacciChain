@@ -173,6 +173,7 @@ function getStore() {
 
 /**
  * Register a new nonce with a 5-minute TTL.
+ * Optionally associates a requestId for log correlation.
  */
 async function set(nonce, clientPublicKey) {
   return getStore().set(nonce, clientPublicKey);

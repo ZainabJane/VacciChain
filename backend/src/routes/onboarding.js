@@ -106,7 +106,16 @@ router.post('/applications/:id/review', reviewLimiter, authMiddleware, adminOnly
 
   const { decision, reviewer_note } = req.body;
 
-  if (decision === 'approved') {
+  const previousStatus = application.status;
+
+  if (!isValidTransition(previousStatus, decision)) {
+    return res.status(400).json({
+      error: `Invalid transition from '${previousStatus}' to '${decision}'`,
+      allowed: ALLOWED_TRANSITIONS[previousStatus] || [],
+    });
+  }
+
+  if (decision === ONBOARDING_STATES.APPROVED) {
     try {
       await addIssuer(application.wallet);
     } catch (err) {
@@ -114,16 +123,37 @@ router.post('/applications/:id/review', reviewLimiter, authMiddleware, adminOnly
     }
   }
 
-  updateIssuerApplicationStatus(req.params.id, { status: decision, reviewer_note });
+  const reviewedAt = new Date().toISOString();
+  const reviewedBy = req.user.wallet;
 
-  audit({
-    actor: req.user.wallet,
-    action: `onboarding.${decision}`,
-    result: decision,
-    meta: { applicationId: req.params.id, applicantWallet: application.wallet },
+  updateIssuerApplicationStatus(req.params.id, {
+    status: decision,
+    reviewer_note,
+    reviewed_by: reviewedBy,
+    reviewed_at: reviewedAt,
   });
 
-  res.json({ id: req.params.id, status: decision, wallet: application.wallet });
+  audit({
+    actor: reviewedBy,
+    action: 'onboarding.review',
+    result: decision,
+    meta: {
+      applicationId: req.params.id,
+      applicantWallet: application.wallet,
+      previousStatus,
+      newStatus: decision,
+      reviewer_note: reviewer_note ?? null,
+      reviewedAt,
+    },
+  });
+
+  res.json({
+    id: req.params.id,
+    status: decision,
+    wallet: application.wallet,
+    reviewed_by: reviewedBy,
+    reviewed_at: reviewedAt,
+  });
 });
 
 module.exports = router;

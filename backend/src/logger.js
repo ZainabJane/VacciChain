@@ -205,6 +205,21 @@ const logger = createLogger({
   transports: [new transports.Console()],
 });
 
+/**
+ * Create a request-scoped child logger that binds the given requestId
+ * to every log entry. Falls back to the base logger when no requestId
+ * is provided.
+ *
+ * @param {string} [requestId] - Safe, validated request identifier.
+ * @returns {import('winston').Logger}
+ */
+function createRequestLogger(requestId) {
+  if (!requestId) {
+    return logger;
+  }
+  return logger.child({ requestId });
+}
+
 module.exports = logger;
 module.exports.redactSensitive = redactSensitive;
 module.exports.redactString = redactString;

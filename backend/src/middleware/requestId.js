@@ -53,6 +53,8 @@ function normalizeHeaderValue(value) {
   return value;
 }
 
+const SAFE_REQUEST_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
 module.exports = function requestId(req, res, next) {
   const incoming = sanitizeRequestId(req.headers['x-request-id']);
   const id = incoming || randomUUID();

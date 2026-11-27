@@ -56,6 +56,34 @@ If you see a message saying you're not authorized:
 3. **Wait for confirmation** — Authorization may take a few minutes to propagate
 4. **Refresh the page** — Try again after a few moments
 
+### Onboarding Application States
+
+Before you can issue records, your issuer application moves through a defined set of states. Understanding these states helps you know what to expect and what actions are available.
+
+| State | Meaning | Who Can Act |
+|-------|---------|-------------|
+| **Pending** | Your application has been submitted and is awaiting review. You cannot issue records yet. | You (submit), Administrators (review) |
+| **Approved** | An administrator has approved your application. You can now issue and revoke records. | Administrators only |
+| **Rejected** | An administrator has rejected your application. You cannot issue records. Contact your administrator for details. | Administrators only |
+
+### Who Can Transition Your Application
+
+- **You (the applicant)** can only *submit* an application, which places it in the **Pending** state.
+- **Only VacciChain administrators** can move an application from **Pending** to **Approved** or **Rejected**.
+- Issuers cannot approve or reject their own applications, nor can they approve or reject other issuers' applications.
+- Once an application is **Approved** or **Rejected**, it is a final state — it cannot be re-transitioned. If your application was rejected, you must contact an administrator to discuss next steps.
+
+### Onboarding Audit Trail
+
+Every state transition is recorded with audit metadata so there is a clear, tamper-evident history:
+
+- **Actor** — The wallet address of the administrator who performed the transition
+- **Timestamp** — When the transition occurred
+- **From → To** — The previous and new state (e.g., Pending → Approved)
+- **Reason** — Any notes provided by the administrator (especially for rejections)
+
+Invalid transitions (e.g., approving an already-approved application) and unauthorized transitions (e.g., an issuer attempting to approve themselves) are rejected by the system and are not persisted.
+
 ### Understanding Your Role
 
 As an issuer, you have:
@@ -241,10 +269,11 @@ All revocations are logged with:
 
 **Solution**:
 1. Verify you're using the correct wallet
-2. Contact your VacciChain administrator
-3. Provide your Stellar public key
-4. Wait for authorization to be processed
-5. Refresh the page
+2. Check your onboarding application status (see [Onboarding Application States](#onboarding-application-states))
+3. If your application is **Pending**, wait for an administrator to review it
+4. If your application is **Rejected**, contact your VacciChain administrator to discuss next steps
+5. If you have not applied yet, submit an application with your Stellar public key
+6. Refresh the page after your application is approved
 
 ### "Transaction Failed"
 
@@ -327,6 +356,12 @@ A: The record is marked as revoked on the blockchain. It will no longer appear i
 
 **Q: Can I see records issued by other providers?**  
 A: No. You can only see records you've issued. This protects patient privacy.
+
+**Q: Can I approve my own issuer application?**  
+A: No. Only VacciChain administrators can approve or reject issuer applications. Every transition is logged with the administrator's address and a timestamp.
+
+**Q: What happens if my application is rejected?**  
+A: You cannot issue records while rejected. Contact your VacciChain administrator to understand the reason and discuss next steps.
 
 ---
 

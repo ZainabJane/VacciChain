@@ -12,6 +12,14 @@ const integrityChecks = new Counter('integrity_checks');
 const writeConflicts = new Counter('write_conflicts');
 const activeInstances = new Gauge('active_instances');
 
+// Batch verification metrics
+const batchLatency = new Trend('batch_latency');
+const batchItemLatency = new Trend('batch_item_latency');
+const batchPartialFailure = new Rate('batch_partial_failure');
+const batchItemErrors = new Counter('batch_item_errors');
+const batchItemsProcessed = new Counter('batch_items_processed');
+const batchConcurrency = new Gauge('batch_concurrency');
+
 // Configuration
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:4000';
 const DURATION = __ENV.DURATION || '60s';
@@ -34,7 +42,6 @@ const SCALING = {
 // single instance (see issue #117), so the load test must verify that
 // concurrent reads never observe corrupted or split-brain index state.
 const INTEGRITY_SAMPLE_RATE = Number(__ENV.INTEGRITY_SAMPLE_RATE || 0.1);
-=======
 
 // Test wallets (valid Stellar addresses for testing)
 const TEST_WALLETS = [
@@ -200,6 +207,24 @@ function textSummary(data, options) {
   summary += `Total Requests: ${data.metrics.http_reqs?.value || 0}\n`;
   summary += `Errors: ${data.metrics.errors?.value || 0}\n`;
   summary += `Success Rate: ${((1 - (data.metrics.errors?.value || 0) / (data.metrics.http_reqs?.value || 1)) * 100).toFixed(2)}%\n`;
+
+  if (data.metrics.batch_latency) {
+    const batch = data.metrics.batch_latency;
+    summary += `\nBatch Verification:\n`;
+    summary += `  Batch Size: ${BATCH_SIZE} (max 100)\n`;
+    summary += `  Parallelism: ${BATCH_PARALLELISM} (max 10)\n`;
+    summary += `  Items Processed: ${data.metrics.batch_items_processed?.value || 0}\n`;
+    summary += `  Item Errors: ${data.metrics.batch_item_errors?.value || 0}\n`;
+    summary += `  Partial Failure Rate: ${((data.metrics.batch_partial_failure?.value || 0) * 100).toFixed(2)}%\n`;
+    summary += `  Batch P95: ${batch.stats?.p(95)?.toFixed(2) || 'N/A'}ms\n`;
+    summary += `  Batch P99: ${batch.stats?.p(99)?.toFixed(2) || 'N/A'}ms\n`;
+  }
+
+  if (data.metrics.batch_item_latency) {
+    const item = data.metrics.batch_item_latency;
+    summary += `  Item P95: ${item.stats?.p(95)?.toFixed(2) || 'N/A'}ms\n`;
+    summary += `  Item P99: ${item.stats?.p(99)?.toFixed(2) || 'N/A'}ms\n`;
+  }
 
   if (data.metrics.http_req_duration) {
     const duration = data.metrics.http_req_duration;

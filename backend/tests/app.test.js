@@ -4,6 +4,35 @@ const health = require('../src/health');
 const rateLimit = require('../src/rateLimit');
 const logger = require('../src/logger');
 
+describe('Readiness state', () => {
+  afterEach(() => {
+    health.setReady(true);
+    health.setSorobanHealthy(true);
+  });
+
+  it('GET /health reports readiness false during startup', async () => {
+    health.setReady(false);
+    const res = await request(app).get('/health');
+    expect(res.body.ready).toBe(false);
+  });
+
+  it('GET /health reports readiness true after all init steps succeed', async () => {
+    health.setReady(true);
+    const res = await request(app).get('/health');
+    expect(res.status).toBe(200);
+    expect(res.body.ready).toBe(true);
+  });
+
+  it('GET /health reports degraded when a dependency fails', async () => {
+    health.setReady(true);
+    health.setSorobanHealthy(false);
+    const res = await request(app).get('/health');
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.ready).toBe(true);
+  });
+});
+
 describe('Health check', () => {
   afterEach(() => {
     health.setSorobanHealthy(true);

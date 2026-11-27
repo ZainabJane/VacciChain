@@ -215,7 +215,7 @@ router.post(
       normalizedVaccineName,
       normalizedDate,
       process.env.ISSUER_SECRET_KEY,
-      { doseNumber: dose_number, doseSeries: dose_series }
+      { doseNumber: dose_number, doseSeries: dose_series, requestId: req.requestId }
     );
     const timestamp = new Date().toISOString();
 
@@ -243,7 +243,7 @@ router.post(
       action: 'vaccination.issue',
       target: patient_address,
       result: 'failure',
-      meta: { error: errorMessage },
+      meta: { error: errorMessage, requestId: req.requestId },
     });
     const { status, body } = toStableErrorResponse(err);
     res.status(status).json(body);
@@ -328,7 +328,7 @@ router.post(
         StellarSdk.Address.fromString(req.user.publicKey).toScVal(),
       ];
 
-      await invokeContract(process.env.ISSUER_SECRET_KEY, 'revoke_vaccination', args);
+      await invokeContract(process.env.ISSUER_SECRET_KEY, 'revoke_vaccination', args, { requestId: req.requestId });
 
       audit({
         actor: req.user.publicKey,
@@ -353,7 +353,7 @@ router.post(
         action: 'vaccination.revoke',
         target: String(token_id),
         result: 'failure',
-        meta: { token_id, error: errorMessage },
+        meta: { token_id, error: errorMessage, requestId: req.requestId },
       });
       const { status, body } = toStableErrorResponse(err);
       res.status(status).json(body);

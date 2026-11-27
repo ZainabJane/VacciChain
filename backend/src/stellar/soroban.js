@@ -26,8 +26,19 @@ const TX_FEE = String(process.env.SOROBAN_FEE || 100);
 // Inclusion tip in stroops for priority during congestion (0 = no tip).
 const TX_TIP = process.env.SOROBAN_TIP ? String(process.env.SOROBAN_TIP) : undefined;
 
-function getRpcServer() {
-  return new StellarSdk.SorobanRpc.Server(SOROBAN_RPC_URL);
+/**
+ * Build a Soroban RPC server whose underlying HTTP client forwards the
+ * correlation ID as an X-Request-ID header on every downstream call.
+ * @param {string} [requestId] - Correlation ID for this workflow
+ */
+function getRpcServer(requestId) {
+  const server = new StellarSdk.SorobanRpc.Server(SOROBAN_RPC_URL);
+  const correlationId = requestId || getRequestId();
+  if (correlationId && server && server.httpClient && server.httpClient.defaults) {
+    server.httpClient.defaults.headers = server.httpClient.defaults.headers || {};
+    server.httpClient.defaults.headers['X-Request-ID'] = correlationId;
+  }
+  return server;
 }
 
 /**
@@ -52,6 +63,8 @@ async function callRead(fn, context) {
  * @param {string} secretKey - Caller's secret key
  * @param {string} method - Contract method name
  * @param {StellarSdk.xdr.ScVal[]} args - Method arguments
+ * @param {Object} [options]
+ * @param {string} [options.requestId] - Correlation ID for this workflow
  */
 async function invokeContract(secretKey, method, args) {
   // Guard against invoking against the wrong network or contract.
@@ -124,8 +137,10 @@ function toOptionalU32(value) {
  * @param {Object} [options]
  * @param {number|null} [options.doseNumber]
  * @param {number|null} [options.doseSeries]
+ * @param {string} [options.requestId] - Correlation ID for this workflow
  */
 async function mintVaccination(patient, vaccineName, dateAdministered, issuerSecret, options = {}) {
+  const requestId = options.requestId || getRequestId();
   try {
     const issuerKeypair = StellarSdk.Keypair.fromSecret(issuerSecret);
     const args = [
@@ -137,7 +152,7 @@ async function mintVaccination(patient, vaccineName, dateAdministered, issuerSec
       toOptionalU32(options.doseSeries),
     ];
 
-    const result = await invokeContract(issuerSecret, 'mint_vaccination', args);
+    const result = await invokeContract(issuerSecret, 'mint_vaccination', args, { requestId });
     const tokenId = StellarSdk.scValToNative(result.returnValue);
     return {
       tokenId,
@@ -169,12 +184,15 @@ const VerificationStatus = Object.freeze({
  * RPC and simulation failures are mapped to UNAVAILABLE (never VALID).
  *
  * @param {string} wallet - Stellar wallet address to verify
+ * @param {Object} [options]
+ * @param {string} [options.requestId] - Correlation ID for this workflow
  * @returns {Promise<{wallet: string, status: string, vaccinated: boolean, records: Array, error?: string}>}
  */
-async function verifyVaccination(wallet) {
+async function verifyVaccination(wallet, options = {}) {
+  const requestId = options.requestId || getRequestId();
   try {
     const args = [StellarSdk.Address.fromString(wallet).toScVal()];
-    const rawResult = await simulateContract('verify_vaccination', args);
+    const rawResult = await simulateContract('verify_vaccination', args, { requestId });
 
     if (rawResult == null) {
       // No return value from the contract: treat as absent, never positive.
@@ -223,6 +241,10 @@ async function verifyVaccination(wallet) {
 
 /**
  * Read-only contract call (no signing needed).
+ * @param {string} method - Contract method name
+ * @param {StellarSdk.xdr.ScVal[]} args - Method arguments
+ * @param {Object} [options]
+ * @param {string} [options.requestId] - Correlation ID for this workflow
  */
 async function simulateContract(method, args) {
   // Guard against simulating against the wrong network or contract.
@@ -408,25 +430,31 @@ module.exports = {
 /**
  * Add a new issuer to the contract allowlist (admin-signed).
  * @param {string} issuerWallet - Stellar public key to authorize as issuer
+ * @param {Object} [options]
+ * @param {string} [options.requestId] - Correlation ID for this workflow
  */
-async function addIssuer(issuerWallet) {
+async function addIssuer(issuerWallet, options = {}) {
+  const requestId = options.requestId || getRequestId();
   const adminSecret = process.env.ADMIN_SECRET_KEY;
   if (!adminSecret) throw new Error('ADMIN_SECRET_KEY not configured');
   const args = [StellarSdk.xdr.ScVal.scvAddress(
     StellarSdk.Address.fromString(issuerWallet).toScAddress()
   )];
-  return invokeContract(adminSecret, 'add_issuer', args);
+  return invokeContract(adminSecret, 'add_issuer', args, { requestId });
 }
 
 /**
  * Revoke an issuer from the contract allowlist (admin-signed).
  * @param {string} issuerWallet - Stellar public key to deauthorize
+ * @param {Object} [options]
+ * @param {string} [options.requestId] - Correlation ID for this workflow
  */
-async function revokeIssuer(issuerWallet) {
+async function revokeIssuer(issuerWallet, options = {}) {
+  const requestId = options.requestId || getRequestId();
   const adminSecret = process.env.ADMIN_SECRET_KEY;
   if (!adminSecret) throw new Error('ADMIN_SECRET_KEY not configured');
   const args = [StellarSdk.xdr.ScVal.scvAddress(
     StellarSdk.Address.fromString(issuerWallet).toScAddress()
   )];
-  return invokeContract(adminSecret, 'revoke_issuer', args);
+  return invokeContract(adminSecret, 'revoke_issuer', args, { requestId });
 }

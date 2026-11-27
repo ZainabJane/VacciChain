@@ -258,17 +258,16 @@ app.get('/ready', async (_req, res) => {
 });
 
 if (require.main === module) {
-  initializeSecrets().then(() => {
-    initDb(config.DATABASE_PATH).then(() => {
-      startPoller(config.EVENT_POLL_INTERVAL_MS);
-        startHealthProbe();
+  runStartup()
+    .then(() => {
+      startHealthProbe();
       const server = app.listen(config.PORT, () => {
         logger.info(`Backend running on port ${config.PORT}`);
       });
 
       const gracefulShutdown = (signal) => {
         logger.info(`${signal} received. Starting graceful shutdown...`);
-        
+
         stopPoller();
 
         server.close(() => {
@@ -285,11 +284,15 @@ if (require.main === module) {
 
       process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
       process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    })
+    .catch((error) => {
+      logger.error('Startup failed', {
+        step: error && error.step,
+        code: error && error.code,
+        message: error && error.message,
+      });
+      process.exit(1);
     });
-  }).catch(error => {
-    logger.error(`Failed to initialize secrets: ${error.message}`);
-    process.exit(1);
-  });
 }
 
 module.exports = app;

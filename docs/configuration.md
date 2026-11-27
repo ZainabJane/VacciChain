@@ -317,6 +317,32 @@ Public verification endpoints (`GET /verify/:wallet`, batch verification) are bo
 
 ---
 
+## Batch verification
+
+Controls the size and parallelism of batch verification requests (`POST /verify/batch`). Both values are bounded so a single request cannot overwhelm the backend, the Soroban RPC provider, or the Python worker pool.
+
+### `BATCH_MAX_SIZE`
+- Required: no
+- Default: `100`
+- Format: integer
+- Allowed range: `1`–`1000` (values outside the range are rejected at startup)
+- Description: Maximum number of items accepted in a single batch verification request. Requests exceeding this limit are rejected with `400` and a structured error; they are not silently truncated.
+- Example: `BATCH_MAX_SIZE=100`
+
+### `BATCH_CONCURRENCY`
+- Required: no
+- Default: `5`
+- Format: integer
+- Allowed range: `1`–`32` (values outside the range are rejected at startup)
+- Description: Maximum number of batch items verified in parallel. Items beyond this are queued. Partial failures are reported per item in the response (`{ index, status, error }`) rather than failing the whole batch.
+- Tuning guidance:
+  - Keep `BATCH_CONCURRENCY` well below the RPC provider's per-second rate limit.
+  - For rate-limited or shared RPC endpoints use `2`–`4`.
+  - Do not raise above `16` without load testing — latency degrades and RPC throttling errors increase.
+- Example: `BATCH_CONCURRENCY=5`
+
+---
+
 ## Rate limiting
 
 Sensitive operations are rate limited per client identity. The client identity is derived from the request using the trusted-proxy configuration below — forwarding headers (`X-Forwarded-For`, `X-Real-IP`) are only honoured when the immediate peer is a trusted proxy, so spoofed headers from untrusted clients are ignored.
@@ -677,6 +703,8 @@ The smoke test exits non-zero if the contract ID is not found on the expected ne
 | `ISSUER_SECRET_KEY` | yes | runtime | valid Stellar secret key format |
 | `JWT_SECRET` | yes | Zod (backend) | non-empty string |
 | `PORT` | no | Zod (backend) | positive integer, default 4000 |
+| `BATCH_MAX_SIZE` | no | Zod (backend) | integer 1–1000, default 100 |
+| `BATCH_CONCURRENCY` | no | Zod (backend) | integer 1–32, default 5 |
 | `ALLOWED_ORIGINS` | no | Zod (backend) | comma-separated URLs, default `http://localhost:3000` |
 | `SOROBAN_FEE` | no | Zod (backend) | positive integer (stroops), default 100 |
 | `SOROBAN_TIP` | no | Zod (backend) | non-negative integer (stroops), default 0 |

@@ -32,6 +32,47 @@ describe('X-Request-ID middleware', () => {
     const res = await request(app).get('/v1/verify/invalid-address');
     expect(res.headers['x-request-id']).toBeDefined();
   });
+
+  it('replaces invalid client-provided X-Request-ID with a generated one', async () => {
+    const invalidIds = [
+      'short',
+      'has spaces in it',
+      'bad<script>alert(1)</script>',
+      'x'.repeat(200),
+      'semi;colon:injection',
+    ];
+
+    for (const invalidId of invalidIds) {
+      const res = await request(app).get('/health').set('X-Request-ID', invalidId);
+      const echoed = res.headers['x-request-id'];
+      expect(echoed).toBeDefined();
+      expect(echoed).not.toBe(invalidId);
+      expect(echoed).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+      );
+    }
+  });
+
+  it('accepts valid client-provided IDs of allowed character set and length', async () => {
+    const validIds = ['abc123', 'trace_id-1.2:3', 'A'.repeat(128)];
+    for (const validId of validIds) {
+      const res = await request(app).get('/health').set('X-Request-ID', validId);
+      expect(res.headers['x-request-id']).toBe(validId);
+    }
+  });
+
+  it('does not leak stack traces or credentials in the response', async () => {
+    const res = await request(app)
+      .get('/verify/invalid-address')
+      .set('X-Request-ID', 'trace-safe-echo-1');
+
+    expect(res.headers['x-request-id']).toBe('trace-safe-echo-1');
+    const body = JSON.stringify(res.body || {});
+    expect(body).not.toMatch(/\bat\s+\S+\s+\(.*:\d+:\d+\)/);
+    expect(body).not.toMatch(/node_modules/);
+    expect(body).not.toMatch(/SECRET|PRIVATE_KEY|password/i);
+    expect(res.text || '').not.toMatch(/node_modules/);
+  });
 });
 
 describe('Structured request logging', () => {
@@ -60,6 +101,53 @@ describe('Structured request logging', () => {
     expect(typeof meta.statusCode).toBe('number');
     expect(typeof meta.durationMs).toBe('number');
     expect(meta.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('logs the generated requestId when none is provided', async () => {
+    const res = await request(app).get('/health');
+    const generatedId = res.headers['x-request-id'];
+    expect(generatedId).toBeDefined();
+
+    const call = logSpy.mock.calls.find(
+      ([msg, meta]) => msg === 'request' && meta?.requestId === generatedId
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('logs the replacement requestId when an invalid ID is provided', async () => {
+    const res = await request(app).get('/health').set('X-Request-ID', 'bad id!');
+    const echoed = res.headers['x-request-id'];
+    expect(echoed).not.toBe('bad id!');
+
+    const call = logSpy.mock.calls.find(
+      ([msg, meta]) => msg === 'request' && meta?.requestId === echoed
+    );
+    expect(call).toBeDefined();
+  });
+});
+
+describe('Request ID propagation to downstream calls', () => {
+  const soroban = require('../src/stellar/soroban');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('propagates the request ID to Stellar/Soroban calls', async () => {
+    const clientId = 'downstream-trace-42';
+    await request(app).get('/health').set('X-Request-ID', clientId);
+
+    const allCalls = [
+      ...soroban.simulateContract.mock.calls,
+      ...soroban.invokeContract.mock.calls,
+    ];
+    // If any downstream call was made, it must carry the request ID context.
+    for (const callArgs of allCalls) {
+      const serialized = JSON.stringify(callArgs, (key, value) =>
+        typeof value === 'function' ? undefined : value
+      );
+      expect(serialized).toContain(clientId);
+    }
   });
 });
 

@@ -233,6 +233,7 @@ function audit({ actor, requestId = null, action, target = null, result, meta = 
     result,
     meta: redactSensitive(meta),
   };
+  if (requestId) entry.requestId = requestId;
   writeAuditEntry(entry);
 }
 

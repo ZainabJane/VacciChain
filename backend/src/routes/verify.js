@@ -339,7 +339,8 @@ router.get(
         wallet,
         status: VERIFY_STATUS.UNAVAILABLE,
         verified: false,
-        error: errorMessage
+        error: errorMessage,
+        requestId: req.id
       });
     }
   }
@@ -453,6 +454,114 @@ router.get(
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
+/**
+ * @swagger
+ * /verify/batch:
+ *   post:
+ *     summary: Batch vaccination status verification
+ *     description: >
+ *       Verifies up to BATCH_MAX_SIZE wallets per request. Items are processed
+ *       with bounded concurrency (BATCH_CONCURRENCY) to protect the RPC provider
+ *       and worker pool. Partial failures are reported per item.
+ *     tags:
+ *       - Verification
+ *     security:
+ *       - bearerAuth: []
+ *       - apiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               wallets:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *     responses:
+ *       200:
+ *         description: Per-item verification results
+ *       400:
+ *         description: Invalid request (bad wallets or batch too large)
+ *       401:
+ *         description: Unauthorized - JWT or API key required
+ *       429:
+ *         description: Rate limit exceeded
+ */
+// POST /verify/batch — JWT or verifier API key, bounded concurrency
+router.post(
+  '/batch',
+  jwtOrApiKey,
+  adaptiveLimiter,
+  async (req, res) => {
+    const requestId = req.id;
+    const actor = req.verifier ? `apikey:${req.verifier.id}` : (req.user?.wallet ?? 'unknown');
+    const wallets = req.body && req.body.wallets;
+
+    if (!Array.isArray(wallets) || wallets.length === 0) {
+      return res.status(400).json({ error: 'wallets must be a non-empty array', requestId });
+    }
+    if (wallets.length > BATCH_MAX_SIZE) {
+      return res.status(400).json({
+        error: `batch size exceeds maximum of ${BATCH_MAX_SIZE}`,
+        requestId,
+      });
+    }
+
+    const invalid = [];
+    wallets.forEach((wallet, index) => {
+      if (typeof wallet !== 'string' || !StellarSdk.StrKey.isValidEd25519PublicKey(wallet)) {
+        invalid.push({ index, wallet, error: 'invalid wallet address' });
+      }
+    });
+    if (invalid.length > 0) {
+      return res.status(400).json({ error: 'invalid wallet address in batch', invalid, requestId });
+    }
+
+    const now = Date.now();
+    const results = await mapWithConcurrency(wallets, BATCH_CONCURRENCY, async (wallet) => {
+      const cached = verifyCache.get(wallet);
+      if (cached && (now - cached.timestamp < CACHE_TTL)) {
+        return { wallet, vaccinated: cached.vaccinated, verified: cached.vaccinated, records: cached.records };
+      }
+      const { vaccinated, records } = await verifyVaccination(wallet, { requestId });
+      verifyCache.set(wallet, { vaccinated, records, timestamp: now });
+      return { wallet, vaccinated, verified: vaccinated, records };
+    });
+
+    const items = results.map((result, index) => {
+      if (result.ok) {
+        return { index, wallet: wallets[index], ok: true, ...result.value };
+      }
+      const errorMessage = resolveContractErrorMessage(result.error);
+      return {
+        index,
+        wallet: wallets[index],
+        ok: false,
+        error: { message: errorMessage, timeout: isTimeoutError(result.error) },
+      };
+    });
+
+    const failed = items.filter((item) => !item.ok).length;
+    audit({
+      actor,
+      action: 'verify.batch',
+      target: `${wallets.length} wallets`,
+      result: failed === 0 ? 'success' : 'partial_failure',
+      meta: { requestId, total: wallets.length, failed },
+    });
+
+    res.json({
+      requestId,
+      total: wallets.length,
+      succeeded: wallets.length - failed,
+      failed,
+      results: items,
+    });
+  }
+);
+
 // GET /verify/:wallet — JWT or verifier API key
 router.get(
   '/:wallet',
@@ -532,7 +641,8 @@ router.get(
         wallet,
         status: VERIFY_STATUS.UNAVAILABLE,
         verified: false,
-        error: errorMessage
+        error: errorMessage,
+        requestId: req.id
       });
     }
   }

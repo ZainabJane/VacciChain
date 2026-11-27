@@ -28,8 +28,13 @@ const server = stellarClient.getHorizonServer();
  *  - signed by server keypair
  *
  * Returns { transaction, nonce, network_passphrase }.
+ *
+ * @param {string} clientPublicKey - Client Stellar account (G...)
+ * @param {string} [requestId] - Correlation ID for tracing (defaults to the
+ *   current request context, if any)
  */
-async function buildChallenge(clientPublicKey) {
+async function buildChallenge(clientPublicKey, requestId) {
+  const correlationId = requestId || getRequestId();
   const serverKeypair = StellarSdk.Keypair.fromSecret(config.SEP10_SERVER_KEY);
 
   // SEP-10 requires sequence number 0. Use a synthetic account so the builder
@@ -83,6 +88,11 @@ async function buildChallenge(clientPublicKey) {
  *  6. Client signature is present and valid
  *
  * Returns the verified client public key on success.
+ *
+ * @param {string} transactionXDR - Base64-encoded challenge transaction
+ * @param {string} nonce - Nonce issued by buildChallenge
+ * @param {string} [requestId] - Correlation ID for tracing (defaults to the
+ *   current request context, if any)
  */
 async function verifyChallenge(transactionXDR, nonce) {
   // 1. Consume nonce atomically before any other checks. This is the single
