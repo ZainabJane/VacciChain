@@ -16,6 +16,7 @@ const {
 const { isValidStellarPublicKey } = require('../middleware/wallet');
 const { addIssuer, revokeIssuer, simulateContract } = require('../stellar/soroban');
 const { isAuthorizedIssuer, invalidateCache } = require('../stellar/issuerCache');
+const { getIndexerStatus, pauseIndexer, resumeIndexer, reconcileRange } = require('../indexer/operations');
 const validate = require('../middleware/validate');
 const { addIssuerSchema, createApiKeySchema, rotateJwtSchema, approveProposalSchema, purgeRetentionSchema } = require('./schemas/admin.schemas');
 const { runRetentionPurge, RETENTION_POLICIES } = require('../retention');

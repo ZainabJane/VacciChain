@@ -11,6 +11,7 @@ const { ERROR_CODES, sendError } = require('../errors');
 const crypto = require('crypto');
 const authMiddleware = require('../middleware/auth');
 const validate = require('../middleware/validate');
+const validateQuery = require('../middleware/validateQuery');
 const { audit } = require('../middleware/auditLog');
 const { addIssuer } = require('../stellar/soroban');
 const { requireMultiSig } = require('../middleware/multiSig');
@@ -80,12 +81,8 @@ router.post('/apply', applyLimiter, authMiddleware, validate(applySchema), async
  * GET /onboarding/applications
  * Admin only — list all applications, optionally filtered by status.
  */
-router.get('/applications', authMiddleware, adminOnly, (req, res) => {
+router.get('/applications', authMiddleware, adminOnly, validateQuery(listApplicationsQuerySchema), (req, res) => {
   const { status } = req.query;
-  const allowed = ['pending', 'approved', 'rejected'];
-  if (status && !allowed.includes(status)) {
-    return res.status(400).json({ error: `status must be one of: ${allowed.join(', ')}` });
-  }
   res.json(listIssuerApplications({ status }));
 });
 

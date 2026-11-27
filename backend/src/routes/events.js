@@ -1,5 +1,7 @@
 const express = require('express');
 const { queryEvents } = require('../indexer/db');
+const { validateQuery } = require('../middleware/validate');
+const { paginationSchema } = require('../validation/schemas');
 
 const router = express.Router();
 

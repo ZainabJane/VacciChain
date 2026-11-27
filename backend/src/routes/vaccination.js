@@ -9,6 +9,7 @@ const { resolveContractErrorMessage, mapContractError } = require('../stellar/co
 const { audit } = require('../middleware/auditLog');
 const { AppError } = require('../middleware/errors');
 const validate = require('../middleware/validate');
+const { validateQuery } = require('../middleware/validate');
 const { hasConsented } = require('../indexer/db');
 const { toApiRecords } = require('../schemas/vaccinationRecord');
 const { issueSchema, revokeSchema, vaccinationListQuerySchema } = require('./schemas/vaccination.schemas');
@@ -503,7 +504,8 @@ router.post('/batch-verify', authMiddleware, batchVerifyLimiter, async (req, res
     const errorMessage = resolveContractErrorMessage(err);
     next(new AppError('rpc_error', errorMessage, 500));
   }
-});
+  }
+);
 
 // GET /vaccination/:wallet — fetch paginated records for a wallet
 // #45: patients may only read their own wallet; issuers (re-verified on-chain) and admins may read any.

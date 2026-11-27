@@ -228,7 +228,10 @@ const issueSchema = z.object({
 });
 
 const revokeSchema = z.object({
-  token_id: z.union([z.string(), z.number()])
+  token_id: z.union([
+    boundedString(MAX_TOKEN_ID_LENGTH, 'token_id'),
+    z.number().int('token_id must be an integer'),
+  ])
     .transform((val) => String(val))
     .describe('Token ID to revoke'),
 });

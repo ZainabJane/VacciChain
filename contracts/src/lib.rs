@@ -275,6 +275,14 @@ impl VacciChainContract {
         Ok(())
     }
 
+    /// Returns the current admin address, if the contract has been initialized.
+    ///
+    /// # Authorization
+    /// This is a public read-only function; no authorization required.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::Admin)
+    }
+
     /// Pause the contract. Admin only. All state-changing calls will return `ContractPaused`.
     pub fn pause(env: Env) -> Result<(), ContractError> {
         let admin: Address = env

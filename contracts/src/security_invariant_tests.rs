@@ -129,6 +129,71 @@ fn invariant_revoked_issuer_cannot_mint() {
     assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
 }
 
+#[test]
+fn invariant_forged_issuer_cannot_mint() {
+    let (env, client, _admin) = setup();
+    // A legitimate issuer exists, but the caller forges a different address
+    // that was never added to the allowlist.
+    let legit_issuer = soroban_sdk::Address::generate(&env);
+    let forged_issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &legit_issuer);
+    assert!(client.is_issuer(&legit_issuer));
+    assert!(!client.is_issuer(&forged_issuer));
+
+    let result = client.try_mint_vaccination(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "2024-01-15"),
+        &forged_issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+
+    assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+}
+
+#[test]
+fn invariant_unauthorized_caller_cannot_mint() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let attacker = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+
+    // Only the attacker authorizes the call; the issuer address is used as the
+    // claimed issuer but the attacker is the actual caller.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attacker,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "mint_vaccination",
+            args: (
+                patient.clone(),
+                String::from_str(&env, "COVID-19"),
+                String::from_str(&env, "2024-01-15"),
+                attacker.clone(),
+                None::<u32>,
+                None::<u32>,
+            ).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = client.try_mint_vaccination(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "2024-01-15"),
+        &attacker,
+        &None::<u32>,
+        &None::<u32>,
+    );
+
+    assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+}
+
 // ── Transfer always fails ─────────────────────────────────────────────────────
 
 #[test]
@@ -228,6 +293,66 @@ fn invariant_non_admin_cannot_revoke_issuer() {
 
     let result = client.try_revoke_issuer(&issuer);
     assert!(result.is_err(), "Non-admin should not be able to revoke an issuer");
+}
+
+#[test]
+fn invariant_non_admin_cannot_pause() {
+    let (env, client, _admin) = setup();
+    let non_admin = soroban_sdk::Address::generate(&env);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &non_admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "pause",
+            args: ().into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = client.try_pause();
+    assert!(result.is_err(), "Non-admin should not be able to pause");
+}
+
+#[test]
+fn invariant_non_admin_cannot_unpause() {
+    let (env, client, _admin) = setup();
+    let non_admin = soroban_sdk::Address::generate(&env);
+
+    client.pause().unwrap();
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &non_admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "unpause",
+            args: ().into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = client.try_unpause();
+    assert!(result.is_err(), "Non-admin should not be able to unpause");
+}
+
+#[test]
+fn invariant_non_admin_cannot_upgrade() {
+    let (env, client, _admin) = setup();
+    let non_admin = soroban_sdk::Address::generate(&env);
+    let new_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &non_admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "upgrade",
+            args: (new_wasm_hash.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = client.try_upgrade(&new_wasm_hash);
+    assert!(result.is_err(), "Non-admin should not be able to upgrade");
 }
 
 // ── Paused contract rejects all state-changing calls ─────────────────────────

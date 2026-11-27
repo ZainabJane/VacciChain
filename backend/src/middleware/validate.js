@@ -41,13 +41,51 @@ const validate = (schema, source = 'body') => (req, res, next) => {
     next();
   } catch (err) {
     if (err.issues) {
-      return res.status(400).json({
-        error: 'Validation failed',
-        details: err.issues.map((e) => ({
-          path: e.path.join('.'),
-          message: e.message,
-        })),
+      return res.status(400).json(buildValidationError(err));
+    }
+    next(err);
+  }
+};
+
+/**
+ * Query parameter validation middleware factory.
+ *
+ * Creates a middleware that validates the request query against a Zod schema.
+ * Returns the same stable 400 error shape as {@link validate}.
+ *
+ * @param {Object} schema - A Zod schema object for query validation
+ *
+ * @returns {Function} Express middleware function
+ *
+ * @example
+ * const schema = boundedPagination();
+ * app.get('/items', validateQuery(schema), (req, res) => {
+ *   // req.query is now validated and typed
+ * });
+ *
+ * @throws {Error} 400 - Validation failed with detailed error messages
+ *
+ * @side-effects Replaces req.query with the validated values
+ */
+const validateQuery = (schema) => (req, res, next) => {
+  try {
+    const validated = schema.parse(req.query);
+    // req.query may be a getter-only property on some Express versions;
+    // assign defensively.
+    try {
+      req.query = validated;
+    } catch (assignErr) {
+      Object.defineProperty(req, 'query', {
+        value: validated,
+        writable: true,
+        configurable: true,
+        enumerable: true,
       });
+    }
+    next();
+  } catch (err) {
+    if (err.issues) {
+      return res.status(400).json(buildValidationError(err));
     }
     next(err);
   }

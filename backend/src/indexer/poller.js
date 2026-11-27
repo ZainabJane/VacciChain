@@ -174,7 +174,7 @@ async function fetchEventsWithRetry(rpc, params) {
       lastErr = err;
       if (attempt === RPC_MAX_RETRIES) break;
       const delay = backoffDelay(attempt);
-      if (process.env.NODE_ENV !== 'test') {
+      if (!isTest()) {
         console.warn(
           `[indexer] getEvents failed (attempt ${attempt + 1}/${RPC_MAX_RETRIES + 1}): ${err.message} — retrying in ${delay}ms`
         );
@@ -421,6 +421,228 @@ function poll() {
 }
 
 /**
+ * Fetch a bounded ledger range of contract events from Soroban RPC.
+ * @param {number} fromLedger inclusive
+ * @param {number} toLedger inclusive
+ * @returns {Promise<Array>} parsed events
+ */
+async function fetchLedgerRange(fromLedger, toLedger) {
+  if (!CONTRACT_ID) {
+    throw new Error('VACCINATIONS_CONTRACT_ID not set — cannot reconcile');
+  }
+  if (!Number.isInteger(fromLedger) || !Number.isInteger(toLedger)) {
+    throw new Error('fromLedger and toLedger must be integers');
+  }
+  if (fromLedger < 1 || toLedger < fromLedger) {
+    throw new Error('Invalid ledger range');
+  }
+
+  const rpc = getRpc();
+  const response = await rpc.getEvents({
+    startLedger: fromLedger,
+    endLedger: toLedger,
+    filters: [{ contractIds: [CONTRACT_ID] }],
+  });
+
+  return (response.events ?? [])
+    .map(parseEvent)
+    .filter(Boolean)
+    .filter((e) => e.ledger >= fromLedger && e.ledger <= toLedger);
+}
+
+/**
+ * Compare a bounded ledger range against persisted indexed events and emit
+ * actionable differences. Optionally applies idempotent repairs.
+ *
+ * Differences reported:
+ *  - missing:   on-chain event not present in the index
+ *  - duplicate: same event id persisted more than once
+ *  - stale:     indexed event in range that no longer exists on-chain
+ *
+ * @param {object} opts
+ * @param {number} opts.fromLedger inclusive
+ * @param {number} opts.toLedger inclusive
+ * @param {boolean} [opts.repair=false] apply idempotent repairs
+ * @param {string} [opts.actor='system'] actor recorded in audit events
+ * @returns {Promise<object>} reconciliation report
+ */
+async function reconcileLedgerRange(opts = {}) {
+  const { fromLedger, toLedger, repair = false, actor = 'system' } = opts;
+
+  const chainEvents = await fetchLedgerRange(fromLedger, toLedger);
+  const indexedEvents = getEventsInLedgerRange(fromLedger, toLedger);
+
+  const chainById = new Map();
+  for (const e of chainEvents) {
+    chainById.set(e.id, e);
+  }
+
+  const indexedById = new Map();
+  const duplicateIds = new Set();
+  for (const e of indexedEvents) {
+    if (indexedById.has(e.id)) {
+      duplicateIds.add(e.id);
+    } else {
+      indexedById.set(e.id, e);
+    }
+  }
+
+  const missing = [];
+  for (const [id, e] of chainById) {
+    if (!indexedById.has(id)) missing.push(e);
+  }
+
+  const stale = [];
+  for (const [id, e] of indexedById) {
+    if (!chainById.has(id)) stale.push(e);
+  }
+
+  const duplicates = [];
+  for (const id of duplicateIds) {
+    const rows = indexedEvents.filter((e) => e.id === id);
+    duplicates.push({ id, count: rows.length, ledger: rows[0].ledger });
+  }
+
+  const report = {
+    fromLedger,
+    toLedger,
+    chainCount: chainEvents.length,
+    indexedCount: indexedEvents.length,
+    missing,
+    duplicates,
+    stale,
+    repaired: false,
+    repairedCount: 0,
+  };
+
+  const hasDifferences = missing.length || duplicates.length || stale.length;
+
+  if (hasDifferences && !isTest()) {
+    console.warn(
+      `[indexer] Reconciliation differences in ledgers ${fromLedger}-${toLedger}: ` +
+        `${missing.length} missing, ${duplicates.length} duplicate, ${stale.length} stale`
+    );
+  }
+
+  if (repair && hasDifferences) {
+    // Idempotent repair: re-upsert missing events (upsert is keyed by id) and
+    // remove stale / duplicate rows. Running this repeatedly converges.
+    let repairedCount = 0;
+
+    if (missing.length) {
+      upsertEvents(missing);
+      repairedCount += missing.length;
+    }
+
+    const staleIds = stale.map((e) => e.id);
+    if (staleIds.length) {
+      deleteEventsByIds(staleIds);
+      repairedCount += staleIds.length;
+    }
+
+    // Duplicates are collapsed by re-upserting the canonical chain event.
+    const duplicateCanonical = duplicates
+      .map((d) => chainById.get(d.id))
+      .filter(Boolean);
+    if (duplicateCanonical.length) {
+      upsertEvents(duplicateCanonical);
+      repairedCount += duplicateCanonical.length;
+    }
+
+    // Invalidate issuer cache for repaired issuer events.
+    for (const e of [...missing, ...duplicateCanonical]) {
+      if ((e.event_type === 'IssuerRevoked' || e.event_type === 'IssuerAdded') && e.payload?.issuer) {
+        invalidateCache(e.payload.issuer);
+      }
+    }
+
+    report.repaired = true;
+    report.repairedCount = repairedCount;
+
+    recordAuditEvent({
+      action: 'indexer.reconcile.repair',
+      actor,
+      details: {
+        fromLedger,
+        toLedger,
+        missing: missing.length,
+        duplicates: duplicates.length,
+        stale: stale.length,
+        repairedCount,
+      },
+    });
+
+    if (!isTest()) {
+      console.log(
+        `[indexer] Reconciliation repair applied for ledgers ${fromLedger}-${toLedger}: ` +
+          `${repairedCount} record(s) repaired`
+      );
+    }
+  } else if (hasDifferences) {
+    recordAuditEvent({
+      action: 'indexer.reconcile.detect',
+      actor,
+      details: {
+        fromLedger,
+        toLedger,
+        missing: missing.length,
+        duplicates: duplicates.length,
+        stale: stale.length,
+      },
+    });
+  }
+
+  return report;
+}
+
+/**
+ * Operational status snapshot for the poller.
+ * @returns {object}
+ */
+function getPollerStatus() {
+  const latestLedger = getLatestLedger();
+  const lag =
+    pollerState.lastProcessedLedger != null
+      ? Math.max(0, latestLedger - pollerState.lastProcessedLedger)
+      : null;
+
+  return {
+    running: pollerState.running,
+    paused: pollerState.paused,
+    intervalMs: pollerState.intervalMs,
+    lastProcessedLedger: pollerState.lastProcessedLedger,
+    latestLedger,
+    lag,
+    lastPollAt: pollerState.lastPollAt,
+    lastError: pollerState.lastError,
+  };
+}
+
+/**
+ * Pause the poller. Subsequent polls are skipped until resumed.
+ * @param {string} [actor='system']
+ */
+function pausePoller(actor = 'system') {
+  if (pollerState.paused) return getPollerStatus();
+  pollerState.paused = true;
+  recordAuditEvent({ action: 'indexer.poller.pause', actor, details: {} });
+  if (!isTest()) console.log('[indexer] Poller paused');
+  return getPollerStatus();
+}
+
+/**
+ * Resume the poller.
+ * @param {string} [actor='system']
+ */
+function resumePoller(actor = 'system') {
+  if (!pollerState.paused) return getPollerStatus();
+  pollerState.paused = false;
+  recordAuditEvent({ action: 'indexer.poller.resume', actor, details: {} });
+  if (!isTest()) console.log('[indexer] Poller resumed');
+  return getPollerStatus();
+}
+
+/**
  * Start the background polling loop.
  * @param {number} intervalMs
  */
@@ -464,6 +686,8 @@ async function stopPoller() {
       // in-flight errors are already handled inside runPoll
     }
   }
+
+  pollerState.running = false;
 }
 
 // Register a shutdown hook so the poller stops cleanly during deploys.
@@ -474,7 +698,6 @@ if (typeof process !== 'undefined' && typeof process.on === 'function') {
   process.once('SIGTERM', shutdown);
   process.once('SIGINT', shutdown);
 }
-
 module.exports = {
   startPoller,
   stopPoller,

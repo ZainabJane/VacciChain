@@ -3,6 +3,12 @@ const { z } = require('zod');
 /**
  * Validation schemas for admin routes.
  * Co-located with admin.js for easy maintenance.
+ *
+ * All schemas apply consistent size/range constraints:
+ * - strings are bounded (min/max length)
+ * - arrays are bounded (max items)
+ * - pagination values are bounded (limit/offset ranges)
+ * - nested objects are depth-limited
  */
 
 /**
@@ -31,23 +37,72 @@ const rotateJwtSchema = z.object({
     .min(32, 'new_secret must be at least 32 characters')
     .optional()
     .describe('New JWT signing secret (min 32 chars)'),
-  new_kid: z.string()
+  new_kid: boundedString({
+    min: 1,
+    max: LIMITS.SHORT_STRING_MAX,
+    label: 'new_kid',
+  })
     .optional()
     .describe('Optional key ID for the new secret'),
   reload_from_env: z.boolean()
     .optional()
     .describe('If true, reload JWT secret from environment'),
-}).refine(
+}).strict().refine(
   (data) => data.new_secret || data.reload_from_env,
   { message: 'Either new_secret or reload_from_env must be provided' }
-);
+));
 
-const approveProposalSchema = z.object({
-  proposal_id: z.string()
-    .min(1, 'proposal_id is required')
+const approveProposalSchema = withDepthLimit(z.object({
+  proposal_id: boundedString({
+    min: 1,
+    max: LIMITS.SHORT_STRING_MAX,
+    label: 'proposal_id',
+  })
     .uuid('proposal_id must be a valid UUID')
     .describe('UUID of the multi-sig proposal to approve'),
-});
+}).strict());
+
+// ---------------------------------------------------------------------------
+// Query schemas (admin list endpoints)
+// ---------------------------------------------------------------------------
+
+const auditLogQuerySchema = withDepthLimit(z.object({
+  limit: paginationLimitSchema,
+  offset: paginationOffsetSchema,
+  action: boundedString({
+    min: 1,
+    max: LIMITS.SHORT_STRING_MAX,
+    label: 'action',
+  }).optional(),
+  actor: boundedString({
+    min: 1,
+    max: LIMITS.SHORT_STRING_MAX,
+    label: 'actor',
+  }).optional(),
+  from: boundedString({
+    min: 1,
+    max: LIMITS.MEDIUM_STRING_MAX,
+    label: 'from',
+  }).optional(),
+  to: boundedString({
+    min: 1,
+    max: LIMITS.MEDIUM_STRING_MAX,
+    label: 'to',
+  }).optional(),
+}).strict());
+
+const apiKeysQuerySchema = withDepthLimit(z.object({
+  limit: paginationLimitSchema,
+  offset: paginationOffsetSchema,
+  label: boundedString({
+    min: 1,
+    max: LIMITS.SHORT_STRING_MAX,
+    label: 'label',
+  }).optional(),
+  active: z.enum(['true', 'false'])
+    .optional()
+    .describe('Filter by active status'),
+}).strict());
 
 /**
  * Propose an admin key rotation / recovery.
@@ -103,6 +158,15 @@ const cancelAdminRotationSchema = z.object({
 });
 
 module.exports = {
+  // limits & helpers (exported for reuse/testing)
+  LIMITS,
+  boundedString,
+  boundedArray,
+  paginationLimitSchema,
+  paginationOffsetSchema,
+  withDepthLimit,
+
+  // write schemas
   addIssuerSchema,
   createApiKeySchema,
   rotateJwtSchema,
