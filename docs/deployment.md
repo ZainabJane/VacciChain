@@ -36,6 +36,7 @@ Complete these steps before touching any infrastructure.
 
 - [ ] External security audit completed and all critical findings resolved
 - [ ] All tests passing: `npm test` (backend), `cargo test` (contracts), `pytest` (python-service)
+- [ ] Staging smoke tests passing (`npm run smoke:staging` against staging) — production promotion is blocked otherwise
 - [ ] Dependency scans clean: `npm audit`, `cargo audit`, `pip audit`
 - [ ] Domain DNS configured and propagated
 - [ ] AWS account limits reviewed (ECS tasks, ECR storage, Secrets Manager)
@@ -510,6 +511,35 @@ For full TLS configuration details, see [`docs/tls-setup.md`](./tls-setup.md).
 
 Run these checks after every production deployment.
 
+> **Staging smoke-test gate:** Production promotion is blocked until the release-level smoke tests pass against staging. See [Section 9.0](#90-staging-smoke-test-gate) for what the gate covers and how to run it.
+
+### 9.0 Staging Smoke Test Gate
+
+Before any release is promoted to production, the same container images must be deployed to staging and pass the release-level smoke test suite. The CI/CD pipeline (`.github/workflows/cd.yml`) runs this gate automatically; a failure blocks the production promotion step.
+
+The smoke tests exercise the **real deployed staging environment** (not mocks) and cover:
+
+| Check | What it verifies |
+|---|---|
+| **Frontend route load** | The staging frontend URL serves the app shell and key routes (e.g. `/`, `/verify`) with HTTP 200 and expected content |
+| **API health** | `GET /health` on the staging backend returns `{"status":"ok"}` and ECS tasks are stable |
+| **Analytics reachability** | The Python analytics service responds on its health/readiness endpoint and is reachable from the backend |
+| **Public verification** | A safe, known public verification case (a wallet with no records) returns the expected `{"vaccinated": false, "records": []}` shape |
+
+Run the gate manually against staging:
+
+```bash
+# Point the suite at the staging environment
+export SMOKE_BASE_URL=https://staging.yourdomain.com
+export SMOKE_ANALYTICS_URL=https://staging.yourdomain.com/analytics
+export SMOKE_VERIFY_WALLET=<KNOWN_EMPTY_TESTNET_WALLET_ADDRESS>
+
+npm run smoke:staging
+```
+
+**Promotion is blocked when any smoke test fails.** Do not override the gate to ship a release; fix the failing check on staging (or roll back the staging deployment) and re-run the suite until it passes.
+=======
+
 ### 9.1 Service Health
 
 ```bash
@@ -572,6 +602,8 @@ aws logs filter-log-events \
 ```
 
 ### 9.6 End-to-End Smoke Test
+
+The automated staging gate in [Section 9.0](#90-staging-smoke-test-gate) must pass before this manual production check. Then:
 
 1. Connect a Freighter wallet (mainnet) to `https://app.yourdomain.com`
 2. Authenticate via SEP-10 — you should receive a JWT
@@ -767,6 +799,7 @@ Initiate a rollback if any of the following occur within 30 minutes of deploymen
 - [Mainnet Launch Checklist](./mainnet-launch.md) — Pre-launch sign-off checklist
 - [Contract Upgrade Guide](./contract-upgrade.md) — Upgrading the Soroban contract
 - [Staging Setup](./staging-setup.md) — Staging environment reference
+- [Staging Smoke Tests](./staging-setup.md#smoke-tests) — Release-level smoke-test gate that blocks production promotion
 - [Stellar Documentation](https://developers.stellar.org/)
 - [AWS ECS Fargate](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html)
 - [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/)

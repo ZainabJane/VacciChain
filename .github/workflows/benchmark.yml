@@ -105,6 +105,132 @@ jobs:
             contracts/gas-summary.txt
           retention-days: 30
 
+  contract-resource-gate:
+    name: Contract resource regression gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: cargo-${{ hashFiles('contracts/Cargo.lock') }}
+
+      - name: Download stored resource baseline
+        continue-on-error: true
+        run: |
+          mkdir -p contracts/benchmarks
+          git show origin/main:contracts/benchmarks/resource-baseline.json \
+            > contracts/benchmarks/resource-baseline.json 2>/dev/null \
+            || echo "No stored resource baseline found; gate will report only"
+
+      - name: Run contract resource baseline tests
+        working-directory: contracts
+        run: |
+          cargo test --release resource_baseline -- --nocapture --test-threads=1 \
+            2>&1 | tee resource-report.txt
+
+      - name: Compare resources against thresholds
+        working-directory: contracts
+        run: |
+          # Documented regression thresholds (see contracts/benchmarks/README.md):
+          #   - CPU instructions: fail if current > baseline * 1.10 (+10%)
+          #   - Memory bytes:     fail if current > baseline * 1.10 (+10%)
+          #   - Absolute Soroban limits: CPU <= 100_000_000, memory <= 40 MiB
+          # Operations covered: mint, verify, revoke, batch.
+          CPU_REGRESSION_PCT=10
+          MEM_REGRESSION_PCT=10
+          CPU_LIMIT=100000000
+          MEM_LIMIT=41943040
+
+          BASELINE=benchmarks/resource-baseline.json
+          CURRENT=benchmarks/resource-current.json
+
+          if [ ! -f "$CURRENT" ]; then
+            echo "::error::Missing current resource measurements at $CURRENT"
+            exit 1
+          fi
+
+          echo "## Contract Resource Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Thresholds: CPU +${CPU_REGRESSION_PCT}%, memory +${MEM_REGRESSION_PCT}% vs baseline; absolute limits CPU ${CPU_LIMIT}, memory ${MEM_LIMIT} bytes." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Operation | Metric | Baseline | Current | Delta | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|----------|---------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          FAILED=0
+          for OP in mint verify revoke batch; do
+            for METRIC in cpu memory; do
+              CUR=$(jq -r --arg op "$OP" --arg m "$METRIC" '.[$op][$m] // empty' "$CURRENT")
+              if [ -z "$CUR" ]; then
+                echo "::error::Missing $METRIC measurement for $OP"
+                FAILED=1
+                continue
+              fi
+
+              if [ "$METRIC" = "cpu" ]; then
+                LIMIT=$CPU_LIMIT
+                PCT=$CPU_REGRESSION_PCT
+              else
+                LIMIT=$MEM_LIMIT
+                PCT=$MEM_REGRESSION_PCT
+              fi
+
+              if [ "$CUR" -gt "$LIMIT" ]; then
+                echo "| $OP | $METRIC | - | $CUR | - | ❌ exceeds limit ($LIMIT) |" >> $GITHUB_STEP_SUMMARY
+                echo "::error::$OP $METRIC $CUR exceeds Soroban limit $LIMIT"
+                FAILED=1
+                continue
+              fi
+
+              BASE=$(jq -r --arg op "$OP" --arg m "$METRIC" '.[$op][$m] // empty' "$BASELINE" 2>/dev/null || echo "")
+              if [ -z "$BASE" ]; then
+                echo "| $OP | $METRIC | n/a | $CUR | n/a | ⚪ no baseline |" >> $GITHUB_STEP_SUMMARY
+                continue
+              fi
+
+              THRESHOLD=$(( BASE + BASE * PCT / 100 ))
+              DELTA=$(( CUR - BASE ))
+              if [ "$CUR" -gt "$THRESHOLD" ]; then
+                echo "| $OP | $METRIC | $BASE | $CUR | +$DELTA | ❌ regression |" >> $GITHUB_STEP_SUMMARY
+                echo "::error::$OP $METRIC regressed: $BASE -> $CUR (threshold +${PCT}%)"
+                FAILED=1
+              else
+                echo "| $OP | $METRIC | $BASE | $CUR | $DELTA | ✅ ok |" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Result: FAILED — resource regression or limit exceeded.**" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Result: PASSED — all operations within thresholds.**" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload resource comparison
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-resource-comparison
+          path: |
+            contracts/resource-report.txt
+            contracts/benchmarks/resource-current.json
+            contracts/benchmarks/resource-baseline.json
+          retention-days: 30
+
   benchmark-comparison:
     name: Compare benchmarks with baseline
     runs-on: ubuntu-latest

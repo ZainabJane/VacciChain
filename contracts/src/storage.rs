@@ -1,5 +1,57 @@
 use soroban_sdk::{contracttype, Address, Bytes, String, BytesN, Env, xdr::ToXdr};
 
+/// Current on-chain storage schema version.
+///
+/// Bump this whenever the layout or semantics of persistent entries change so
+/// that migration logic (see issue #92) can detect and handle prior state.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Minimum TTL (in ledgers) applied to persistent entries on every write.
+///
+/// Soroban persistent entries expire unless their TTL is extended. All
+/// persistent writes must call [`extend_persistent_ttl`] so that vaccination
+/// histories and issuer records remain readable for the retention window.
+/// At ~5 seconds per ledger this is roughly 30 days.
+pub const PERSISTENT_TTL_MIN: u32 = 518_400;
+
+/// TTL (in ledgers) that persistent entries are extended to on write.
+///
+/// This is the target lifetime granted when a persistent entry is written or
+/// touched. It must be greater than or equal to [`PERSISTENT_TTL_MIN`].
+/// At ~5 seconds per ledger this is roughly 180 days.
+pub const PERSISTENT_TTL_EXTEND: u32 = 3_110_400;
+
+/// Threshold (in ledgers) below which a persistent entry is considered
+/// "close to expiry" and should be extended on access.
+pub const PERSISTENT_TTL_THRESHOLD: u32 = PERSISTENT_TTL_MIN;
+
+/// Extend the TTL of a persistent entry to [`PERSISTENT_TTL_EXTEND`].
+///
+/// Must be invoked after every persistent write (and on read paths that need
+/// to keep entries alive) so that storage lifecycle assumptions documented for
+/// issue #90 hold. If the entry is missing this is a no-op at the host level.
+pub fn extend_persistent_ttl<K>(env: &Env, key: &K)
+where
+    K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+{
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+}
+
+/// Safely read the schema version of a stored [`VaccinationRecord`].
+///
+/// Returns `Some(version)` when the record exists, or `None` when the entry is
+/// missing or has expired. Callers must treat `None` as "unknown/absent" and
+/// must never fail open on authorization decisions (issue #90).
+pub fn read_record_schema_version(env: &Env, token_id: u64) -> Option<u32> {
+    let key = DataKey::Token(token_id);
+    match env.storage().persistent().get::<DataKey, VaccinationRecord>(&key) {
+        Some(record) => Some(record.schema_version),
+        None => None,
+    }
+}
+
 /// Hash an address to a 32-byte key using SHA-256.
 ///
 /// This helper is useful for storage key derivation and indexing.

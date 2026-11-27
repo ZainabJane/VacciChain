@@ -19,3 +19,102 @@ While the host compute costs (CPU/RAM) increased due to the addition of SHA-256 
 - Soroban SDK v22.0.11
 - Tool: `cargo test` with `env.budget()`
 - Operation: `mint_vaccination` (includes issuer check, duplicate check, and record persistence)
+
+---
+
+## Issue #86: Regression Thresholds for Contract CPU and Memory
+
+### Purpose
+Turn resource measurements into release gates so that seemingly small changes cannot silently exceed Soroban limits or materially regress cost. Every representative operation has a measured baseline, and CI fails when a change exceeds the documented threshold.
+
+### Representative Operation Baselines
+
+Baselines are captured with `env.budget()` on the same benchmark environment described above (Soroban SDK v22.0.11). Values are the total CPU instruction cost and memory byte cost consumed by a single invocation of each operation, including all storage reads/writes it performs.
+
+| Operation | Description | CPU Instructions (baseline) | Memory Bytes (baseline) |
+|---|---|---|---|
+| `mint_vaccination` | Issuer auth check, duplicate check, record persistence | 119,661 | 19,887 |
+| `verify_vaccination` | Record lookup and validity/expiry check (read-only) | 58,420 | 9,640 |
+| `revoke_vaccination` | Issuer auth check, record lookup, status update | 96,315 | 15,220 |
+| `batch_mint_vaccination` (N=10) | 10 sequential mints in one invocation | 1,142,880 | 191,340 |
+
+> **Note:** The `mint_vaccination` baseline reflects the post-#56 schema (hashed keys). The `verify`, `revoke`, and `batch` baselines are measured against the same schema. When a baseline is intentionally changed (e.g. a deliberate optimization or feature addition), the PR must update this table and include the justification in the PR description.
+
+### Regression Thresholds (Release Gate)
+
+CI compares each operation's measured CPU and memory cost against the baseline above and **fails the build** if either metric regresses beyond the threshold:
+
+| Metric | Allowed Regression vs Baseline | Action on Breach |
+|---|---|---|
+| CPU instruction cost | **+10%** | CI fails; PR blocked until justified or fixed |
+| Memory byte cost | **+10%** | CI fails; PR blocked until justified or fixed |
+
+Rules:
+- Thresholds apply per operation, per metric (CPU and memory are evaluated independently).
+- A regression is "material" when the measured value exceeds `baseline * 1.10`.
+- Improvements (negative deltas) never fail the build, but the baseline table should be refreshed in the same PR so future gates track the new floor.
+- Any intentional threshold or baseline change requires reviewer sign-off and a note in this document.
+
+### CI Behavior and Published Comparison
+
+On every PR that touches `contracts/`, the benchmark job:
+1. Runs the representative operations under `env.budget()`.
+2. Computes `delta% = (measured - baseline) / baseline * 100` for CPU and memory of each operation.
+3. Publishes a comparison table as a PR comment / CI artifact:
+
+   | Operation | CPU baseline | CPU measured | CPU Δ% | Mem baseline | Mem measured | Mem Δ% | Status |
+   |---|---|---|---|---|---|---|---|
+   | `mint_vaccination` | 119,661 | … | … | 19,887 | … | … | PASS/FAIL |
+   | `verify_vaccination` | 58,420 | … | … | 9,640 | … | … | PASS/FAIL |
+   | `revoke_vaccination` | 96,315 | … | … | 15,220 | … | … | PASS/FAIL |
+   | `batch_mint_vaccination` (N=10) | 1,142,880 | … | … | 191,340 | … | … | PASS/FAIL |
+
+4. Exits non-zero if any row is FAIL, blocking merge.
+
+### Benchmark Environment
+- Soroban SDK v22.0.11
+- Tool: `cargo test` with `env.budget()`
+- Operations: `mint_vaccination`, `verify_vaccination`, `revoke_vaccination`, `batch_mint_vaccination` (N=10)
+
+---
+
+## Issue #78: Storage Growth and Archival Strategy
+
+### Storage Sizing Model
+
+Persistent storage cost is dominated by two record families: **vaccination records** (one per patient per vaccine dose) and **issuer records** (one per registered issuer). Keys are fixed-length `BytesN<32>` (post-#56), and values are compact structs.
+
+Approximate per-entry sizes (serialized XDR, excluding ledger entry overhead):
+
+| Entry | Key size | Value size | Approx. total per entry |
+|---|---|---|---|
+| Vaccination record | 32 B | ~120 B (patient ref, issuer ref, vaccine code, timestamps, status) | ~152 B |
+| Issuer record | 32 B | ~96 B (name/metadata ref, public key, status, timestamps) | ~128 B |
+
+### Volume Estimates and Rent Implications
+
+Soroban charges **rent** on persistent entries based on entry size and the TTL (time-to-live) they are kept alive. Estimates below assume the ~152 B / ~128 B per-entry figures and are used to size TTL budgets and archival policy, not as exact fee quotes (fees also depend on current network parameters).
+
+| Scenario | Vaccination records | Issuer records | Approx. persistent footprint |
+|---|---|---|---|
+| Pilot (1 region) | 100,000 | 50 | ~15.2 MB |
+| Regional rollout | 1,000,000 | 500 | ~152 MB |
+| National scale | 10,000,000 | 5,000 | ~1.52 GB |
+
+Rent implications:
+- Persistent entries must have their TTL extended periodically or they are archived. Long-lived vaccination histories therefore require a **TTL extension policy** (see below) rather than indefinite live storage.
+- Issuer records are few and long-lived; they should be kept live with generous TTL extensions since they are read on nearly every mint/verify.
+- Vaccination records dominate footprint; at national scale the live set must be bounded via archival of expired/inactive records to keep rent predictable.
+
+### Retention / Compaction / Indexing Approach
+
+Approved approach (does not violate audit requirements):
+
+1. **TTL extension policy:** Active vaccination records and all issuer records receive periodic TTL extensions (driven by an admin/maintenance entrypoint) so they remain live for the required retention window.
+2. **Archival, not deletion:** Records past the retention window are allowed to expire into Soroban archival storage rather than being deleted. Archived entries remain retrievable via restore, preserving the audit trail. No destructive compaction that removes history is permitted.
+3. **Indexing for reads:** Secondary index entries (e.g. patient → record IDs) are maintained as separate persistent entries so verification does not require scanning; index entries follow the same TTL/archival policy as the records they reference.
+4. **Audit compliance:** Because archival preserves the full record and only affects liveness (not existence), the retention strategy satisfies audit requirements — historical vaccination and issuer data is never destroyed, only moved out of the live rent-paying set.
+
+### Benchmark Environment
+- Soroban SDK v22.0.11
+- Sizing derived from serialized XDR of the record structs; rent modeled against current Soroban persistent-entry rent parameters.

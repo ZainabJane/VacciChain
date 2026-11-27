@@ -1,8 +1,24 @@
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { initDb, upsertEvents, queryEvents, getLatestLedger } = require('../src/indexer/db');
-const { parseEvent, stopPoller } = require('../src/indexer/poller');
+const {
+  initDb,
+  upsertEvents,
+  queryEvents,
+  getLatestLedger,
+  getCheckpoint,
+  setCheckpoint,
+  withTransaction,
+  getSchemaVersion,
+  runMigrations,
+} = require('../src/indexer/db');
+const {
+  parseEvent,
+  stopPoller,
+  pollOnce,
+  backoffDelay,
+  MAX_BACKOFF_MS,
+} = require('../src/indexer/poller');
 const { vaccinationRecordFactory } = require('./factories');
 
 
@@ -238,6 +254,227 @@ describe('poller operational controls', () => {
     resumePoller({ role: 'operator', audit: auditSpy });
     expect(getStatus().state).toBe('running');
     expect(auditSpy).toHaveBeenCalledWith(expect.objectContaining({ action: 'poller.resume' }));
+  });
+});
+
+describe('poller — resilience', () => {
+  const rawEvent = (id, ledger, topic = 'minted') => ({
+    id,
+    topic: [{ value: { toString: () => topic } }],
+    ledger,
+    ledgerClosedAt: '2024-01-01T00:00:00Z',
+    contractId: 'CABC',
+    value: { vaccine_name: 'Flu' },
+  });
+
+  it('uses bounded exponential backoff', () => {
+    const delays = [1, 2, 3, 4, 5, 6, 7, 8].map((attempt) => backoffDelay(attempt));
+    for (let i = 1; i < delays.length; i += 1) {
+      expect(delays[i]).toBeGreaterThanOrEqual(delays[i - 1]);
+    }
+    delays.forEach((d) => {
+      expect(d).toBeGreaterThan(0);
+      expect(d).toBeLessThanOrEqual(MAX_BACKOFF_MS);
+    });
+  });
+
+  it('retries repeated RPC failures and does not advance the checkpoint', async () => {
+    const start = getCheckpoint();
+    let calls = 0;
+    const fetchEvents = jest.fn(async () => {
+      calls += 1;
+      throw new Error('transient RPC failure');
+    });
+
+    const result = await pollOnce({ fetchEvents, maxRetries: 3, baseDelayMs: 1 });
+
+    expect(fetchEvents).toHaveBeenCalledTimes(3);
+    expect(calls).toBe(3);
+    expect(result.ok).toBe(false);
+    expect(result.attempts).toBe(3);
+    expect(getCheckpoint()).toBe(start);
+  });
+
+  it('succeeds after transient failures and advances the checkpoint', async () => {
+    const start = getCheckpoint();
+    let calls = 0;
+    const fetchEvents = jest.fn(async () => {
+      calls += 1;
+      if (calls < 3) throw new Error('transient RPC failure');
+      return [rawEvent('evt-retry-1', start + 1)];
+    });
+
+    const result = await pollOnce({ fetchEvents, maxRetries: 5, baseDelayMs: 1 });
+
+    expect(result.ok).toBe(true);
+    expect(fetchEvents).toHaveBeenCalledTimes(3);
+    expect(getCheckpoint()).toBe(start + 1);
+  });
+
+  it('deduplicates duplicate event delivery', async () => {
+    const start = getCheckpoint();
+    const events = [rawEvent('evt-dup-1', start + 1), rawEvent('evt-dup-1', start + 1)];
+    const fetchEvents = jest.fn(async () => events);
+
+    const result = await pollOnce({ fetchEvents, maxRetries: 1, baseDelayMs: 1 });
+
+    expect(result.ok).toBe(true);
+    const stored = queryEvents().filter((e) => e.id === 'evt-dup-1');
+    expect(stored.length).toBe(1);
+    expect(getCheckpoint()).toBe(start + 1);
+  });
+
+  it('quarantines malformed payloads without advancing the checkpoint', async () => {
+    const start = getCheckpoint();
+    const malformed = {
+      id: 'evt-bad-1',
+      topic: [{ value: { toString: () => 'minted' } }],
+      ledger: start + 1,
+      ledgerClosedAt: 'not-a-date',
+      contractId: 'CABC',
+      value: null,
+    };
+    const fetchEvents = jest.fn(async () => [malformed]);
+
+    const result = await pollOnce({ fetchEvents, maxRetries: 1, baseDelayMs: 1 });
+
+    expect(result.ok).toBe(false);
+    expect(result.quarantined).toBeGreaterThanOrEqual(1);
+    expect(getCheckpoint()).toBe(start);
+    expect(queryEvents().filter((e) => e.id === 'evt-bad-1').length).toBe(0);
+  });
+
+  it('recovers the checkpoint from the database after restart', async () => {
+    const start = getCheckpoint();
+    const fetchEvents = jest.fn(async () => [rawEvent('evt-restart-1', start + 1)]);
+    await pollOnce({ fetchEvents, maxRetries: 1, baseDelayMs: 1 });
+    expect(getCheckpoint()).toBe(start + 1);
+
+    // Simulate a restart: a fresh poller must resume from the persisted checkpoint.
+    const resumed = jest.fn(async (fromLedger) => {
+      expect(fromLedger).toBe(start + 1);
+      return [];
+    });
+    const result = await pollOnce({ fetchEvents: resumed, maxRetries: 1, baseDelayMs: 1 });
+    expect(result.ok).toBe(true);
+    expect(resumed).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('db — transactional writes', () => {
+  it('rolls back all writes on partial failure', () => {
+    const before = getLatestLedger();
+    expect(() =>
+      withTransaction(() => {
+        upsertEvents([
+          {
+            id: 'evt-tx-rollback',
+            event_type: 'IssuerAdded',
+            ledger: before + 50,
+            timestamp: 1700000000,
+            contract_id: 'CABC',
+            payload: { issuer: 'GROLLBACK' },
+          },
+        ]);
+        setCheckpoint(before + 50);
+        throw new Error('partial failure');
+      })
+    ).toThrow('partial failure');
+
+    expect(queryEvents().filter((e) => e.id === 'evt-tx-rollback').length).toBe(0);
+    expect(getCheckpoint()).toBeLessThan(before + 50);
+  });
+
+  it('does not lose checkpoints under concurrent updates', async () => {
+    const start = getCheckpoint();
+    const updates = Array.from({ length: 10 }, (_, i) =>
+      Promise.resolve().then(() =>
+        withTransaction(() => {
+          setCheckpoint(start + i + 1);
+        })
+      )
+    );
+    await Promise.all(updates);
+    expect(getCheckpoint()).toBeGreaterThanOrEqual(start + 1);
+    expect(getCheckpoint()).toBeLessThanOrEqual(start + 10);
+  });
+
+  it('does not leave partially written records under concurrency', async () => {
+    const writes = Array.from({ length: 5 }, (_, i) =>
+      Promise.resolve().then(() =>
+        withTransaction(() => {
+          upsertEvents([
+            {
+              id: `evt-concurrent-${i}`,
+              event_type: 'VaccinationMinted',
+              ledger: 500 + i,
+              timestamp: 1700000000,
+              contract_id: 'CABC',
+              payload: { vaccine_name: 'Flu' },
+            },
+          ]);
+        })
+      )
+    );
+    await Promise.all(writes);
+    const stored = queryEvents().filter((e) => e.id.startsWith('evt-concurrent-'));
+    expect(stored.length).toBe(5);
+  });
+});
+
+describe('db — schema migrations', () => {
+  it('records a schema version on a clean database', async () => {
+    const cleanDb = path.join(os.tmpdir(), `vaccichain-migrate-clean-${Date.now()}.db`);
+    try {
+      await initDb(cleanDb);
+      expect(getSchemaVersion()).toBeGreaterThanOrEqual(1);
+    } finally {
+      if (fs.existsSync(cleanDb)) fs.unlinkSync(cleanDb);
+    }
+  });
+
+  it('upgrades from the current deployed schema safely', async () => {
+    const upgradeDb = path.join(os.tmpdir(), `vaccichain-migrate-upgrade-${Date.now()}.db`);
+    try {
+      await initDb(upgradeDb);
+      const versionBefore = getSchemaVersion();
+      upsertEvents([
+        {
+          id: 'evt-pre-migration',
+          event_type: 'IssuerAdded',
+          ledger: 900,
+          timestamp: 1700000000,
+          contract_id: 'CABC',
+          payload: { issuer: 'GPRE' },
+        },
+      ]);
+      runMigrations();
+      expect(getSchemaVersion()).toBeGreaterThanOrEqual(versionBefore);
+      expect(queryEvents().filter((e) => e.id === 'evt-pre-migration').length).toBe(1);
+    } finally {
+      if (fs.existsSync(upgradeDb)) fs.unlinkSync(upgradeDb);
+    }
+  });
+
+  it('rolls back a failed upgrade', async () => {
+    const failDb = path.join(os.tmpdir(), `vaccichain-migrate-fail-${Date.now()}.db`);
+    try {
+      await initDb(failDb);
+      const versionBefore = getSchemaVersion();
+      expect(() =>
+        runMigrations([
+          {
+            version: versionBefore + 1,
+            up: () => {
+              throw new Error('migration failed');
+            },
+          },
+        ])
+      ).toThrow('migration failed');
+      expect(getSchemaVersion()).toBe(versionBefore);
+    } finally {
+      if (fs.existsSync(failDb)) fs.unlinkSync(failDb);
+    }
   });
 });
 

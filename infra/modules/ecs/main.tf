@@ -126,10 +126,12 @@ resource "aws_lb_target_group" "backend" {
   vpc_id      = var.vpc_id
   target_type = "ip"
   health_check {
-    path                = "/health"
+    path                = "/ready"
+    matcher             = "200"
     healthy_threshold   = 2
     unhealthy_threshold = 3
     interval            = 30
+    timeout             = 5
   }
 }
 
@@ -140,9 +142,12 @@ resource "aws_lb_target_group" "frontend" {
   vpc_id      = var.vpc_id
   target_type = "ip"
   health_check {
-    path              = "/"
-    healthy_threshold = 2
-    interval          = 30
+    path                = "/ready"
+    matcher             = "200"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    interval            = 30
+    timeout             = 5
   }
 }
 
@@ -222,11 +227,11 @@ resource "aws_ecs_task_definition" "backend" {
       }
     }
     healthCheck = {
-      command     = ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
+      command     = ["CMD-SHELL", "wget -qO- http://localhost:4000/ready || exit 1"]
       interval    = 30
       timeout     = 5
       retries     = 3
-      startPeriod = 15
+      startPeriod = 30
     }
   }])
 }
@@ -273,6 +278,13 @@ resource "aws_ecs_task_definition" "frontend" {
         "awslogs-region"        = data.aws_region.current.name
         "awslogs-stream-prefix" = "frontend"
       }
+    }
+    healthCheck = {
+      command     = ["CMD-SHELL", "wget -qO- http://localhost:80/ready || exit 1"]
+      interval    = 30
+      timeout     = 5
+      retries     = 3
+      startPeriod = 30
     }
   }])
 }
@@ -322,6 +334,13 @@ resource "aws_ecs_task_definition" "analytics" {
         "awslogs-region"        = data.aws_region.current.name
         "awslogs-stream-prefix" = "python-service"
       }
+    }
+    healthCheck = {
+      command     = ["CMD-SHELL", "wget -qO- http://localhost:8001/ready || exit 1"]
+      interval    = 30
+      timeout     = 5
+      retries     = 3
+      startPeriod = 30
     }
   }])
 }

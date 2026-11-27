@@ -69,13 +69,35 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 |------|-------|--------|-------|
 | Deploy contract to mainnet | Dev Lead | ⬜ | Use `make deploy` with mainnet config |
 | Record contract ID | Dev Lead | ⬜ | Store in version control and `.env` |
+| Record deployment transaction hash | Dev Lead | ⬜ | Store in the verification package (see below) |
+| Record reproducible WASM hash | Dev Lead | ⬜ | Rebuild from the tagged commit; hashes must match |
 | Verify contract on Stellar Expert | Dev Lead | ⬜ | Check https://stellar.expert/explorer/public |
 | Test contract functions on mainnet | QA Lead | ⬜ | Call mint, verify, revoke with test data |
 | Verify issuer allowlist is empty | Dev Lead | ⬜ | No issuers should be pre-authorized |
 | Add initial issuer (if applicable) | Dev Lead | ⬜ | Call `add_issuer` with authorized healthcare provider |
 | Document contract address | Dev Lead | ⬜ | Share with all teams |
+| Publish contract verification package | Dev Lead | ⬜ | See [Contract Verification Package](#contract-verification-package) |
+| Independent reviewer executes verification instructions | Independent Reviewer | ⬜ | Reviewer must not be the deployer; record sign-off below |
 
-**Go/No-Go Criteria**: Contract deployed; all functions callable; issuer allowlist configured.
+**Go/No-Go Criteria**: Contract deployed; all functions callable; issuer allowlist configured; verification package published and independently verified.
+
+---
+
+### 4a. Contract Verification Package
+
+The release package must be published alongside the deployment and contain:
+
+| Item | Owner | Status | Notes |
+|------|-------|--------|-------|
+| Source commit link | Dev Lead | ⬜ | Tagged commit used to build the deployed WASM |
+| WASM hash (reproducible build) | Dev Lead | ⬜ | SHA-256 of the deployed WASM artifact |
+| Audit report link | Security Lead | ⬜ | Final signed audit report from step 1 |
+| Network transaction link | Dev Lead | ⬜ | Stellar Expert link to the deployment transaction |
+| Verified contract ID | Dev Lead | ⬜ | Contract ID confirmed on Stellar Expert |
+| Verification instructions | Dev Lead | ⬜ | Step-by-step rebuild and hash comparison guide |
+| Independent verification sign-off | Independent Reviewer | ⬜ | Reviewer confirms instructions work as written |
+
+**Go/No-Go Criteria**: Package is complete; an independent reviewer has reproduced the WASM hash and confirmed the contract ID and transaction.
 
 ---
 
@@ -255,6 +277,18 @@ This checklist must be reviewed and approved by at least two contributors before
 - **Date**: ___________________
 - **Signature**: ___________________
 
+### Independent Verification Reviewer
+
+The reviewer below must be independent of the deployer and must have executed the verification instructions from the contract verification package.
+
+- **Name**: ___________________
+- **Role**: ___________________
+- **Date**: ___________________
+- **Source commit verified**: ___________________
+- **WASM hash reproduced**: ___________________
+- **Contract ID / transaction confirmed**: ___________________
+- **Signature**: ___________________
+
 ---
 
 ## References
@@ -264,3 +298,4 @@ This checklist must be reviewed and approved by at least two contributors before
 - [VacciChain Architecture](../README.md)
 - [Security Threat Model](./security/threat-model.md)
 - [Configuration Guide](./configuration.md)
+- [Contract Verification Package](./contract-verification.md)

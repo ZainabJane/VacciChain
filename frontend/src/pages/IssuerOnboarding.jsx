@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { useAuth } from '../hooks/useFreighter';
 
+import { pageContainerNarrow } from '../layout.js';
+
 const s = {
-  page:   { maxWidth: 520, width: '100%', margin: '2rem auto', padding: '0 1rem', boxSizing: 'border-box' },
   field:  { display: 'flex', flexDirection: 'column', gap: '0.35rem', marginBottom: '1rem' },
   label:  { color: '#94a3b8', fontSize: '0.85rem' },
   input:  { padding: '0.5rem 0.75rem', background: '#1e293b', border: '1px solid #334155', borderRadius: 6, color: '#e2e8f0', fontSize: '0.9rem' },
@@ -20,7 +21,7 @@ export default function IssuerOnboarding() {
 
   if (!publicKey) {
     return (
-      <div style={s.page}>
+      <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
         <h2 style={{ color: 'var(--text)', marginBottom: '1rem' }}>Apply for Issuer Status</h2>
         <p style={{ color: '#94a3b8', marginBottom: '1rem' }}>
           Connect your wallet to submit an onboarding request.
@@ -55,7 +56,7 @@ export default function IssuerOnboarding() {
   };
 
   return (
-    <div style={s.page}>
+    <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
       <h2 style={{ color: 'var(--text)', marginBottom: '0.5rem' }}>Apply for Issuer Status</h2>
       <p style={{ color: '#94a3b8', marginBottom: '1.5rem', fontSize: '0.9rem' }}>
         Submit your details below. An admin will review your application and add you to the

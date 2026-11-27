@@ -132,6 +132,140 @@ describe('GET /verify/public/:wallet', () => {
   });
 });
 
+describe('Public verification semantics (valid / revoked / absent / unavailable)', () => {
+  const validWallet = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';
+  const otherWallet = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+
+  // The contract/API must expose an explicit status so that callers can
+  // distinguish a positive verification from missing, revoked, or
+  // unavailable data. A boolean alone is not sufficient.
+  const ALLOWED_STATUSES = ['valid', 'revoked', 'absent', 'unavailable'];
+
+  let verifyService;
+
+  beforeEach(() => {
+    jest.resetModules();
+    verifyService = require('../src/services/verifyService');
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  function mockContractResult(result) {
+    jest
+      .spyOn(verifyService, 'getVerificationRecords')
+      .mockResolvedValue(result);
+  }
+
+  function mockContractFailure(error) {
+    jest
+      .spyOn(verifyService, 'getVerificationRecords')
+      .mockRejectedValue(error);
+  }
+
+  it('reports status "valid" and verified=true for a wallet with active records', async () => {
+    mockContractResult({
+      status: 'valid',
+      records: [{ id: 'rec-1', vaccine: 'COVID-19', revoked: false }],
+    });
+
+    const res = await request(app).get(`/v1/verify/public/${validWallet}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('status');
+    expect(ALLOWED_STATUSES).toContain(res.body.status);
+    expect(res.body.status).toBe('valid');
+    expect(res.body.verified).toBe(true);
+    expect(Array.isArray(res.body.records)).toBe(true);
+    expect(res.body.records.length).toBeGreaterThan(0);
+  });
+
+  it('reports status "revoked" and verified=false when all records are revoked', async () => {
+    mockContractResult({
+      status: 'revoked',
+      records: [{ id: 'rec-1', vaccine: 'COVID-19', revoked: true }],
+    });
+
+    const res = await request(app).get(`/v1/verify/public/${validWallet}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('revoked');
+    expect(res.body.verified).toBe(false);
+  });
+
+  it('reports status "absent" and verified=false when the wallet has no records', async () => {
+    mockContractResult({ status: 'absent', records: [] });
+
+    const res = await request(app).get(`/v1/verify/public/${otherWallet}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('absent');
+    expect(res.body.verified).toBe(false);
+    expect(res.body.records).toEqual([]);
+  });
+
+  it('reports status "unavailable" and verified=false when the contract is unreachable', async () => {
+    mockContractFailure(new Error('RPC connection refused'));
+
+    const res = await request(app).get(`/v1/verify/public/${validWallet}`);
+
+    // Unavailable data must never be surfaced as a successful verification.
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(res.body.verified).not.toBe(true);
+    if (res.body.status !== undefined) {
+      expect(res.body.status).toBe('unavailable');
+    }
+  });
+
+  it('does not collapse an RPC timeout into a positive verification result', async () => {
+    const timeoutError = new Error('RPC timeout');
+    timeoutError.code = 'ETIMEDOUT';
+    mockContractFailure(timeoutError);
+
+    const res = await request(app).get(`/v1/verify/public/${validWallet}`);
+
+    expect(res.status).not.toBe(200);
+    expect(res.body.verified).not.toBe(true);
+    expect(res.body).not.toHaveProperty('vaccinated');
+  });
+
+  it('does not collapse a contract error into a positive verification result', async () => {
+    mockContractFailure(new Error('contract invocation failed'));
+
+    const res = await request(app).get(`/v1/verify/public/${validWallet}`);
+
+    expect(res.status).not.toBe(200);
+    expect(res.body.verified).not.toBe(true);
+  });
+
+  it('never returns verified=true when records are missing from the contract response', async () => {
+    mockContractResult({ status: 'absent' });
+
+    const res = await request(app).get(`/v1/verify/public/${validWallet}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.verified).toBe(false);
+    expect(res.body.status).not.toBe('valid');
+  });
+
+  it('distinguishes revoked from absent in the response status', async () => {
+    mockContractResult({
+      status: 'revoked',
+      records: [{ id: 'rec-1', vaccine: 'COVID-19', revoked: true }],
+    });
+    const revokedRes = await request(app).get(`/v1/verify/public/${validWallet}`);
+
+    jest.restoreAllMocks();
+    mockContractResult({ status: 'absent', records: [] });
+    const absentRes = await request(app).get(`/v1/verify/public/${otherWallet}`);
+
+    expect(revokedRes.body.status).not.toBe(absentRes.body.status);
+    expect(revokedRes.body.verified).toBe(false);
+    expect(absentRes.body.verified).toBe(false);
+  });
+});
+
 describe('GET /verify/:wallet (authenticated)', () => {
   describe('Authentication required', () => {
     it('should return 401 without Authorization header', async () => {

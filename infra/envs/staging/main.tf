@@ -19,6 +19,66 @@ variable "backend_image"   { type = string }
 variable "frontend_image"  { type = string }
 variable "analytics_image" { type = string }
 
+variable "backend_health_check_path" {
+  type        = string
+  description = "HTTP path used by the backend container and target group health checks"
+  default     = "/health"
+}
+
+variable "frontend_health_check_path" {
+  type        = string
+  description = "HTTP path used by the frontend container and target group health checks"
+  default     = "/"
+}
+
+variable "analytics_health_check_path" {
+  type        = string
+  description = "HTTP path used by the analytics container and target group health checks"
+  default     = "/health"
+}
+
+variable "health_check_interval" {
+  type        = number
+  description = "Seconds between health check probes"
+  default     = 30
+}
+
+variable "health_check_timeout" {
+  type        = number
+  description = "Seconds before a health check probe times out"
+  default     = 5
+}
+
+variable "health_check_healthy_threshold" {
+  type        = number
+  description = "Consecutive successful probes required to mark a target healthy"
+  default     = 2
+}
+
+variable "health_check_unhealthy_threshold" {
+  type        = number
+  description = "Consecutive failed probes required to mark a target unhealthy"
+  default     = 3
+}
+
+variable "health_check_grace_period" {
+  type        = number
+  description = "Seconds ECS waits before starting container health checks after task start"
+  default     = 60
+}
+
+variable "health_check_start_period" {
+  type        = number
+  description = "Seconds the container health check start period allows for boot before failures count"
+  default     = 30
+}
+
+variable "health_check_retries" {
+  type        = number
+  description = "Number of consecutive container health check failures before the container is marked unhealthy"
+  default     = 3
+}
+
 locals { env = "staging" }
 
 module "vpc" {
@@ -44,6 +104,18 @@ module "ecs" {
   analytics_image = var.analytics_image
   secret_arns     = module.secrets.secret_arns
   desired_count   = 1
+
+  backend_health_check_path   = var.backend_health_check_path
+  frontend_health_check_path  = var.frontend_health_check_path
+  analytics_health_check_path = var.analytics_health_check_path
+
+  health_check_interval            = var.health_check_interval
+  health_check_timeout             = var.health_check_timeout
+  health_check_healthy_threshold   = var.health_check_healthy_threshold
+  health_check_unhealthy_threshold = var.health_check_unhealthy_threshold
+  health_check_grace_period        = var.health_check_grace_period
+  health_check_start_period        = var.health_check_start_period
+  health_check_retries             = var.health_check_retries
 }
 
 output "alb_dns_name" { value = module.ecs.alb_dns_name }

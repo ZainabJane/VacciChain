@@ -11,9 +11,9 @@ import RecordDetailModal from '../components/RecordDetailModal';
 import CopyButton from '../components/CopyButton';
 import QRCodeModal from '../components/QRCodeModal';
 import ConsentScreen from '../components/ConsentScreen';
+import { pageContainer, section } from '../layout.js';
 
 const styles = {
-  page: { maxWidth: 700, width: '100%', margin: '2rem auto', padding: '0 1rem', boxSizing: 'border-box' },
   header: { borderLeft: '4px solid #0ea5e9', paddingLeft: '0.75rem', marginBottom: '1.5rem' },
   btn: { padding: '0.6rem 1.5rem', background: '#0ea5e9', color: '#fff', border: 'none', borderRadius: 8, cursor: 'pointer' },
 };
@@ -29,7 +29,7 @@ export default function PatientDashboard() {
 
   if (!publicKey) {
     return (
-      <div style={styles.page}>
+      <div style={{ ...pageContainer, marginTop: '2rem', marginBottom: '2rem' }}>
         <p style={{ color: '#94a3b8', marginBottom: '1rem' }}>Connect your wallet to view records.</p>
         <button style={styles.btn} onClick={connect} aria-label="Connect Freighter wallet to view vaccination records">Connect Wallet</button>
       </div>
@@ -38,7 +38,7 @@ export default function PatientDashboard() {
 
   if (consented === false) {
     return (
-      <div style={styles.page}>
+      <div style={{ ...pageContainer, marginTop: '2rem', marginBottom: '2rem' }}>
         <ConsentScreen
           onAccept={giveConsent}
           onDecline={handleDeclineConsent}
@@ -49,7 +49,7 @@ export default function PatientDashboard() {
   }
 
   return (
-    <div style={styles.page}>
+    <div style={{ ...pageContainer, marginTop: '2rem', marginBottom: '2rem' }}>
       <div style={styles.header}>
         <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.25rem' }}>
           <h2 style={{ color: '#e2e8f0', margin: 0 }}>{t('patient.title')}</h2>
@@ -57,7 +57,7 @@ export default function PatientDashboard() {
         </div>
         {records.length > 0 && (
           <span style={{ color: '#64748b', fontSize: '0.85rem' }}>
-            {records.length} records
+            {t('patient.recordCount', { count: records.length })}
           </span>
         )}
       </div>

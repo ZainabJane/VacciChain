@@ -43,3 +43,43 @@ docker events --filter event=oom --format '{{.Actor.Attributes.name}}' | \
 If you observe legitimate OOM kills under normal load, increase the memory limit
 in `docker-compose.yml` in 64 MB increments and re-profile. Do not remove limits
 entirely — use `reservations` to guarantee a floor and `limits` to cap the ceiling.
+
+## Soroban contract storage lifecycle
+
+Container limits above do not bound on-chain state. Soroban persistent entries
+(vaccination histories, issuer records) are rented storage: each entry carries a
+TTL measured in ledgers, and rent is charged on write and on TTL extension.
+
+### Storage-size estimates
+
+| Entry type | Approx. size | Expected volume | Notes |
+|---|---|---|---|
+| Vaccination record | ~200–400 B | 1 per dose per patient | Grows linearly with doses; never overwritten |
+| Patient index entry | ~100–200 B | 1 per patient | Maps patient ID → record keys |
+| Issuer record | ~300–500 B | 1 per issuer | Small, near-static set |
+| Issuer revocation entry | ~100 B | 1 per revoked credential | Append-only for audit |
+
+Rent implications: persistent entries are billed per ledger of TTL retained, so
+cost scales with `entry_size × TTL_ledgers × entry_count`. Long-lived vaccination
+histories dominate cost; issuer records are negligible by comparison.
+
+### TTL extension assumptions
+
+- Persistent entries are extended on write and on read-triggered bumps, targeting
+  a TTL comfortably longer than the expected audit retention window.
+- TTL extension is treated as best-effort: a failed extension must not corrupt
+  state, and reads of expired entries must return a recoverable "not found"
+  rather than panicking.
+- Authorization checks must never fail open when required state is absent or
+  expired; missing entries are treated as deny.
+
+### Retention, compaction, and archival
+
+- Records are append-only for audit purposes; compaction never deletes or mutates
+  historical vaccination or revocation entries.
+- Archival is achieved by indexing (off-chain index of record keys) and by
+  extending TTLs for entries still within the audit window, rather than by
+  removing entries.
+- Any future compaction must preserve the ability to prove historical state and
+  must be documented and approved before implementation.
+=======
