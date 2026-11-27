@@ -4,9 +4,12 @@ terraform {
     aws = { source = "hashicorp/aws", version = "~> 5.0" }
   }
   backend "s3" {
-    bucket = "vaccichain-tfstate"
-    key    = "staging/terraform.tfstate"
-    region = "us-east-1"
+    bucket         = "vaccichain-tfstate"
+    key            = "staging/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    kms_key_id     = "alias/vaccichain-tfstate"
+    dynamodb_table = "vaccichain-tfstate-lock"
   }
 }
 
@@ -152,6 +155,50 @@ module "secrets" {
   name   = "vaccichain-${local.env}"
 }
 
+# Private service discovery namespace for internal service-to-service routing.
+resource "aws_service_discovery_private_dns_namespace" "internal" {
+  name        = "${local.env}.vaccichain.internal"
+  description = "Private service discovery namespace for vaccichain ${local.env}"
+  vpc         = module.vpc.vpc_id
+}
+
+# Managed ACM certificate with automatic DNS validation/renewal.
+resource "aws_acm_certificate" "public" {
+  domain_name       = var.domain_name
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = {
+    Name        = "vaccichain-${local.env}"
+    Environment = local.env
+  }
+}
+
+resource "aws_route53_record" "cert_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.public.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = var.hosted_zone_id
+}
+
+resource "aws_acm_certificate_validation" "public" {
+  certificate_arn         = aws_acm_certificate.public.arn
+  validation_record_fqdns = [for record in aws_route53_record.cert_validation : record.fqdn]
+}
+
 module "ecs" {
   source          = "../../modules/ecs"
   name            = "vaccichain-${local.env}"
@@ -163,6 +210,18 @@ module "ecs" {
   analytics_image = "${var.analytics_image}@${var.analytics_digest}"
   secret_arns     = module.secrets.secret_arns
   desired_count   = 1
+
+  # HTTPS listener with managed certificate and modern TLS policy.
+  certificate_arn = aws_acm_certificate_validation.public.certificate_arn
+  tls_policy      = var.tls_policy
+
+  # Explicit HTTP -> HTTPS redirect (plaintext application traffic rejected).
+  http_redirect_to_https = true
+
+  # Private service discovery for analytics -> backend calls.
+  service_discovery_namespace_arn  = aws_service_discovery_private_dns_namespace.internal.arn
+  service_discovery_namespace_name = aws_service_discovery_private_dns_namespace.internal.name
+  analytics_backend_url            = local.analytics_backend_url
 
   backend_health_check_path   = var.backend_health_check_path
   frontend_health_check_path  = var.frontend_health_check_path

@@ -4,9 +4,12 @@ terraform {
     aws = { source = "hashicorp/aws", version = "~> 5.0" }
   }
   backend "s3" {
-    bucket = "vaccichain-tfstate"
-    key    = "production/terraform.tfstate"
-    region = "us-east-1"
+    bucket         = "vaccichain-tfstate"
+    key            = "production/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    kms_key_id     = "alias/vaccichain-tfstate"
+    dynamodb_table = "vaccichain-tfstate-lock"
   }
 }
 
@@ -118,6 +121,20 @@ module "ecs" {
     module.secrets.secret_arns,
     { EVENT_INDEX_DATABASE_URL = module.event_index_db.connection_secret_arn }
   )
+
+  # TLS termination on the public ALB.
+  certificate_arn     = aws_acm_certificate_validation.app.certificate_arn
+  https_listener_port = 443
+  http_listener_port  = 80
+  ssl_policy          = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  http_redirect       = true
+
+  # Private service discovery for internal routing.
+  service_discovery_namespace = "${local.env}.vaccichain.internal"
+
+  # Environment-specific backend endpoints for the analytics service.
+  backend_service_url   = local.backend_service_url
+  analytics_service_url = local.analytics_service_url
 
   # Container health checks (Backlog 120)
   backend_health_check_path     = "/health"

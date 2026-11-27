@@ -9,6 +9,11 @@ variable "secret_arns"     { type = map(string) }
 variable "backend_cpu"     { type = number; default = 512 }
 variable "backend_memory"  { type = number; default = 1024 }
 variable "desired_count"   { type = number; default = 1 }
+variable "certificate_arn" { type = string }
+variable "service_discovery_namespace" {
+  type    = string
+  default = "internal"
+}
 
 # Persistence strategy: "sqlite-efs" (single writer, EFS-backed SQLite) or
 # "postgres-rds" (multi-writer, RDS-backed). See docs/persistence-strategy.md.
@@ -132,13 +137,33 @@ resource "aws_security_group" "alb" {
 resource "aws_security_group" "tasks" {
   name   = "${var.name}-tasks-sg"
   vpc_id = var.vpc_id
+
+  # Least-privilege ingress: only the backend listener port is reachable from
+  # the ALB. Health checks hit the same container port (/health), so no
+  # separate ephemeral range is required.
   ingress {
-    from_port       = 0
-    to_port         = 65535
+    description     = "Backend listener + health checks from ALB"
+    from_port       = 4000
+    to_port         = 4000
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
   }
+
+  # Task-to-task traffic (analytics -> backend) stays inside the tasks SG.
+  ingress {
+    description = "Analytics to backend via private service discovery"
+    from_port   = 4000
+    to_port     = 4000
+    protocol    = "tcp"
+    self        = true
+  }
+
+  # Egress is intentionally broad: tasks pull images from ECR, write logs to
+  # CloudWatch, read Secrets Manager and reach EFS mount targets whose IPs are
+  # not statically known. Restricting this would require VPC endpoints for each
+  # service; documented here as an accepted, intentional rule.
   egress {
+    description = "Outbound to AWS APIs and EFS (intentionally broad)"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -187,10 +212,14 @@ resource "aws_lb_target_group" "frontend" {
   }
 }
 
-resource "aws_lb_listener" "http" {
+# HTTPS listener terminates public traffic with a managed certificate and a
+# modern TLS policy (TLS 1.2+ with strong ciphers).
+resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.this.arn
-  port              = 80
-  protocol          = "HTTP"
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.certificate_arn
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.frontend.arn
@@ -216,7 +245,7 @@ resource "aws_lb_target_group" "backend_canary" {
 }
 
 resource "aws_lb_listener_rule" "api" {
-  listener_arn = aws_lb_listener.http.arn
+  listener_arn = aws_lb_listener.https.arn
   priority     = 10
   action {
     type = "forward"
@@ -389,7 +418,11 @@ resource "aws_ecs_service" "backend" {
     container_port   = 4000
   }
 
-  depends_on = [aws_lb_listener.http]
+  service_registries {
+    registry_arn = aws_service_discovery_service.backend.arn
+  }
+
+  depends_on = [aws_lb_listener.https]
 }
 
 # ── Frontend task definition ──────────────────────────────────────────────────
@@ -450,7 +483,7 @@ resource "aws_ecs_service" "frontend" {
     container_port   = 80
   }
 
-  depends_on = [aws_lb_listener.http]
+  depends_on = [aws_lb_listener.https]
 }
 
 # ── Analytics (python-service) task definition ────────────────────────────────
@@ -468,7 +501,7 @@ resource "aws_ecs_task_definition" "analytics" {
     essential = true
     portMappings = [{ containerPort = 8001, protocol = "tcp" }]
     environment = [
-      { name = "BACKEND_URL", value = "http://localhost:4000" },
+      { name = "BACKEND_URL", value = "http://backend.${var.service_discovery_namespace}:4000" },
     ]
     logConfiguration = {
       logDriver = "awslogs"
@@ -507,6 +540,8 @@ resource "aws_ecs_service" "analytics" {
     subnets         = var.private_subnets
     security_groups = [aws_security_group.tasks.id]
   }
+
+  depends_on = [aws_service_discovery_service.backend]
 }
 
 output "alb_dns_name" { value = aws_lb.this.dns_name }

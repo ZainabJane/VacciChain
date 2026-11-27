@@ -335,6 +335,74 @@ jobs:
           fi
           echo "Smoke test passed: contract $CONTRACT_ID on $STELLAR_NETWORK matches artifact hash $ACTUAL_HASH"
 
+      - name: Smoke test — analytics-to-backend via private service discovery
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECS_CLUSTER: vaccichain-staging
+          BACKEND_SERVICE_DISCOVERY_URL: ${{ vars.STAGING_BACKEND_SERVICE_DISCOVERY_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BACKEND_SERVICE_DISCOVERY_URL:-}" ]; then
+            echo "::error::STAGING_BACKEND_SERVICE_DISCOVERY_URL is not set; refusing to smoke test against an unknown endpoint."
+            exit 1
+          fi
+
+          case "$BACKEND_SERVICE_DISCOVERY_URL" in
+            *localhost*|*127.0.0.1*|*0.0.0.0*|*"[::1]"*)
+              echo "::error::Backend URL resolves to loopback ($BACKEND_SERVICE_DISCOVERY_URL); analytics must use private service discovery."
+              exit 1
+              ;;
+          esac
+
+          echo "Running isolated analytics smoke test against: $BACKEND_SERVICE_DISCOVERY_URL"
+
+          # Launch a one-off task from the analytics task definition in the private
+          # subnets so it resolves the backend via Cloud Map private DNS.
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --task-definition vaccichain-analytics-staging \
+            --launch-type FARGATE \
+            --network-configuration 'awsvpcConfiguration={subnets='"${{ vars.STAGING_PRIVATE_SUBNETS }}"',securityGroups='"${{ vars.STAGING_ANALYTICS_SMOKE_SG }}"',assignPublicIp=DISABLED}' \
+            --overrides '{
+              "containerOverrides": [{
+                "name": "analytics",
+                "command": ["python", "-m", "analytics.smoke_test", "--backend-url", "'"$BACKEND_SERVICE_DISCOVERY_URL"'"],
+                "environment": [{"name": "BACKEND_URL", "value": "'"$BACKEND_SERVICE_DISCOVERY_URL"'"}]
+              }]
+            }' \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "::error::Failed to launch analytics smoke test task."
+            exit 1
+          fi
+
+          echo "Waiting for smoke test task $TASK_ARN to stop..."
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN"
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          STOPPED_REASON=$(aws ecs describe-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].stoppedReason' \
+            --output text)
+
+          echo "Smoke test exit code: $EXIT_CODE (reason: $STOPPED_REASON)"
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "::error::Analytics smoke test failed: analytics could not reach backend at $BACKEND_SERVICE_DISCOVERY_URL (exit $EXIT_CODE)."
+            exit 1
+          fi
+
+          echo "Analytics-to-backend connectivity verified via private service discovery."
+
       - name: Post deployment summary
         run: |
           echo "### Staging Deployment" >> $GITHUB_STEP_SUMMARY
