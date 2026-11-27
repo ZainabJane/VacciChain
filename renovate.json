@@ -3,7 +3,8 @@
   "description": "Update cadence: Renovate runs weekly (before 3am on Monday). Docker digest-only updates are auto-merged; minor/major base image updates require approval. Terraform providers and modules are kept updated weekly and grouped for review.",
   "extends": [
     "config:base",
-    ":docker"
+    ":docker",
+    "helpers:pinGitHubActionDigests"
   ],
   "dockerfile": true,
   "docker": {

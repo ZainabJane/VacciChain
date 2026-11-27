@@ -15,9 +15,6 @@ provider "aws" {
 }
 
 variable "aws_region"      { type = string; default = "us-east-1" }
-variable "backend_image"   { type = string }
-variable "frontend_image"  { type = string }
-variable "analytics_image" { type = string }
 
 # Persistence strategy for the event index (Backlog 052).
 # Production uses a multi-writer PostgreSQL backend (RDS) instead of the
@@ -141,6 +138,8 @@ module "ecs" {
   target_group_healthy_threshold     = 2
   target_group_unhealthy_threshold   = 3
   target_group_deregistration_delay  = 30
+
+  depends_on = [terraform_data.provenance_verification]
 }
 
 output "alb_dns_name" { value = module.ecs.alb_dns_name }

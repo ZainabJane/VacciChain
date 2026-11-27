@@ -17,6 +17,11 @@ on:
           - testnet
           - mainnet
 
+# Least privilege by default: the workflow token is read-only unless a job
+# explicitly opts in to additional scopes below.
+permissions:
+  contents: read
+
 jobs:
   decide:
     runs-on: ubuntu-latest
@@ -166,7 +171,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             ~/.cargo/registry

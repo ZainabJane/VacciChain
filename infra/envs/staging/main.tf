@@ -19,6 +19,29 @@ variable "backend_image"   { type = string }
 variable "frontend_image"  { type = string }
 variable "analytics_image" { type = string }
 
+# Immutable artifact digests (sha256:...) produced by the release build.
+# These must match the attested artifacts recorded in the provenance metadata.
+variable "backend_digest"   { type = string }
+variable "frontend_digest"  { type = string }
+variable "analytics_digest" { type = string }
+
+# Trusted provenance metadata emitted by the build workflow (e.g. in-toto
+# attestation / SLSA provenance). Each entry links an artifact to its source
+# revision, build workflow, and dependency inputs.
+variable "provenance" {
+  type = object({
+    source_revision = string
+    build_workflow  = string
+    build_run_id    = string
+    artifacts = object({
+      backend   = string
+      frontend  = string
+      analytics = string
+    })
+  })
+  description = "Trusted provenance metadata for release artifacts (source revision, build workflow, attested digests)."
+}
+
 variable "backend_health_check_path" {
   type        = string
   description = "HTTP path used by the backend container and target group health checks"
@@ -135,9 +158,9 @@ module "ecs" {
   vpc_id          = module.vpc.vpc_id
   public_subnets  = module.vpc.public_subnets
   private_subnets = module.vpc.private_subnets
-  backend_image   = var.backend_image
-  frontend_image  = var.frontend_image
-  analytics_image = var.analytics_image
+  backend_image   = "${var.backend_image}@${var.backend_digest}"
+  frontend_image  = "${var.frontend_image}@${var.frontend_digest}"
+  analytics_image = "${var.analytics_image}@${var.analytics_digest}"
   secret_arns     = module.secrets.secret_arns
   desired_count   = 1
 
